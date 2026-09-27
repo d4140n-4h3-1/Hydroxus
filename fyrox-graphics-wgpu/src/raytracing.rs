@@ -5,6 +5,11 @@
 //! shader can ask "does anything block this ray?" and get an answer that includes what is behind
 //! the camera or around a corner.
 //!
+//! The structure comes in two levels. [`RayTracedGeometry`] holds one mesh's triangles, in the
+//! mesh's own space, built once; one that is posed - a skinned character - can be given its
+//! vertices again and refitted. [`RayTracedScene`] places copies of those wherever they are now,
+//! and is cheap to rebuild every frame, so that what moves casts its shadow from where it is.
+//!
 //! What lives here is the part that has to: the acceleration structure, and the pass that traces
 //! against it. It is all self-contained - none of the renderer's own machinery knows about ray
 //! tracing - so an effect elsewhere can use the result as an ordinary texture.
@@ -21,18 +26,73 @@ use fyrox_graphics::{
 };
 use wgpu::util::DeviceExt;
 
-/// Scene geometry in a form the ray tracing hardware can trace against.
-pub struct RayTracedScene {
-    /// Kept alive: the acceleration structure is built from these.
-    _vertices: wgpu::Buffer,
-    _indices: wgpu::Buffer,
-    _blas: wgpu::Blas,
-    tlas: wgpu::Tlas,
+/// One mesh's triangles in a form the ray tracing hardware can trace against, in the mesh's own
+/// space, for a [`RayTracedScene`] to place copies of.
+pub struct RayTracedGeometry {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    blas: wgpu::Blas,
+    size: wgpu::BlasTriangleGeometrySizeDescriptor,
+    vertex_count: u32,
     triangle_count: u32,
+    /// Whether it can be given its vertices again, and refitted round them.
+    updatable: bool,
+}
+
+impl RayTracedGeometry {
+    /// How many triangles it has.
+    pub fn triangle_count(&self) -> u32 {
+        self.triangle_count
+    }
+
+    /// How many vertices it has, three floats each.
+    pub fn vertex_count(&self) -> u32 {
+        self.vertex_count
+    }
+
+    fn build_entry(&self) -> wgpu::BlasBuildEntry<'_> {
+        wgpu::BlasBuildEntry {
+            blas: &self.blas,
+            geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+                size: &self.size,
+                vertex_buffer: &self.vertices,
+                first_vertex: 0,
+                vertex_stride: 12,
+                index_buffer: Some(&self.indices),
+                first_index: Some(0),
+                transform_buffer: None,
+                transform_buffer_offset: None,
+            }]),
+        }
+    }
+}
+
+/// A copy of some [`RayTracedGeometry`], placed in the world.
+#[derive(Clone, Copy)]
+pub struct RayTracedInstance<'a> {
+    /// What is placed.
+    pub geometry: &'a RayTracedGeometry,
+    /// Where it is: an affine transform from its own space to the world's, three rows of four,
+    /// row by row.
+    pub transform: [f32; 12],
+}
+
+/// The transform that leaves geometry where it is.
+pub const IDENTITY_TRANSFORM: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+
+/// Scene geometry in a form the ray tracing hardware can trace against: copies of geometry,
+/// each where it is.
+pub struct RayTracedScene {
+    tlas: wgpu::Tlas,
+    /// How many copies it has room for, and how many triangles the ones it has come to.
+    capacity: u32,
+    triangle_count: u32,
+    /// For a scene built from triangles alone, the geometry it holds.
+    _geometry: Option<RayTracedGeometry>,
 }
 
 impl RayTracedScene {
-    /// How many triangles were put into the structure.
+    /// How many triangles were put into the structure, counting each copy.
     pub fn triangle_count(&self) -> u32 {
         self.triangle_count
     }
@@ -240,13 +300,38 @@ impl WgpuGraphicsServer {
         vertices: &[f32],
         indices: &[u32],
     ) -> Result<Option<RayTracedScene>, FrameworkError> {
+        let Some(geometry) = self.build_ray_traced_geometry(vertices, indices, false)? else {
+            return Ok(None);
+        };
+        let instance = RayTracedInstance {
+            geometry: &geometry,
+            transform: IDENTITY_TRANSFORM,
+        };
+        let Some(mut scene) = self.build_ray_traced_instances(&[instance])? else {
+            return Ok(None);
+        };
+        scene._geometry = Some(geometry);
+        Ok(Some(scene))
+    }
+
+    /// Puts one mesh's triangles into an acceleration structure of their own, for a
+    /// [`RayTracedScene`] to place copies of. Positions are in the mesh's own space, three floats
+    /// each; every three indices make a triangle. `updatable` geometry can be given its vertices
+    /// again later, for something posed, at some cost to how fast rays are traced against it.
+    /// Returns [`None`] without ray tracing hardware, or with no triangles.
+    pub fn build_ray_traced_geometry(
+        &self,
+        vertices: &[f32],
+        indices: &[u32],
+        updatable: bool,
+    ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
         if !self.ray_tracing || vertices.is_empty() || indices.len() < 3 {
             return Ok(None);
         }
 
         let device = &self.state.device;
         let vertex_count = (vertices.len() / 3) as u32;
-        let index_count = indices.len() as u32;
+        let index_count = (indices.len() / 3 * 3) as u32;
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RayTracedVertices"),
@@ -255,7 +340,7 @@ impl WgpuGraphicsServer {
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RayTracedIndices"),
-            contents: bytemuck::cast_slice(indices),
+            contents: bytemuck::cast_slice(&indices[..index_count as usize]),
             usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -266,61 +351,151 @@ impl WgpuGraphicsServer {
             index_count: Some(index_count),
             flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
         };
+        let (flags, update_mode) = if updatable {
+            (
+                wgpu::AccelerationStructureFlags::ALLOW_UPDATE
+                    | wgpu::AccelerationStructureFlags::PREFER_FAST_BUILD,
+                wgpu::AccelerationStructureUpdateMode::PreferUpdate,
+            )
+        } else {
+            (
+                wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                wgpu::AccelerationStructureUpdateMode::Build,
+            )
+        };
         let blas = device.create_blas(
             &wgpu::CreateBlasDescriptor {
                 label: Some("RayTracedGeometry"),
-                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                flags,
+                update_mode,
             },
             wgpu::BlasGeometrySizeDescriptors::Triangles {
                 descriptors: vec![size.clone()],
             },
         );
+        let geometry = RayTracedGeometry {
+            vertices: vertex_buffer,
+            indices: index_buffer,
+            blas,
+            size,
+            vertex_count,
+            triangle_count: index_count / 3,
+            updatable,
+        };
 
-        let mut tlas = device.create_tlas(&wgpu::CreateTlasDescriptor {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("BuildRayTracedGeometry"),
+        });
+        encoder.build_acceleration_structures([&geometry.build_entry()], std::iter::empty());
+        self.state.queue.submit([encoder.finish()]);
+        Ok(Some(geometry))
+    }
+
+    /// Gives each piece of updatable geometry its vertices again - as many as it was built with,
+    /// in its own space - and refits it round them, all at once.
+    pub fn update_ray_traced_geometry(
+        &self,
+        updates: &[(&RayTracedGeometry, &[f32])],
+    ) -> Result<(), FrameworkError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        for (geometry, vertices) in updates {
+            if !geometry.updatable || vertices.len() != geometry.vertex_count as usize * 3 {
+                return Err(FrameworkError::Custom(format!(
+                    "ray traced geometry of {} vertices, updatable: {}, given {} floats",
+                    geometry.vertex_count,
+                    geometry.updatable,
+                    vertices.len()
+                )));
+            }
+            self.state
+                .queue
+                .write_buffer(&geometry.vertices, 0, bytemuck::cast_slice(vertices));
+        }
+        let entries: Vec<wgpu::BlasBuildEntry> =
+            updates.iter().map(|(geometry, _)| geometry.build_entry()).collect();
+        let mut encoder = self
+            .state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("UpdateRayTracedGeometry"),
+            });
+        encoder.build_acceleration_structures(entries.iter(), std::iter::empty());
+        self.state.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
+    /// Places `instances` in a scene to trace against. Returns [`None`] without ray tracing
+    /// hardware.
+    pub fn build_ray_traced_instances(
+        &self,
+        instances: &[RayTracedInstance],
+    ) -> Result<Option<RayTracedScene>, FrameworkError> {
+        if !self.ray_tracing {
+            return Ok(None);
+        }
+        let capacity = (instances.len() as u32).max(1).next_power_of_two();
+        let tlas = self.state.device.create_tlas(&wgpu::CreateTlasDescriptor {
             label: Some("RayTracedScene"),
-            max_instances: 1,
+            max_instances: capacity,
             flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
             update_mode: wgpu::AccelerationStructureUpdateMode::Build,
         });
-        // The geometry is already in world space, so the instance sits at the origin.
-        tlas[0] = Some(wgpu::TlasInstance::new(
-            &blas,
-            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            0,
-            0xff,
-        ));
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("BuildRayTracedScene"),
-        });
-        encoder.build_acceleration_structures(
-            [&wgpu::BlasBuildEntry {
-                blas: &blas,
-                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![
-                    wgpu::BlasTriangleGeometry {
-                        size: &size,
-                        vertex_buffer: &vertex_buffer,
-                        first_vertex: 0,
-                        vertex_stride: 12,
-                        index_buffer: Some(&index_buffer),
-                        first_index: Some(0),
-                        transform_buffer: None,
-                        transform_buffer_offset: None,
-                    },
-                ]),
-            }],
-            [&tlas],
-        );
-        self.state.queue.submit([encoder.finish()]);
-
-        Ok(Some(RayTracedScene {
-            _vertices: vertex_buffer,
-            _indices: index_buffer,
-            _blas: blas,
+        let mut scene = RayTracedScene {
             tlas,
-            triangle_count: index_count / 3,
-        }))
+            capacity,
+            triangle_count: 0,
+            _geometry: None,
+        };
+        self.update_ray_traced_instances(&mut scene, instances)?;
+        Ok(Some(scene))
+    }
+
+    /// Places `instances` in `scene` in place of what it had, making room for them if it has to.
+    /// Cheap enough to do every frame.
+    pub fn update_ray_traced_instances(
+        &self,
+        scene: &mut RayTracedScene,
+        instances: &[RayTracedInstance],
+    ) -> Result<(), FrameworkError> {
+        if instances.len() as u32 > scene.capacity {
+            let capacity = (instances.len() as u32).next_power_of_two();
+            scene.tlas = self.state.device.create_tlas(&wgpu::CreateTlasDescriptor {
+                label: Some("RayTracedScene"),
+                max_instances: capacity,
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            });
+            scene.capacity = capacity;
+        }
+        let slots = scene
+            .tlas
+            .get_mut_slice(0..scene.capacity as usize)
+            .ok_or_else(|| FrameworkError::Custom("ray traced scene instances".into()))?;
+        for (slot, instance) in slots.iter_mut().zip(
+            instances
+                .iter()
+                .map(Some)
+                .chain(std::iter::repeat(None)),
+        ) {
+            *slot = instance.map(|instance| {
+                wgpu::TlasInstance::new(&instance.geometry.blas, instance.transform, 0, 0xff)
+            });
+        }
+        scene.triangle_count = instances
+            .iter()
+            .map(|instance| instance.geometry.triangle_count)
+            .sum();
+        let mut encoder = self
+            .state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("BuildRayTracedScene"),
+            });
+        encoder.build_acceleration_structures(std::iter::empty(), [&scene.tlas]);
+        self.state.queue.submit([encoder.finish()]);
+        Ok(())
     }
 
     /// Creates the passes that trace shadow rays, or [`None`] without ray tracing hardware.
