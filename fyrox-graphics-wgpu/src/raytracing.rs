@@ -104,7 +104,7 @@ pub const IDENTITY_TRANSFORM: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.
 /// Scene geometry in a form the ray tracing hardware can trace against: copies of geometry,
 /// each where it is.
 pub struct RayTracedScene {
-    tlas: wgpu::Tlas,
+    pub(crate) tlas: wgpu::Tlas,
     /// How many copies it has room for, and how many triangles the ones it has come to.
     capacity: u32,
     triangle_count: u32,

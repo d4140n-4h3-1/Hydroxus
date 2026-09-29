@@ -68,6 +68,8 @@
 
 #![warn(missing_docs)]
 
+/// Rectangles that glow and light what is round them, with traced shadows where possible.
+pub mod area_lights;
 /// Generic GPU buffer implementation (uniform, vertex, index, pixel read/write).
 pub mod buffer;
 
