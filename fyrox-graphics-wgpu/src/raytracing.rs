@@ -14,6 +14,10 @@
 //! against it. It is all self-contained - none of the renderer's own machinery knows about ray
 //! tracing - so an effect elsewhere can use the result as an ordinary texture.
 //!
+//! Glass ([`WgpuGraphicsServer::build_ray_traced_glass`]) is traced as well, but rays go on
+//! through it, and each copy of it says how much of each colour of light it lets through, so the
+//! shadows it casts are the colour of the light that came through it.
+//!
 //! Availability: [`WgpuGraphicsServer::ray_tracing`] is false unless the adapter reported ray
 //! queries, in which case everything here returns [`None`] and the caller falls back to whatever
 //! it did before.
@@ -37,6 +41,8 @@ pub struct RayTracedGeometry {
     triangle_count: u32,
     /// Whether it can be given its vertices again, and refitted round them.
     updatable: bool,
+    /// Whether it is glass, which rays go on through, rather than solid.
+    see_through: bool,
 }
 
 impl RayTracedGeometry {
@@ -48,6 +54,12 @@ impl RayTracedGeometry {
     /// How many vertices it has, three floats each.
     pub fn vertex_count(&self) -> u32 {
         self.vertex_count
+    }
+
+    /// Whether it is glass, which rays go on through: see
+    /// [`WgpuGraphicsServer::build_ray_traced_glass`].
+    pub fn is_see_through(&self) -> bool {
+        self.see_through
     }
 
     fn build_entry(&self) -> wgpu::BlasBuildEntry<'_> {
@@ -75,6 +87,15 @@ pub struct RayTracedInstance<'a> {
     /// Where it is: an affine transform from its own space to the world's, three rows of four,
     /// row by row.
     pub transform: [f32; 12],
+    /// For glass, how much of the red, green and blue of a light it lets through, each from 0 to
+    /// 1, where a ray crosses it. Solid geometry lets nothing through whatever this says.
+    pub lets_through: [f32; 3],
+}
+
+/// `lets_through` as an instance's custom data: a byte for each of red, green and blue.
+fn lets_through_bits([r, g, b]: [f32; 3]) -> u32 {
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    byte(r) | (byte(g) << 8) | (byte(b) << 16)
 }
 
 /// The transform that leaves geometry where it is.
@@ -189,7 +210,8 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// A pipeline that draws one full-screen triangle into a single-channel target.
+/// A pipeline that draws one full-screen triangle into a colour target: how much of a light's
+/// red, green and blue gets through.
 fn mask_pipeline(
     device: &wgpu::Device,
     label: &str,
@@ -218,7 +240,7 @@ fn mask_pipeline(
             module: &module,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::R8Unorm,
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -269,7 +291,7 @@ fn draw_mask(
     pass.draw(0..3, 0..1);
 }
 
-/// The single-channel texture in `slot`, made again if it is not `width` by `height`.
+/// The colour texture in `slot`, made again if it is not `width` by `height`.
 fn mask_texture(
     slot: &mut Option<GpuTexture>,
     server: &WgpuGraphicsServer,
@@ -284,7 +306,7 @@ fn mask_texture(
         *slot = Some(server.create_texture(GpuTextureDescriptor {
             name,
             kind: GpuTextureKind::Rectangle { width, height },
-            pixel_kind: PixelKind::R8,
+            pixel_kind: PixelKind::RGBA8,
             ..Default::default()
         })?);
     }
@@ -306,6 +328,7 @@ impl WgpuGraphicsServer {
         let instance = RayTracedInstance {
             geometry: &geometry,
             transform: IDENTITY_TRANSFORM,
+            lets_through: [0.0; 3],
         };
         let Some(mut scene) = self.build_ray_traced_instances(&[instance])? else {
             return Ok(None);
@@ -324,6 +347,28 @@ impl WgpuGraphicsServer {
         vertices: &[f32],
         indices: &[u32],
         updatable: bool,
+    ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
+        self.build_geometry(vertices, indices, updatable, false)
+    }
+
+    /// As [`Self::build_ray_traced_geometry`], but glass: rays go on through it rather than
+    /// stopping, and each copy of it lets through as much of a light as its
+    /// [`RayTracedInstance::lets_through`] says, so a light shone through it takes on its colour.
+    pub fn build_ray_traced_glass(
+        &self,
+        vertices: &[f32],
+        indices: &[u32],
+        updatable: bool,
+    ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
+        self.build_geometry(vertices, indices, updatable, true)
+    }
+
+    fn build_geometry(
+        &self,
+        vertices: &[f32],
+        indices: &[u32],
+        updatable: bool,
+        see_through: bool,
     ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
         if !self.ray_tracing || vertices.is_empty() || indices.len() < 3 {
             return Ok(None);
@@ -349,7 +394,12 @@ impl WgpuGraphicsServer {
             vertex_count,
             index_format: Some(wgpu::IndexFormat::Uint32),
             index_count: Some(index_count),
-            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            // Glass is only ever passed through, and each pane has to be counted once.
+            flags: if see_through {
+                wgpu::AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION
+            } else {
+                wgpu::AccelerationStructureGeometryFlags::OPAQUE
+            },
         };
         let (flags, update_mode) = if updatable {
             (
@@ -381,6 +431,7 @@ impl WgpuGraphicsServer {
             vertex_count,
             triangle_count: index_count / 3,
             updatable,
+            see_through,
         };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -480,7 +531,12 @@ impl WgpuGraphicsServer {
                 .chain(std::iter::repeat(None)),
         ) {
             *slot = instance.map(|instance| {
-                wgpu::TlasInstance::new(&instance.geometry.blas, instance.transform, 0, 0xff)
+                wgpu::TlasInstance::new(
+                    &instance.geometry.blas,
+                    instance.transform,
+                    lets_through_bits(instance.lets_through),
+                    0xff,
+                )
             });
         }
         scene.triangle_count = instances
@@ -558,8 +614,9 @@ impl WgpuGraphicsServer {
 }
 
 impl ShadowTracer {
-    /// Traces shadow rays for each pixel and returns a mask: 1 where the light reaches, 0 where
-    /// the geometry blocks it, and in between where it blocks part of the light. The mask is a
+    /// Traces shadow rays for each pixel and returns a mask: how much of the light's red, green
+    /// and blue reaches it - 1 where all of it does, 0 where the geometry blocks it, in between
+    /// where it blocks part of the light, and coloured where it came through glass. The mask is a
     /// texture like any other, to be read by an effect.
     ///
     /// The same texture is returned every time, so each call overwrites the previous mask. That

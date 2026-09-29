@@ -10,6 +10,11 @@ enable wgpu_ray_query;
 // The light is either the sun, infinitely far away in one direction, or a lamp at a point, whose
 // rays end where the lamp is so that nothing behind it can cast a shadow.
 //
+// Glass is traced too, but lets light through: its geometry is not opaque, so a ray passes on
+// through it, and each copy of it carries in its custom data how much of the red, green and blue
+// of the light it lets through, a byte each. A ray is lit by what is left of the light once every
+// pane it crosses has taken its share - coloured by the glass - and by nothing past anything solid.
+//
 // A real light has a size, and a shadow's edge is soft where only part of it is hidden. With more
 // than one sample, the rays spread over a disk the size of the light - or, for the sun, over the
 // cone its disk fills in the sky - and the pixel gets the share of them that got through. The
@@ -46,9 +51,10 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
     return vec4f(x, y, 0.0, 1.0);
 }
 
-// Whether anything lies along the ray within `reach`. Any hit will do, so the search stops at the
-// first one rather than looking for the nearest.
-fn blocked(origin: vec3f, direction: vec3f, reach: f32) -> bool {
+// How much of the light gets through along the ray within `reach`, colour by colour: none past
+// anything solid - any solid hit will do, so the search stops at the first one - and through each
+// pane of glass it crosses, as much as that glass lets through.
+fn transmitted(origin: vec3f, direction: vec3f, reach: f32) -> vec3f {
     const TERMINATE_ON_FIRST_HIT = 0x4u;
     var query: ray_query;
     rayQueryInitialize(&query, sceneGeometry, RayDesc(
@@ -59,8 +65,20 @@ fn blocked(origin: vec3f, direction: vec3f, reach: f32) -> bool {
         origin,
         direction,
     ));
-    rayQueryProceed(&query);
-    return rayQueryGetCommittedIntersection(&query).kind != RAY_QUERY_INTERSECTION_NONE;
+    var through = vec3f(1.0);
+    // Glass is only a candidate, never taken for the hit: the ray goes on through it.
+    while (rayQueryProceed(&query)) {
+        let lets = rayQueryGetCandidateIntersection(&query).instance_custom_data;
+        through *= vec3f(
+            f32(lets & 0xFFu),
+            f32((lets >> 8u) & 0xFFu),
+            f32((lets >> 16u) & 0xFFu),
+        ) / 255.0;
+    }
+    if (rayQueryGetCommittedIntersection(&query).kind != RAY_QUERY_INTERSECTION_NONE) {
+        return vec3f(0.0);
+    }
+    return through;
 }
 
 // A direction at right angles to `n` (which must be unit length), without dividing by anything
@@ -123,12 +141,12 @@ fn position_error(uv: vec2f, depth: f32, position: vec3f) -> f32 {
 }
 
 @fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) f32 {
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let pixel = vec2i(fragCoord.xy);
     let depth = textureLoad(sceneDepth, pixel, 0);
     // Nothing was drawn here, so nothing can be in shadow.
     if (depth >= 1.0) {
-        return 1.0;
+        return vec4f(1.0);
     }
 
     let uv = fragCoord.xy / uniforms.screenSize;
@@ -150,20 +168,20 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) f32 {
         let distance = length(offset);
         // Out of the lamp's reach, so it lights nothing here and there is nothing to shadow.
         if (distance >= uniforms.lightRadius || distance <= uniforms.bias) {
-            return 1.0;
+            return vec4f(1.0);
         }
         toLight = offset / distance;
     }
     // Facing away from the light: it lights nothing here whatever the rays would say.
     if (dot(normal, toLight) <= 0.0) {
-        return 0.0;
+        return vec4f(0.0, 0.0, 0.0, 1.0);
     }
 
     let count = max(uniforms.sampleCount, 1u);
     let t = tangent(toLight);
     let b = cross(toLight, t);
     let rotation = pattern_rotation(pixel);
-    var lit = 0u;
+    var lit = vec3f(0.0);
     for (var i = 0u; i < count; i++) {
         var spread = vec3f(0.0);
         if (count > 1u) {
@@ -174,12 +192,10 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) f32 {
             // surface and the light.
             let offset = uniforms.lightPosition + spread - origin;
             let reach = length(offset);
-            if (!blocked(origin, offset / reach, reach - uniforms.bias)) {
-                lit++;
-            }
-        } else if (!blocked(origin, normalize(toLight + spread), uniforms.reach)) {
-            lit++;
+            lit += transmitted(origin, offset / reach, reach - uniforms.bias);
+        } else {
+            lit += transmitted(origin, normalize(toLight + spread), uniforms.reach);
         }
     }
-    return f32(lit) / f32(count);
+    return vec4f(lit / f32(count), 1.0);
 }

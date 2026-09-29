@@ -556,6 +556,22 @@ pub struct SceneRenderPassContext<'a, 'b> {
     /// Keep in mind that G-Buffer cannot be modified in custom render passes, so you don't
     /// have an ability to write to this texture.
     pub ambient_texture: &'a GpuTexture,
+    /// A texture with the colour of each surface from G-Buffer: what light falling on it is
+    /// multiplied by.
+    ///
+    /// # Important notes
+    ///
+    /// Keep in mind that G-Buffer cannot be modified in custom render passes, so you don't
+    /// have an ability to write to this texture.
+    pub diffuse_texture: &'a GpuTexture,
+    /// A texture with the material of each surface from G-Buffer: how metallic it is in its red
+    /// channel, and how rough in its green.
+    ///
+    /// # Important notes
+    ///
+    /// Keep in mind that G-Buffer cannot be modified in custom render passes, so you don't
+    /// have an ability to write to this texture.
+    pub material_texture: &'a GpuTexture,
 
     /// User interface renderer.
     pub ui_renderer: &'a mut UiRenderer,
@@ -1212,6 +1228,8 @@ impl Renderer {
                         depth_texture: render_data.gbuffer.depth(),
                         normal_texture: render_data.gbuffer.normal_texture(),
                         ambient_texture: render_data.gbuffer.ambient_texture(),
+                        diffuse_texture: render_data.gbuffer.diffuse_texture(),
+                        material_texture: render_data.gbuffer.material_texture(),
                         framebuffer: &render_data.hdr_scene_framebuffer,
                         ui_renderer: &mut self.ui_renderer,
                         uniform_buffer_cache: &mut self.uniform_buffer_cache,
@@ -1311,6 +1329,8 @@ impl Renderer {
                         depth_texture: render_data.gbuffer.depth(),
                         normal_texture: render_data.gbuffer.normal_texture(),
                         ambient_texture: render_data.gbuffer.ambient_texture(),
+                        diffuse_texture: render_data.gbuffer.diffuse_texture(),
+                        material_texture: render_data.gbuffer.material_texture(),
                         framebuffer: &render_data.ldr_scene_framebuffer,
                         ui_renderer: &mut self.ui_renderer,
                         uniform_buffer_cache: &mut self.uniform_buffer_cache,

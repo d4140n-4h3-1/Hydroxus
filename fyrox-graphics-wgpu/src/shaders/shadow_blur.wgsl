@@ -50,11 +50,11 @@ fn normal_at(pixel: vec2i) -> vec3f {
 }
 
 @fragment
-fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) f32 {
+fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let pixel = vec2i(fragCoord.xy);
     let depth = textureLoad(sceneDepth, pixel, 0);
     if (depth >= 1.0) {
-        return 1.0;
+        return vec4f(1.0);
     }
     let normal = normal_at(pixel);
     let position = world_position(pixel, depth);
@@ -63,7 +63,7 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) f32 {
     // still the same surface.
     let tolerance = uniforms.planeTolerance + 2.0 * position_error(pixel, depth, position);
 
-    var sum = 0.0;
+    var sum = vec3f(0.0);
     var weights = 0.0;
     for (var dy = -2; dy <= 2; dy++) {
         for (var dx = -2; dx <= 2; dx++) {
@@ -75,10 +75,10 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) f32 {
             let facing = pow(max(dot(normal, normal_at(neighbor)), 0.0), 8.0);
             let offPlane = abs(dot(normal, world_position(neighbor, neighborDepth) - position));
             let weight = facing * max(1.0 - offPlane / tolerance, 0.0);
-            sum += textureLoad(mask, neighbor, 0).r * weight;
+            sum += textureLoad(mask, neighbor, 0).rgb * weight;
             weights += weight;
         }
     }
     // The pixel itself always counts fully, so there is always something to divide by.
-    return sum / weights;
+    return vec4f(sum / weights, 1.0);
 }

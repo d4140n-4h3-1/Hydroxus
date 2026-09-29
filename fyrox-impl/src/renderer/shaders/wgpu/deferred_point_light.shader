@@ -138,8 +138,9 @@
                             properties.shadowsEnabled != 0u, properties.softShadows != 0u, dist, properties.shadowBias, ctx.fragmentToLight, pointShadowTexture_tex, pointShadowTexture_samp);
                         // A traced shadow, when the renderer has one for this light, replaces the shadow map.
                         // It is sampled either way: sampling is not allowed under a condition here.
-                        let traced_shadow = textureSample(tracedShadowTexture_tex, tracedShadowTexture_samp, tex_coord).r;
-                        let final_shadow = mix(1.0, select(shadow, traced_shadow, properties.tracedShadows != 0u), properties.shadowAlpha);
+                        let traced_shadow = textureSample(tracedShadowTexture_tex, tracedShadowTexture_samp, tex_coord).rgb;
+                        // Traced, it is coloured where the light came through glass.
+                        let final_shadow = mix(vec3f(1.0), select(vec3f(shadow), traced_shadow, properties.tracedShadows != 0u), properties.shadowAlpha);
 
                         return vec4f(properties.lightIntensity * distance_attenuation * final_shadow * lighting, diffuse_color.a);
                     }
