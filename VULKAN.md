@@ -1,6 +1,6 @@
-# Vulkan fork
+# Hydroxus: the Vulkan branch
 
-This branch makes Fyrox's wgpu backend (`backend_wgpu`, Vulkan on Linux) render games the same
+This branch - Hydroxus's `vulkan` - makes Fyrox's wgpu backend (`backend_wgpu`, Vulkan on Linux) render games the same
 way the OpenGL backend does. It was driven by running Station Iapetus on both backends and
 comparing the frames stage by stage (G-buffer, HDR, final image).
 

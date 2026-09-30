@@ -1,62 +1,56 @@
 <div align="center">
-  <a href="https://fyrox.rs/">
-    <img src="pics/logo.png" width="128" height="128" alt="Fyrox" />
-  </a>
-  <h1>Fyrox - a modern Rust game engine</h1>
+  <h1>Hydroxus</h1>
+  <p>A fork of the <a href="https://github.com/FyroxEngine/Fyrox">Fyrox</a> game engine, built
+  around its wgpu backend: Vulkan on the desktop, WebGL 2 in a browser.</p>
 </div>
 
-[![License (MIT)](https://img.shields.io/crates/l/fyrox)](https://github.com/FyroxEngine/Fyrox/blob/master/LICENSE.md)
-[![CI Status](https://github.com/FyroxEngine/Fyrox/actions/workflows/ci.yml/badge.svg)](https://github.com/FyroxEngine/Fyrox/actions/workflows/ci.yml)
-[![Crates.io](https://img.shields.io/crates/v/fyrox)](https://crates.io/crates/fyrox)
-[![docs.rs](https://img.shields.io/badge/docs-website-blue)](https://docs.rs/Fyrox/)
-[![Discord](https://img.shields.io/discord/756573453561102427)](https://discord.gg/xENF5Uh)
-[![Lines of code](https://tokei.rs/b1/github/FyroxEngine/Fyrox)](https://github.com/FyroxEngine/Fyrox)
+Hydroxus is [Fyrox](https://fyrox.rs/) - the feature-rich 2D/3D Rust game engine by Dmitry Stepanov
+and the Fyrox contributors - with its wgpu renderer made to draw games the way the OpenGL one
+does, running in a browser, and taught to trace rays where the hardware can. Nearly everything
+in it is Fyrox's own work; see [Credits and licence](#credits-and-licence).
 
-A feature-rich, production-ready, general purpose 2D/3D game engine written in Rust with a scene editor.
-_Formerly known as rg3d_
+## What it adds
 
-## [Learning materials](https://fyrox-book.github.io/)
+- **The wgpu backend, made whole.** Frames match the OpenGL backend's: depth, coordinate
+  conventions, shadows, bloom, SSAO, decals and UI render targets all line up. Fyrox's
+  `backend_wgpu` feature takes effect instead of being overridden by OpenGL.
+- **Browsers.** On `wasm32` it draws with WebGL 2, through wgpu's GL backend.
+- **Hardware ray tracing.** Where the adapter has ray queries, shadows can be traced: soft and
+  exact, coloured by glass the light passes through, with moving things traced where they are
+  each frame.
+- **Area lights.** Glowing rectangles that light what is round them from their whole surface, with
+  soft traced shadows where rays can be traced.
+- **Faster shadow maps**, and fixes to glTF import, animation, loading and more.
 
-[Read the official Fyrox book here.](https://fyrox-book.github.io/) It contains comprehensive information about many aspects of the engine, starting
-by "how to build" and ending by various tutorials.
+[`VULKAN.md`](VULKAN.md) describes the changes to the renderer, and why, file by file.
 
-## Community
+## Using it
 
-You can always ask your question in Discord server - [Join the Discord server](https://discord.gg/xENF5Uh), or directly in 
-[Discussions](https://github.com/FyroxEngine/Fyrox/discussions).
+The crates keep their Fyrox names, so code written for Fyrox works unchanged and upstream changes
+merge cleanly. Depend on this repository instead of crates.io, and turn on the wgpu backend:
 
-## Examples
+```toml
+[dependencies]
+fyrox = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan", default-features = false, features = ["backend_wgpu"] }
+```
 
-You can run examples directly in your web browser, the full list of demo projects is [available here](https://fyrox.rs/examples.html).
-Source code for each demo project [can be found here](https://github.com/FyroxEngine/Fyrox-demo-projects).
+Nothing else in the workspace should enable `backend_opengl`: when both are on, OpenGL wins. For a
+browser build, also enable wgpu's `webgl` feature.
 
-## Support
+Fyrox's own documentation applies throughout: the [Fyrox book](https://fyrox-book.github.io/),
+the [API docs](https://docs.rs/fyrox/) and the
+[examples](https://github.com/FyroxEngine/Fyrox-demo-projects).
 
-If you want to support the development of the project, click the link below. Preferrable way is to use [Boosty](https://boosty.to/fyrox) - this way the money
-will be available for the development immediately. Alternatively you can can use [Patreon](https://www.patreon.com/mrdimas), but in this case the money will
-be on-hold for unknown period of time ([details are here](https://github.com/FyroxEngine/Fyrox/issues/363)).
+## Used by
 
-## Contributing
+- [fyrox-gfx](https://github.com/d4140n-4h3-1/fyrox-gfx): graphics effects - traced shadows,
+  area lights, glass, reflections, anti-aliasing - as render passes.
+- [MazeGame](https://github.com/d4140n-4h3-1/MazeGame): the game it was made for, and its
+  [web build](https://github.com/d4140n-4h3-1/MazeGame-web).
 
-Contributions are very welcome! See the [contributions guidelines](CONTRIBUTING.md) for more info. Check the [good first issue](https://github.com/FyroxEngine/Fyrox/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) label to 
-see where you can help.
+## Credits and licence
 
-## Sponsors
-
-The engine is supported by very generous people, their donations provides sustainable development of the engine:
-
-[Brandon Thomas](https://www.patreon.com/user?u=34951681) | [Taylor C. Richberger](https://www.patreon.com/user/creators?u=60141723) | [Avery Wagar](https://www.patreon.com/user?u=41863848) |
-[George Atkinson](https://www.patreon.com/user?u=61771027) | [Erlend Sogge Heggen](https://www.patreon.com/amethystengine/creators) | [Mitch Skinner](https://www.patreon.com/user/creators?u=60141723) | [ozkriff](https://www.patreon.com/ozkriff) | [Taylor Gerpheide](https://www.patreon.com/user/creators?u=32274918) |
-[zrkn](https://www.patreon.com/user/creators?u=23413376) | [Aleks Row](https://www.patreon.com/user/creators?u=51907853) | [Edward L](https://www.patreon.com/user/creators?u=53507198) | [L.apz](https://www.patreon.com/user/creators?u=5448832) | [Luke Jones](https://www.patreon.com/flukejones) | [toyboot4e](https://www.patreon.com/user/creators?u=53758973) | [Vish Vadlamani](https://www.patreon.com/user/creators?u=42768509) |
-[Alexey Kuznetsov](https://www.patreon.com/user?u=39375025) | [Daniel Simon](https://www.patreon.com/user/creators?u=43754885) | [Jesper Nordenberg](https://www.patreon.com/jesnor) | [Kornel](https://www.patreon.com/user?u=59867) | [Parham Gholami](https://www.patreon.com/user?u=33009238) | [Yuki Ishii](https://www.patreon.com/user/creators?u=9564103) |
-[Joseph Catrambone](https://www.patreon.com/user?u=4738580) | [MGlolenstine](https://github.com/MGlolenstine) | [zamar lomax](https://www.patreon.com/user?u=65928523) | [Gheorghe Ugrik](https://www.patreon.com/user?u=54846813) |
-[Anton Zelenin](https://www.patreon.com/user?u=62378966) | [Barugon](https://www.patreon.com/user?u=11344465) | [Tom Leys](https://www.patreon.com/user?u=222856) | [Jay Sistar](https://www.patreon.com/user?u=284041) | [tc](https://www.patreon.com/user?u=11268466) | [false](https://www.patreon.com/user?u=713537) | [BlueSkye](https://www.patreon.com/EmotionalSnow) |
-[Ben Anderson](https://www.patreon.com/user/creators?u=14436239) | [Thomas](https://www.patreon.com/user?u=317826) | [Iulian Radu](https://www.patreon.com/user?u=8698230) | [Vitaliy (ArcticNoise) Chernyshev](https://www.patreon.com/user?u=2601918)
-
-### JetBrains
-
-JetBrains provided an open-source all-products license for their products which drastically helps in development of the engine.
-
-<img src="https://resources.jetbrains.com/storage/products/company/brand/logos/jb_beam.png" alt="JetBrains logo." width="200" height="200">
-
-_Copyright © 2000-2021 [JetBrains](https://jb.gg/OpenSource) s.r.o. JetBrains and the JetBrains logo are registered trademarks of JetBrains s.r.o._
+Hydroxus is a fork of [Fyrox](https://github.com/FyroxEngine/Fyrox), Copyright (c) 2019-present
+Dmitry Stepanov and Fyrox Engine contributors, and like Fyrox is released under the MIT licence
+([`LICENSE.md`](LICENSE.md)). It is not affiliated with or endorsed by the Fyrox project. If you
+would like to support Fyrox itself, see [its README](https://github.com/FyroxEngine/Fyrox#support).
