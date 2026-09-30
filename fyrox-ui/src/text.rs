@@ -23,6 +23,7 @@
 
 #![warn(missing_docs)]
 
+use crate::formatted_text::InlineContext;
 use crate::{
     brush::Brush,
     core::{
@@ -319,6 +320,15 @@ impl MessageData for TextMessage {}
 ///
 /// Please keep in mind, that like any other situation when you "changing" something via messages, you should remember
 /// that the change is **not** immediate.
+///
+/// ## Inline Elements
+///
+/// It is possible to put a child widget in the text at arbitrary position, such widgets are called
+/// inline widgets. It could be useful to create complex text layout. For example, this ability allows
+/// you to create text with embedded images. To add an inline element all you need to do is to put
+/// it as a direct child widget of the [`Text`] widget and set its column property to the desired
+/// character index. The inline widget will then be put at the specified position and the rest of the
+/// text will be put right next to it.
 #[derive(Default, Clone, Visit, PartialEq, Reflect, Debug)]
 #[reflect(
     derived_type = "UiNode",
@@ -359,17 +369,26 @@ impl ConstructorProvider<UiNode, UserInterface> for Text {
 crate::define_widget_deref!(Text);
 
 impl Control for Text {
-    fn measure_override(&self, _: &UserInterface, available_size: Vector2<f32>) -> Vector2<f32> {
+    fn measure_override(&self, ui: &UserInterface, available_size: Vector2<f32>) -> Vector2<f32> {
         self.formatted_text
             .borrow_mut()
             .set_super_sampling_scale(self.visual_max_scaling())
             .set_constraint(available_size)
-            .measure()
+            .measure(Some(InlineContext {
+                children: &self.children,
+                ui,
+            }))
     }
 
     fn arrange_override(&self, ui: &UserInterface, final_size: Vector2<f32>) -> Vector2<f32> {
-        self.formatted_text.borrow_mut().arrange(final_size);
-        self.widget.arrange_override(ui, final_size)
+        self.formatted_text.borrow_mut().arrange(
+            final_size,
+            Some(InlineContext {
+                children: &self.children,
+                ui,
+            }),
+        );
+        final_size
     }
 
     fn draw(&self, drawing_context: &mut DrawingContext) {

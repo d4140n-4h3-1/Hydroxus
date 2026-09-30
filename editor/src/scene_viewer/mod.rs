@@ -18,38 +18,37 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::scene_viewer::menu::{SceneItemAction, SceneItemMenu};
 use crate::{
     fyrox::{
-        core::{color::Color, math::Rect, pool::Handle, uuid::Uuid},
+        core::{algebra::Vector2, color::Color, math::Rect, pool::Handle, uuid::Uuid},
         engine::Engine,
         fxhash::FxHashMap,
         graph::SceneGraph,
         graphics::PolygonFillMode,
         gui::{
-            border::BorderBuilder,
+            border::{Border, BorderBuilder},
             brush::Brush,
             button::{Button, ButtonBuilder, ButtonMessage},
             canvas::CanvasBuilder,
-            check_box::{CheckBoxBuilder, CheckBoxMessage},
+            check_box::{CheckBox, CheckBoxBuilder, CheckBoxMessage},
             decorator::DecoratorMessage,
             dropdown_list::{DropdownList, DropdownListMessage},
-            dropdown_menu::DropdownMenuBuilder,
+            dropdown_menu::{DropdownMenu, DropdownMenuBuilder},
             formatted_text::WrapMode,
             grid::{Column, GridBuilder, Row},
-            image::{ImageBuilder, ImageMessage},
+            image::{Image, ImageBuilder, ImageMessage},
             message::{MessageDirection, MouseButton, UiMessage},
-            numeric::{NumericUpDownBuilder, NumericUpDownMessage},
-            stack_panel::StackPanelBuilder,
+            numeric::{NumericUpDown, NumericUpDownBuilder, NumericUpDownMessage},
+            stack_panel::{StackPanel, StackPanelBuilder},
             style::{resource::StyleResourceExt, Style},
             tab_control::{TabControl, TabControlBuilder, TabControlMessage, TabDefinition},
-            text::{TextBuilder, TextMessage},
+            text::{Text, TextBuilder, TextMessage},
             utils::{
                 make_dropdown_list_option, make_dropdown_list_option_universal,
-                make_dropdown_list_option_with_height, make_simple_tooltip,
+                make_dropdown_list_option_with_height, make_simple_tooltip, ImageButtonBuilder,
             },
             widget::{WidgetBuilder, WidgetMessage},
-            window::{WindowBuilder, WindowMessage, WindowTitle},
+            window::{Window, WindowBuilder, WindowMessage, WindowTitle},
             BuildContext, HorizontalAlignment, Orientation, Thickness, UserInterface,
             VerticalAlignment,
         },
@@ -59,23 +58,16 @@ use crate::{
     load_image,
     message::MessageSender,
     scene::container::EditorSceneEntry,
-    scene_viewer::gizmo::{SceneGizmo, SceneGizmoAction},
+    scene_viewer::{
+        gizmo::{SceneGizmo, SceneGizmoAction},
+        menu::{SceneItemAction, SceneItemMenu},
+    },
     settings::SettingsMessage,
-    utils,
-    utils::enable_widget,
+    utils::{self, enable_widget},
     DropdownListBuilder, GameScene, Message, Mode, SaveSceneConfirmationDialogAction,
     SceneContainer, Settings,
 };
-use fyrox::core::algebra::Vector2;
-use fyrox::gui::border::Border;
-use fyrox::gui::check_box::CheckBox;
-use fyrox::gui::dropdown_menu::DropdownMenu;
-use fyrox::gui::image::Image;
-use fyrox::gui::numeric::NumericUpDown;
-use fyrox::gui::stack_panel::StackPanel;
-use fyrox::gui::text::Text;
-use fyrox::gui::utils::ImageButtonBuilder;
-use fyrox::gui::window::Window;
+use fyrox::scene;
 use std::{
     ops::Deref,
     sync::mpsc::{self, Receiver},
@@ -637,45 +629,50 @@ impl SceneViewer {
         }
     }
 
+    fn sync_with_game_scene(
+        &mut self,
+        game_scene: &GameScene,
+        ui: &UserInterface,
+        scenes: &scene::SceneContainer,
+    ) {
+        let scene = &scenes[game_scene.scene];
+
+        let index = match scene.graph[game_scene.camera_controller.camera].projection() {
+            Projection::Perspective(_) => Some(0),
+            Projection::Orthographic(_) => Some(1),
+        };
+        ui.send(
+            self.camera_projection,
+            DropdownListMessage::Selection(index),
+        );
+
+        let mode = match scene.rendering_options.polygon_rasterization_mode {
+            PolygonFillMode::Fill => Some(0),
+            PolygonFillMode::Line => Some(1),
+            _ => None,
+        };
+        ui.send(self.debug_switches, DropdownListMessage::Selection(mode));
+
+        for widget in [self.camera_projection, self.debug_switches] {
+            ui.send(widget, WidgetMessage::Visibility(true));
+        }
+    }
+
     pub fn on_current_scene_changed(
         &mut self,
         new_scene: &mut EditorSceneEntry,
         engine: &mut Engine,
     ) {
         let ui = engine.user_interfaces.first_mut();
-        let index = new_scene
-            .controller
-            .downcast_ref::<GameScene>()
-            .map(|game_scene| {
-                let scene = &engine.scenes[game_scene.scene];
-                match scene.graph[game_scene.camera_controller.camera].projection() {
-                    Projection::Perspective(_) => 0,
-                    Projection::Orthographic(_) => 1,
-                }
-            });
-        ui.send(
-            self.camera_projection,
-            DropdownListMessage::Selection(index),
-        );
-        let debug_mode_index = new_scene
-            .controller
-            .downcast_ref::<GameScene>()
-            .map(|s| {
-                engine.scenes[s.scene]
-                    .rendering_options
-                    .polygon_rasterization_mode
-            })
-            .map(|s| match s {
-                PolygonFillMode::Fill => 0,
-                PolygonFillMode::Line => 1,
-                _ => 0,
-            });
-        if let Some(debug_mode_index) = debug_mode_index {
-            ui.send(
-                self.debug_switches,
-                DropdownListMessage::Selection(Some(debug_mode_index)),
-            );
+
+        if let Some(game_scene) = new_scene.controller.downcast_ref::<GameScene>() {
+            self.sync_with_game_scene(game_scene, ui, &engine.scenes)
+        } else {
+            for widget in [self.camera_projection, self.debug_switches] {
+                ui.send(widget, WidgetMessage::Visibility(false));
+            }
         }
+
         self.sync_interaction_modes(new_scene, ui)
     }
 
@@ -720,6 +717,7 @@ impl SceneViewer {
                 if let Some(entry) = scenes.entry_by_scene_id(scene_id) {
                     if let Some(entry_path) = entry.path.as_ref() {
                         settings.general.add_startup_scene(entry_path);
+                        self.sender.send(Message::ForceSync);
                     }
                 }
             }
@@ -727,6 +725,7 @@ impl SceneViewer {
                 if let Some(entry) = scenes.entry_by_scene_id(scene_id) {
                     if let Some(entry_path) = entry.path.as_ref() {
                         settings.general.remove_startup_scene(entry_path);
+                        self.sender.send(Message::ForceSync);
                     }
                 }
             }
@@ -921,7 +920,7 @@ impl SceneViewer {
         }
     }
 
-    pub fn sync_to_model(&self, scenes: &SceneContainer, engine: &mut Engine) {
+    pub fn sync_to_model(&self, scenes: &SceneContainer, settings: &Settings, engine: &mut Engine) {
         // Sync tabs first.
 
         // Remove any excess tabs.
@@ -967,14 +966,22 @@ impl SceneViewer {
 
         for tab in ui[self.tab_control].tabs.iter() {
             if let Some(scene) = scenes.entry_by_scene_id(tab.uuid) {
-                ui.send(
-                    tab.header_content,
-                    TextMessage::Text(format!(
-                        "{}{}",
-                        scene.name(),
-                        if scene.need_save() { "*" } else { "" }
-                    )),
-                );
+                let mut title = String::with_capacity(64);
+                if scene.need_save() {
+                    title += "* ";
+                }
+                let is_startup = scene
+                    .path
+                    .as_ref()
+                    .is_some_and(|p| settings.general.startup_scenes.contains(p));
+                if is_startup {
+                    title += "[";
+                }
+                title += scene.name().as_str();
+                if is_startup {
+                    title += "]";
+                }
+                ui.send(tab.header_content, TextMessage::Text(title));
             }
         }
 
