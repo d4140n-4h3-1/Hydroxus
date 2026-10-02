@@ -57,6 +57,9 @@ pub struct WgpuBuffer {
     size: Cell<usize>,
     kind: BufferKind,
     usage: BufferUsage,
+    /// The server's count of submissions when the buffer was last bound by a command, if ever:
+    /// while it is still the count, those commands are waiting to be submitted.
+    bound: Cell<Option<u64>>,
 }
 
 impl WgpuBuffer {
@@ -86,7 +89,13 @@ impl WgpuBuffer {
             size: Cell::new(desc.size),
             kind: desc.kind,
             usage: desc.usage,
+            bound: Cell::new(None),
         })
+    }
+
+    /// Notes that a command being recorded reads the buffer.
+    pub fn mark_bound(&self, server: &WgpuGraphicsServer) {
+        self.bound.set(Some(server.submissions.get()));
     }
 
     /// Returns a reference to the underlying [`wgpu::Buffer`].
@@ -128,8 +137,14 @@ impl GpuBufferTrait for WgpuBuffer {
         let Some(server) = self.server.upgrade() else {
             return Err(FrameworkError::GraphicsServerUnavailable);
         };
-        // Commands recorded before this write must not see its data.
-        server.submit_pending();
+        // Commands recorded before this write must not see its data: `write_buffer` takes effect
+        // before the next submission, so any not yet submitted that read the buffer go first.
+        // Only those - submitting costs far more than drawing, and most writes are to buffers
+        // nothing has read since the last submission, such as the uniform buffers handed out
+        // afresh for every draw.
+        if self.bound.get() == Some(server.submissions.get()) {
+            server.submit_pending();
+        }
         if data.len() <= self.size.get() {
             server
                 .state

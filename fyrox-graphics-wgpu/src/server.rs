@@ -208,6 +208,11 @@ pub struct WgpuGraphicsServer {
     /// Storing it on the server (not per-framebuffer) because multiple framebuffers
     /// (G-Buffer, HDR, backbuffer) share the same frame and benefit from a single submit.
     pub frame_encoder: RefCell<Option<wgpu::CommandEncoder>>,
+    /// How many times the frame encoder has been submitted. A buffer bound by a command recorded
+    /// since the last submission remembers this number, so that writing to it can tell whether
+    /// the write has to wait for those commands to be submitted first (see
+    /// [`crate::buffer::WgpuBuffer`]).
+    pub submissions: Cell<u64>,
     /// Currently accumulating render pass. Draw commands are batched here and
     /// flushed when the target changes or the frame ends.
     pub active_pass: RefCell<Option<ActivePass>>,
@@ -441,6 +446,7 @@ impl WgpuGraphicsServer {
             backbuffer_needs_clear: Cell::new(true),
             backbuffer_depth_stencil: RefCell::new(None),
             frame_encoder: RefCell::new(None),
+            submissions: Cell::new(0),
             active_pass: RefCell::new(None),
             mipmap_sampler,
             mipmap_bind_group_layout,
@@ -646,8 +652,14 @@ impl WgpuGraphicsServer {
     pub fn submit_pending(&self) {
         self.flush_active_pass();
         if let Some(encoder) = self.frame_encoder.borrow_mut().take() {
-            self.state.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_frame_encoder(encoder);
         }
+    }
+
+    /// Submits the frame encoder, taken from [`Self::frame_encoder`].
+    pub fn submit_frame_encoder(&self, encoder: wgpu::CommandEncoder) {
+        self.state.queue.submit(std::iter::once(encoder.finish()));
+        self.submissions.set(self.submissions.get() + 1);
     }
 }
 
@@ -795,7 +807,7 @@ impl GraphicsServer for WgpuGraphicsServer {
         // Submit all batched draw commands from this frame
         self.flush_active_pass();
         if let Some(encoder) = self.frame_encoder.borrow_mut().take() {
-            self.state.queue.submit(std::iter::once(encoder.finish()));
+            self.submit_frame_encoder(encoder);
         }
 
         let frame = self.current_frame.borrow_mut().take();
@@ -827,7 +839,7 @@ impl GraphicsServer for WgpuGraphicsServer {
 
             self.flush_active_pass();
             if let Some(encoder) = self.frame_encoder.borrow_mut().take() {
-                self.state.queue.submit(std::iter::once(encoder.finish()));
+                self.submit_frame_encoder(encoder);
             }
 
             self.current_frame.borrow_mut().take();

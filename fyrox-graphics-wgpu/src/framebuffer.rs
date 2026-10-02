@@ -1027,7 +1027,7 @@ impl GpuFrameBufferTrait for WgpuFrameBuffer {
         server.flush_active_pass();
         // Flush any pending frame encoder so prior draws are submitted before readback.
         if let Some(encoder) = server.frame_encoder.borrow_mut().take() {
-            server.state.queue.submit(std::iter::once(encoder.finish()));
+            server.submit_frame_encoder(encoder);
         }
         let texture = match read_target {
             ReadTarget::Depth | ReadTarget::Stencil => &self.depth_attachment.as_ref()?.texture,
@@ -1301,6 +1301,7 @@ fn create_bind_group(
                     // SAFETY: No write_data call is active at this point (we're building
                     // bind groups between draw calls), so the buffer reference is stable.
                     let wb_buf = unsafe { wb.wgpu_buffer_raw() };
+                    wb.mark_bound(server);
                     wb_buf.hash(&mut hasher);
                     hasher.write_u32(*loc as u32);
                     match data_usage {
