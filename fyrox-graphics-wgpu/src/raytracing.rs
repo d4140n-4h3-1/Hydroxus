@@ -105,8 +105,10 @@ pub const IDENTITY_TRANSFORM: [f32; 12] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.
 /// each where it is.
 pub struct RayTracedScene {
     pub(crate) tlas: wgpu::Tlas,
-    /// How many copies it has room for, and how many triangles the ones it has come to.
+    /// How many copies it has room for, how many it was last given, and how many triangles the
+    /// ones it has come to.
     capacity: u32,
+    used: u32,
     triangle_count: u32,
     /// For a scene built from triangles alone, the geometry it holds.
     _geometry: Option<RayTracedGeometry>,
@@ -496,6 +498,7 @@ impl WgpuGraphicsServer {
         let mut scene = RayTracedScene {
             tlas,
             capacity,
+            used: 0,
             triangle_count: 0,
             _geometry: None,
         };
@@ -503,26 +506,33 @@ impl WgpuGraphicsServer {
         Ok(Some(scene))
     }
 
-    /// Places `instances` in `scene` in place of what it had, making room for them if it has to.
-    /// Cheap enough to do every frame.
+    /// Places `instances` in `scene` in place of what it had, making room for them if it has to,
+    /// and giving back room it has far more of than it needs. Cheap enough to do every frame: it
+    /// costs as many copies as there are, not as many as there is room for.
     pub fn update_ray_traced_instances(
         &self,
         scene: &mut RayTracedScene,
         instances: &[RayTracedInstance],
     ) -> Result<(), FrameworkError> {
-        if instances.len() as u32 > scene.capacity {
-            let capacity = (instances.len() as u32).next_power_of_two();
+        // Every slot there is room for is gone through each time the scene is built, used or
+        // not, so room for many more than are placed is given back.
+        let wanted = (instances.len() as u32).max(1).next_power_of_two();
+        if instances.len() as u32 > scene.capacity || scene.capacity >= wanted * 4 {
             scene.tlas = self.state.device.create_tlas(&wgpu::CreateTlasDescriptor {
                 label: Some("RayTracedScene"),
-                max_instances: capacity,
+                max_instances: wanted,
                 flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
                 update_mode: wgpu::AccelerationStructureUpdateMode::Build,
             });
-            scene.capacity = capacity;
+            scene.capacity = wanted;
+            scene.used = 0;
         }
+        // Only the slots given copies now or last time; those past them are empty already.
+        let end = (instances.len() as u32).max(scene.used) as usize;
+        scene.used = instances.len() as u32;
         let slots = scene
             .tlas
-            .get_mut_slice(0..scene.capacity as usize)
+            .get_mut_slice(0..end)
             .ok_or_else(|| FrameworkError::Custom("ray traced scene instances".into()))?;
         for (slot, instance) in slots.iter_mut().zip(
             instances
