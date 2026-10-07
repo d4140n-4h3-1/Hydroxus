@@ -31,7 +31,7 @@ struct Uniforms {
     pad0: u32,
     pad1: u32,
     pad2: u32,
-    lights: array<Light, 16>,
+    lights: array<Light, 64>,
 };
 
 @group(0) @binding(1) var sceneDepth: texture_2d<f32>;
@@ -85,7 +85,7 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
 
     let turn = pattern_rotation(pixel);
     var light = vec3f(0.0);
-    for (var l = 0u; l < min(uniforms.lightCount, 16u); l++) {
+    for (var l = 0u; l < min(uniforms.lightCount, 64u); l++) {
         let area = uniforms.lights[l];
         let u = area.edgeU.xyz;
         let v = area.edgeV.xyz;

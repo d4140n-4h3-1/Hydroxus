@@ -16,8 +16,10 @@ use fyrox_graphics::{
 };
 use wgpu::util::DeviceExt;
 
-/// The most area lights lit at once. Any more are left out.
-pub const MAX_AREA_LIGHTS: usize = 16;
+/// The most area lights lit at once. Any more are left out. Each pixel only works on the lights
+/// that reach it, so many lights spread out cost about what a few do; 64 of them fill 4 KB of
+/// uniforms, well inside what every backend allows.
+pub const MAX_AREA_LIGHTS: usize = 64;
 
 /// A glowing rectangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -540,4 +542,15 @@ fn draw(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
     pass.draw(0..3, 0..1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shader_holds_as_many_lights_as_are_sent() {
+        assert!(SHADER.contains(&format!("lights: array<Light, {MAX_AREA_LIGHTS}>")));
+        assert!(SHADER.contains(&format!("min(uniforms.lightCount, {MAX_AREA_LIGHTS}u)")));
+    }
 }
