@@ -25,6 +25,7 @@
 //! Sound engine manages contexts, feeds output device with data.
 
 use crate::context::SoundContext;
+use crate::renderer::Renderer;
 use fyrox_core::visitor::prelude::*;
 use fyrox_core::SafeLock;
 use std::error::Error;
@@ -45,6 +46,11 @@ impl Default for SoundEngine {
 pub struct State {
     sample_rate: u32,
     contexts: Vec<SoundContext>,
+    /// A whole HRTF block rendered ahead, and how much of it has been handed out already. The HRTF
+    /// renderer works only in blocks of [`State::render_buffer_len`], which is longer than the
+    /// output device's own block.
+    hrtf_block: Vec<(f32, f32)>,
+    hrtf_block_read: usize,
     #[cfg(feature = "output")]
     output_device: Option<tinyaudio::OutputDevice>,
 }
@@ -52,6 +58,16 @@ pub struct State {
 impl SoundEngine {
     /// Default sample rate of the sound engine.
     pub const DEFAULT_SAMPLE_RATE: u32 = 44100;
+
+    /// How many samples per channel the output device is fed at a time. The device holds two of
+    /// these, so this sets how late every sound is heard: 512 is about 23 ms at 44.1 kHz, where the
+    /// HRTF block of 2052 is about 93 ms. In a browser the samples are handed over on the page's
+    /// own thread, between frames, so there the longer block stays to keep the sound from breaking.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub const OUTPUT_BLOCK_LEN: usize = 512;
+    /// How many samples per channel the output device is fed at a time.
+    #[cfg(target_arch = "wasm32")]
+    pub const OUTPUT_BLOCK_LEN: usize = SoundContext::SAMPLES_PER_CHANNEL;
 
     /// Creates new instance of the sound engine. It is possible to have multiple engines running at
     /// the same time, but you shouldn't do this because you can create multiple contexts which
@@ -69,6 +85,8 @@ impl SoundEngine {
         Self(Arc::new(Mutex::new(State {
             sample_rate,
             contexts: Default::default(),
+            hrtf_block: Default::default(),
+            hrtf_block_read: 0,
             #[cfg(feature = "output")]
             output_device: None,
         })))
@@ -102,7 +120,7 @@ impl SoundEngine {
                 tinyaudio::OutputDeviceParameters {
                     sample_rate,
                     channels_count: 2,
-                    channel_sample_count: SoundContext::SAMPLES_PER_CHANNEL,
+                    channel_sample_count: Self::OUTPUT_BLOCK_LEN,
                 },
                 {
                     move |buf| {
@@ -184,8 +202,36 @@ impl State {
     /// This method internally locks added sound contexts so it must be called when all the contexts
     /// are unlocked or you'll get a deadlock.
     pub fn render(&mut self, buf: &mut [(f32, f32)]) {
-        buf.fill((0.0, 0.0));
-        self.render_inner(buf);
+        // Without HRTF any length renders as it is asked for, and nothing waits a block ahead.
+        if self.hrtf_block_read == self.hrtf_block.len() && !self.uses_hrtf() {
+            buf.fill((0.0, 0.0));
+            self.render_inner(buf);
+            return;
+        }
+
+        let mut written = 0;
+        while written < buf.len() {
+            if self.hrtf_block_read == self.hrtf_block.len() {
+                let mut block = std::mem::take(&mut self.hrtf_block);
+                block.clear();
+                block.resize(Self::render_buffer_len(), (0.0, 0.0));
+                self.render_inner(&mut block);
+                self.hrtf_block = block;
+                self.hrtf_block_read = 0;
+            }
+            let count = (buf.len() - written).min(self.hrtf_block.len() - self.hrtf_block_read);
+            buf[written..written + count].copy_from_slice(
+                &self.hrtf_block[self.hrtf_block_read..self.hrtf_block_read + count],
+            );
+            written += count;
+            self.hrtf_block_read += count;
+        }
+    }
+
+    fn uses_hrtf(&self) -> bool {
+        self.contexts
+            .iter()
+            .any(|context| matches!(context.state().renderer(), Renderer::HrtfRenderer(_)))
     }
 
     fn render_inner(&mut self, buf: &mut [(f32, f32)]) {
