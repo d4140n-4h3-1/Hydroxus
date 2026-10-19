@@ -150,6 +150,17 @@ pub trait GpuBufferTrait: GpuBufferAsAny {
     fn size(&self) -> usize;
     /// Writes an arbitrary number of bytes from the given slice.
     fn write_data(&self, data: &[u8]) -> Result<(), FrameworkError>;
+    /// Writes `data` into the buffer from `offset` bytes in, leaving the rest as it is. The caller
+    /// promises that nothing recorded but not yet submitted reads that part of the buffer, as when
+    /// appending to a buffer that commands read only the start of, so a backend need not submit
+    /// first. Backends that cannot write part of a buffer return an error; the caller then writes
+    /// the whole of it with [`Self::write_data`].
+    fn write_data_at(&self, offset: usize, data: &[u8]) -> Result<(), FrameworkError> {
+        let _ = (offset, data);
+        Err(FrameworkError::Custom(
+            "This backend cannot write part of a buffer".to_string(),
+        ))
+    }
     /// Read an arbitrary number of bytes from the buffer (GPU memory) to the given slice. The
     /// amount of the data that will be attempted to read is defined by the length of the given
     /// slice.

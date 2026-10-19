@@ -131,7 +131,10 @@ impl UniformBufferCache {
 
 struct Page {
     dynamic: DynamicUniformBuffer,
-    is_submitted: bool,
+    /// How many bytes from the start are on the GPU already. Blocks are only ever added to the
+    /// end of a page during a frame, so each upload only has to write what has been added since
+    /// the last - and, writing only what no command has read yet, does not hold the frame up.
+    uploaded: usize,
 }
 
 /// The position of a uniform within a [`UniformMemoryAllocator`].
@@ -170,7 +173,7 @@ impl UniformMemoryAllocator {
     pub fn clear(&mut self) {
         for page in self.pages.iter_mut() {
             page.dynamic.clear();
-            page.is_submitted = false;
+            page.uploaded = 0;
         }
         self.blocks.clear();
     }
@@ -179,15 +182,31 @@ impl UniformMemoryAllocator {
     where
         T: ByteStorage,
     {
+        self.allocate_with_binding_size(buffer, 0)
+    }
+
+    /// Like [`Self::allocate`], but the block is bound as `binding_size` bytes, however few of them
+    /// the data fills - for arrays a shader declares bigger than they are ever filled, such as the
+    /// bone matrices of a skeleton with fewer bones than the most there can be. What lies past the
+    /// data is whatever else is in the page there, which the shader never reads.
+    pub fn allocate_with_binding_size<T>(
+        &mut self,
+        buffer: UniformBuffer<T>,
+        binding_size: usize,
+    ) -> UniformBlockLocation
+    where
+        T: ByteStorage,
+    {
         let data = buffer.finish();
         assert!(data.bytes_count() > 0);
-        assert!(data.bytes_count() < self.max_uniform_buffer_binding_size);
+        let room = data.bytes_count().max(binding_size);
+        assert!(room < self.max_uniform_buffer_binding_size);
 
         let page_index = match self.pages.iter().position(|page| {
             let write_position = page
                 .dynamic
                 .next_write_aligned_position(self.block_alignment);
-            self.max_uniform_buffer_binding_size - write_position >= data.bytes_count()
+            self.max_uniform_buffer_binding_size - write_position >= room
         }) {
             Some(page_index) => page_index,
             None => {
@@ -196,14 +215,13 @@ impl UniformMemoryAllocator {
                     dynamic: UniformBuffer::with_storage(Vec::with_capacity(
                         self.max_uniform_buffer_binding_size,
                     )),
-                    is_submitted: false,
+                    uploaded: 0,
                 });
                 page_index
             }
         };
 
         let page = &mut self.pages[page_index];
-        page.is_submitted = false;
         let offset = page
             .dynamic
             .write_bytes_with_alignment(data.bytes(), self.block_alignment);
@@ -211,7 +229,7 @@ impl UniformMemoryAllocator {
         let block = UniformBlockLocation {
             page: page_index,
             offset,
-            size: data.bytes_count(),
+            size: room,
         };
         self.blocks.push(block);
         block
@@ -231,11 +249,16 @@ impl UniformMemoryAllocator {
         }
 
         for (page, gpu_buffer) in self.pages.iter_mut().zip(self.gpu_buffers.iter()) {
-            if !page.is_submitted {
-                let bytes = page.dynamic.storage().bytes();
-                assert!(bytes.len() <= self.max_uniform_buffer_binding_size);
-                gpu_buffer.write_data(bytes)?;
-                page.is_submitted = true;
+            let bytes = page.dynamic.storage().bytes();
+            assert!(bytes.len() <= self.max_uniform_buffer_binding_size);
+            if page.uploaded < bytes.len() {
+                if gpu_buffer
+                    .write_data_at(page.uploaded, &bytes[page.uploaded..])
+                    .is_err()
+                {
+                    gpu_buffer.write_data(bytes)?;
+                }
+                page.uploaded = bytes.len();
             }
         }
 

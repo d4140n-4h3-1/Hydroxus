@@ -1294,16 +1294,20 @@ impl Renderer {
             &self.renderer_resources,
         )?;
 
-        // Render debug geometry in the LDR frame buffer.
-        self.debug_renderer.set_lines(&scene.drawing_context.lines);
-        render_data.statistics += self.debug_renderer.render(
-            server,
-            &mut self.uniform_buffer_cache,
-            observer.viewport,
-            &render_data.ldr_scene_framebuffer,
-            observer.position.view_projection_matrix,
-            &self.renderer_resources,
-        )?;
+        // Render debug geometry in the LDR frame buffer, if there is any: with none, drawing
+        // nothing would still start a pass of its own, and write a buffer the last frame's lines
+        // may have been drawn from.
+        if !scene.drawing_context.lines.is_empty() {
+            self.debug_renderer.set_lines(&scene.drawing_context.lines);
+            render_data.statistics += self.debug_renderer.render(
+                server,
+                &mut self.uniform_buffer_cache,
+                observer.viewport,
+                &render_data.ldr_scene_framebuffer,
+                observer.position.view_projection_matrix,
+                &self.renderer_resources,
+            )?;
+        }
 
         for render_pass in self.scene_render_passes.iter() {
             let _debug_scope = server.begin_scope(&format!(

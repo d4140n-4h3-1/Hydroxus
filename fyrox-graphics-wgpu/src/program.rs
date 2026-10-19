@@ -227,10 +227,13 @@ fn compile_wgsl(
 
 /// Creates bind group layout using actual texture formats when available.
 /// `texture_formats` provides the actual wgpu format for specific bindings.
+/// `dynamic` lists the uniform blocks bound with dynamic offsets (see
+/// [`WgpuProgram::dynamic_uniforms`]).
 fn create_bind_group_layout_with_formats(
     device: &wgpu::Device,
     resources: &[ShaderResourceDefinition],
     texture_formats: &[(usize, wgpu::TextureFormat)],
+    dynamic: &[usize],
 ) -> wgpu::BindGroupLayout {
     let fmt_map: std::collections::HashMap<usize, wgpu::TextureFormat> =
         texture_formats.iter().copied().collect();
@@ -307,7 +310,7 @@ fn create_bind_group_layout_with_formats(
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: dynamic.contains(&res.binding),
                         min_binding_size: None,
                     },
                     count: None,
@@ -427,6 +430,12 @@ pub struct WgpuProgram {
     vertex_module: wgpu::ShaderModule,
     fragment_module: wgpu::ShaderModule,
     resources: Vec<ShaderResourceDefinition>,
+    /// The bindings of the uniform blocks bound with dynamic offsets, in order: as many as the
+    /// device allows, up to [`MAX_DYNAMIC_UNIFORMS`]. Per-draw blocks are handed out of a few big
+    /// buffers at different places, so with the place left out of the bind group, the same few
+    /// bind groups do for every draw of a material, frame after frame, rather than one made for
+    /// each draw.
+    dynamic_uniforms: Vec<usize>,
     #[allow(clippy::type_complexity)]
     cached_layouts: RefCell<
         HashMap<
@@ -437,6 +446,10 @@ pub struct WgpuProgram {
 }
 
 impl GpuProgramTrait for WgpuProgram {}
+
+/// The most uniform blocks of one program bound with dynamic offsets (see
+/// [`WgpuProgram::dynamic_uniforms`]).
+pub const MAX_DYNAMIC_UNIFORMS: usize = 16;
 
 impl WgpuProgram {
     /// Creates a program by compiling vertex and fragment shaders from source.
@@ -499,14 +512,34 @@ impl WgpuProgram {
         frag: &WgpuShader,
         resources: &[ShaderResourceDefinition],
     ) -> Result<Self, FrameworkError> {
+        let most = (server
+            .state
+            .device
+            .limits()
+            .max_dynamic_uniform_buffers_per_pipeline_layout as usize)
+            .min(MAX_DYNAMIC_UNIFORMS);
+        let mut dynamic_uniforms: Vec<usize> = resources
+            .iter()
+            .filter(|res| matches!(res.kind, ShaderResourceKind::PropertyGroup { .. }))
+            .map(|res| res.binding)
+            .collect();
+        dynamic_uniforms.sort_unstable();
+        dynamic_uniforms.truncate(most);
         Ok(Self {
             server: server.weak_ref(),
             name: name.to_owned(),
             vertex_module: vert.module.clone(),
             fragment_module: frag.module.clone(),
             resources: resources.to_vec(),
+            dynamic_uniforms,
             cached_layouts: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// The bindings of the uniform blocks bound with dynamic offsets, lowest first, which is the
+    /// order their offsets are given in.
+    pub fn dynamic_uniforms(&self) -> &[usize] {
+        &self.dynamic_uniforms
     }
 
     /// Lazily create bind group layout + pipeline layout based on actual texture formats.
@@ -535,6 +568,7 @@ impl WgpuProgram {
             &server.state.device,
             &self.resources,
             texture_formats,
+            &self.dynamic_uniforms,
         );
 
         let pl = server

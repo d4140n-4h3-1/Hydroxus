@@ -455,43 +455,57 @@ impl RenderDataBundle {
         // Upload instance uniforms.
         let mut instance_blocks = Vec::with_capacity(self.instances.len());
         for instance in self.instances.iter() {
-            let mut packed_blend_shape_weights =
-                [Vector4::<f32>::default(); ShaderDefinition::MAX_BLEND_SHAPE_WEIGHT_GROUPS];
-
-            for (i, blend_shape_weight) in instance.blend_shapes_weights.iter().enumerate() {
-                let n = i / 4;
-                let c = i % 4;
-                packed_blend_shape_weights[n][c] = *blend_shape_weight;
-            }
-
             let instance_buffer = StaticUniformBuffer::<1024>::new()
                 .with(&instance.world_transform)
                 .with(&(view_projection_matrix * instance.world_transform))
                 .with(&(instance.blend_shapes_weights.len() as i32))
-                .with(&(!instance.bone_matrices.is_empty()))
-                .with_slice_with_max_size(
-                    &packed_blend_shape_weights,
-                    ShaderDefinition::MAX_BLEND_SHAPE_WEIGHT_GROUPS,
-                );
+                .with(&(!instance.bone_matrices.is_empty()));
+
+            // Without blend shapes - nearly always - the weights are left out: the shader reads
+            // only as many as there are, and the block is bound as big as it would be with them.
+            let instance_block = if instance.blend_shapes_weights.is_empty() {
+                render_context
+                    .uniform_memory_allocator
+                    .allocate_with_binding_size(instance_buffer, instance_block_size())
+            } else {
+                let mut packed_blend_shape_weights =
+                    [Vector4::<f32>::default(); ShaderDefinition::MAX_BLEND_SHAPE_WEIGHT_GROUPS];
+
+                for (i, blend_shape_weight) in instance.blend_shapes_weights.iter().enumerate() {
+                    let n = i / 4;
+                    let c = i % 4;
+                    packed_blend_shape_weights[n][c] = *blend_shape_weight;
+                }
+
+                render_context.uniform_memory_allocator.allocate(
+                    instance_buffer.with_slice_with_max_size(
+                        &packed_blend_shape_weights,
+                        ShaderDefinition::MAX_BLEND_SHAPE_WEIGHT_GROUPS,
+                    ),
+                )
+            };
 
             let mut instance_uniform_data = InstanceUniformData {
-                instance_block: render_context
-                    .uniform_memory_allocator
-                    .allocate(instance_buffer),
+                instance_block,
                 bone_matrices_block: None,
             };
 
             if !instance.bone_matrices.is_empty() {
-                const INIT: Matrix4<f32> = Matrix4::new(
-                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                );
-                let mut matrices = [INIT; ShaderDefinition::MAX_BONE_MATRICES];
+                // Only the skeleton's own bones are written; the block is bound as big as the
+                // shader's array, which it never reads past the bones the vertices use.
                 const SIZE: usize = ShaderDefinition::MAX_BONE_MATRICES * size_of::<Matrix4<f32>>();
-                matrices[0..instance.bone_matrices.len()].copy_from_slice(&instance.bone_matrices);
+                let mut matrices = StaticUniformBuffer::<SIZE>::new();
+                for matrix in instance
+                    .bone_matrices
+                    .iter()
+                    .take(ShaderDefinition::MAX_BONE_MATRICES)
+                {
+                    matrices.push(matrix);
+                }
 
                 let bone_matrices_block = render_context
                     .uniform_memory_allocator
-                    .allocate(StaticUniformBuffer::<SIZE>::new().with(&matrices));
+                    .allocate_with_binding_size(matrices, SIZE);
                 instance_uniform_data.bone_matrices_block = Some(bone_matrices_block);
             }
 
@@ -726,6 +740,24 @@ impl RenderDataBundle {
 
         Ok(stats)
     }
+}
+
+/// How big an instance's uniform block is with all of its blend shape weights, in bytes.
+fn instance_block_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        StaticUniformBuffer::<1024>::new()
+            .with(&Matrix4::<f32>::identity())
+            .with(&Matrix4::<f32>::identity())
+            .with(&0i32)
+            .with(&false)
+            .with_slice_with_max_size(
+                &[Vector4::<f32>::default(); ShaderDefinition::MAX_BLEND_SHAPE_WEIGHT_GROUPS],
+                ShaderDefinition::MAX_BLEND_SHAPE_WEIGHT_GROUPS,
+            )
+            .finish()
+            .bytes_count()
+    })
 }
 
 /// A trait for an entity that can collect render data.

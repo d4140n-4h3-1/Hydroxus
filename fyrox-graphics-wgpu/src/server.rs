@@ -78,6 +78,9 @@ pub struct DrawCommand {
     pub pipeline: wgpu::RenderPipeline,
     /// Resource bind group (textures, samplers, uniforms).
     pub bind_group: Option<wgpu::BindGroup>,
+    /// Where in their buffers the uniform blocks bound with dynamic offsets are, in the order of
+    /// their bindings (see [`crate::program::WgpuProgram::dynamic_uniforms`]).
+    pub dynamic_offsets: DynamicOffsets,
     /// Vertex buffers bound for this draw.
     pub vertex_buffers: Vec<wgpu::Buffer>,
     /// Number of extra vertex buffer slots filled with the dummy buffer.
@@ -185,6 +188,10 @@ pub struct WgpuGraphicsServer {
     pub ray_tracing: bool,
     /// Hash-based cache of render pipelines, keyed by [`PipelineKey`].
     pub pipeline_cache: RefCell<HashMap<PipelineKey, wgpu::RenderPipeline>>,
+    /// The pipeline of the last draw, with what it was made for: draws of one material come one
+    /// after another, and for those, comparing what they are drawn with is quicker than putting
+    /// together a [`PipelineKey`] and looking it up.
+    pub last_pipeline: RefCell<Option<LastPipeline>>,
     /// Hash-based cache of bind groups, keyed by resource pointers and texture formats.
     pub bind_group_cache: RefCell<HashMap<u64, wgpu::BindGroup>>,
     weak_self: RefCell<Option<Weak<WgpuGraphicsServer>>>,
@@ -435,6 +442,7 @@ impl WgpuGraphicsServer {
             msaa_sample_count: msaa,
             ray_tracing,
             pipeline_cache: RefCell::new(HashMap::new()),
+            last_pipeline: RefCell::new(None),
             bind_group_cache: RefCell::new(HashMap::new()),
             weak_self: RefCell::new(None),
             memory_usage: RefCell::new(ServerMemoryUsage::default()),
@@ -550,7 +558,7 @@ impl WgpuGraphicsServer {
             }
             rp.set_pipeline(&cmd.pipeline);
             if let Some(bg) = &cmd.bind_group {
-                rp.set_bind_group(0, bg, &[]);
+                rp.set_bind_group(0, bg, cmd.dynamic_offsets.as_slice());
             }
             if let Some(st) = cmd.stencil_ref {
                 rp.set_stencil_reference(st);
@@ -1016,4 +1024,55 @@ impl GraphicsServer for WgpuGraphicsServer {
     }
     fn push_debug_group(&self, _name: &str) {}
     fn pop_debug_group(&self) {}
+}
+
+/// The dynamic offsets of one draw's bind group, kept inline: a draw has at most
+/// [`crate::program::MAX_DYNAMIC_UNIFORMS`].
+#[derive(Clone, Copy, Default)]
+pub struct DynamicOffsets {
+    len: usize,
+    offsets: [u32; crate::program::MAX_DYNAMIC_UNIFORMS],
+}
+
+impl DynamicOffsets {
+    /// Adds the next offset.
+    pub fn push(&mut self, offset: u32) {
+        self.offsets[self.len] = offset;
+        self.len += 1;
+    }
+
+    /// The offsets, in order.
+    pub fn as_slice(&self) -> &[u32] {
+        &self.offsets[..self.len]
+    }
+}
+
+/// What the last draw's pipeline was made for, and the pipeline (see
+/// [`WgpuGraphicsServer::last_pipeline`]).
+pub struct LastPipeline {
+    /// The program, by its address - and by its shaders, which a program made where a freed one
+    /// was does not share.
+    pub program: usize,
+    /// The program's vertex shader.
+    pub vertex_module: wgpu::ShaderModule,
+    /// The program's fragment shader.
+    pub fragment_module: wgpu::ShaderModule,
+    /// How it was drawn: blending, depth and stencil tests, culling.
+    pub params: fyrox_graphics::DrawParameters,
+    /// The vertex buffers' layouts of the geometry drawn.
+    pub vertex_layouts: Vec<wgpu::VertexBufferLayout<'static>>,
+    /// What the geometry is made of: triangles, lines or points.
+    pub element_kind: fyrox_graphics::ElementKind,
+    /// The frame buffer drawn into, by its address.
+    pub frame_buffer: usize,
+    /// The formats of the frame buffer's colour attachments.
+    pub color_formats: Vec<wgpu::TextureFormat>,
+    /// The formats of the textures bound, by binding.
+    pub texture_formats: Vec<(usize, wgpu::TextureFormat)>,
+    /// Whether polygons were filled, or drawn as lines or points.
+    pub polygon_fill_mode: fyrox_graphics::PolygonFillMode,
+    /// The pipeline made for all of that.
+    pub pipeline: wgpu::RenderPipeline,
+    /// How many dummy vertex buffers the pipeline takes after the geometry's own.
+    pub extra_vert_count: u32,
 }

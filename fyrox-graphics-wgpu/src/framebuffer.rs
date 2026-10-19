@@ -26,7 +26,7 @@ use crate::format_helpers::{
 use crate::geometry_buffer::WgpuGeometryBuffer;
 use crate::program::WgpuProgram;
 use crate::sampler::WgpuSampler;
-use crate::server::WgpuGraphicsServer;
+use crate::server::{DynamicOffsets, WgpuGraphicsServer};
 use crate::texture::WgpuTexture;
 use fyrox_core::log::Log;
 use fyrox_graphics::{
@@ -629,25 +629,68 @@ impl WgpuFrameBuffer {
             }
         }
 
-        let (_bind_group_layout, pipeline_layout) = prog.get_or_create_layouts(&texture_formats);
-        let (all_layouts, extra_vert_count) = build_vertex_layouts(geo);
-        let has_color = self.is_backbuffer || !self.color_attachments.is_empty();
-
-        let pipeline = self.get_or_create_pipeline(
-            &server,
-            prog,
-            params,
-            &all_layouts,
-            &color_formats,
-            df,
-            &pipeline_layout,
-            geo.element_kind(),
-            has_color,
-            &texture_formats,
-        );
-        let bind_group = create_bind_group(&server, prog, resources);
-
         let fb_id = self as *const _ as usize;
+        let polygon_fill_mode = server.polygon_fill_mode();
+        let same = |last: &&crate::server::LastPipeline| {
+            last.program == prog as *const _ as usize
+                && last.frame_buffer == fb_id
+                && last.vertex_module == *prog.vertex_module()
+                && last.fragment_module == *prog.fragment_module()
+                && last.params == *params
+                && last.element_kind == geo.element_kind()
+                && last.polygon_fill_mode == polygon_fill_mode
+                && last.color_formats == color_formats
+                && last.texture_formats == texture_formats
+                && last.vertex_layouts == geo.vertex_buffer_layouts()
+        };
+        let remembered = server
+            .last_pipeline
+            .borrow()
+            .as_ref()
+            .filter(same)
+            .map(|last| (last.pipeline.clone(), last.extra_vert_count));
+        let (pipeline, extra_vert_count) = match remembered {
+            Some(remembered) => remembered,
+            None => {
+                let (_bind_group_layout, pipeline_layout) =
+                    prog.get_or_create_layouts(&texture_formats);
+                let (all_layouts, extra_vert_count) = build_vertex_layouts(geo);
+                let has_color = self.is_backbuffer || !self.color_attachments.is_empty();
+
+                let pipeline = self.get_or_create_pipeline(
+                    &server,
+                    prog,
+                    params,
+                    &all_layouts,
+                    &color_formats,
+                    df,
+                    &pipeline_layout,
+                    geo.element_kind(),
+                    has_color,
+                    &texture_formats,
+                );
+                *server.last_pipeline.borrow_mut() = Some(crate::server::LastPipeline {
+                    program: prog as *const _ as usize,
+                    vertex_module: prog.vertex_module().clone(),
+                    fragment_module: prog.fragment_module().clone(),
+                    params: params.clone(),
+                    vertex_layouts: geo.vertex_buffer_layouts().to_vec(),
+                    element_kind: geo.element_kind(),
+                    frame_buffer: fb_id,
+                    color_formats: color_formats.clone(),
+                    texture_formats: texture_formats.clone(),
+                    polygon_fill_mode,
+                    pipeline: pipeline.clone(),
+                    extra_vert_count,
+                });
+                (pipeline, extra_vert_count)
+            }
+        };
+        let (bind_group, dynamic_offsets) = match create_bind_group(&server, prog, resources) {
+            Some((bind_group, offsets)) => (Some(bind_group), offsets),
+            None => (None, Default::default()),
+        };
+
         let requires_new_pass = {
             let pass = server.active_pass.borrow();
             pass.is_none()
@@ -810,6 +853,7 @@ impl WgpuFrameBuffer {
             .push(crate::server::DrawCommand {
                 pipeline,
                 bind_group,
+                dynamic_offsets,
                 vertex_buffers: geo.vertex_buffers().iter().cloned().collect(),
                 extra_verts: extra_vert_count,
                 index_buffer: geo.element_buffer().clone(),
@@ -1251,8 +1295,13 @@ fn create_bind_group(
     server: &WgpuGraphicsServer,
     program: &WgpuProgram,
     groups: &[ResourceBindGroup],
-) -> Option<wgpu::BindGroup> {
+) -> Option<(wgpu::BindGroup, DynamicOffsets)> {
     let mut entries = Vec::new();
+    // The uniform blocks bound with dynamic offsets, with where they are: their place is given
+    // when the bind group is set, so it is no part of the bind group, nor of its key.
+    let dynamic = program.dynamic_uniforms();
+    let mut dynamic_offsets: [Option<u32>; crate::program::MAX_DYNAMIC_UNIFORMS] =
+        [None; crate::program::MAX_DYNAMIC_UNIFORMS];
     let mut texture_formats: Vec<(usize, wgpu::TextureFormat)> = Vec::new();
 
     // The cache key is built from the wgpu handles themselves, not from the engine's wrapper
@@ -1304,8 +1353,12 @@ fn create_bind_group(
                     wb.mark_bound(server);
                     wb_buf.hash(&mut hasher);
                     hasher.write_u32(*loc as u32);
+                    let slot = dynamic.iter().position(|&d| d == *loc);
                     match data_usage {
                         BufferDataUsage::UseEverything => {
+                            if let Some(slot) = slot {
+                                dynamic_offsets[slot] = Some(0);
+                            }
                             hasher.write_u64(0);
                             entries.push(wgpu::BindGroupEntry {
                                 binding: (*loc + UNIFORM_BINDING_OFFSET) as u32,
@@ -1317,7 +1370,14 @@ fn create_bind_group(
                             });
                         }
                         BufferDataUsage::UseSegment { offset, size } => {
-                            hasher.write_u64(*offset as u64);
+                            let bound_at = match slot {
+                                Some(slot) => {
+                                    dynamic_offsets[slot] = Some(*offset as u32);
+                                    0
+                                }
+                                None => *offset as u64,
+                            };
+                            hasher.write_u64(bound_at);
                             hasher.write_u64(*size as u64);
                             let nonzero_size = std::num::NonZeroU64::new(*size as u64)
                                 .expect("BufferDataUsage::UseSegment size must be non-zero");
@@ -1325,7 +1385,7 @@ fn create_bind_group(
                                 binding: (*loc + UNIFORM_BINDING_OFFSET) as u32,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer: wb_buf,
-                                    offset: *offset as u64,
+                                    offset: bound_at,
                                     size: Some(nonzero_size),
                                 }),
                             })
@@ -1337,6 +1397,12 @@ fn create_bind_group(
     }
     if entries.is_empty() {
         return None;
+    }
+    // Every dynamic block is given an offset, even one the draw left unbound - which wgpu would
+    // refuse anyway, for the entry it lacks.
+    let mut offsets = DynamicOffsets::default();
+    for offset in dynamic_offsets.iter().take(dynamic.len()) {
+        offsets.push(offset.unwrap_or(0));
     }
 
     // The layout stands for the program: a different program, even one allocated where an old
@@ -1350,7 +1416,7 @@ fn create_bind_group(
     {
         let cache = server.bind_group_cache.borrow();
         if let Some(bg) = cache.get(&key) {
-            return Some(bg.clone());
+            return Some((bg.clone(), offsets));
         }
     }
     let bind_group = server
@@ -1370,5 +1436,5 @@ fn create_bind_group(
     }
     cache.insert(key, bind_group.clone());
 
-    Some(bind_group)
+    Some((bind_group, offsets))
 }

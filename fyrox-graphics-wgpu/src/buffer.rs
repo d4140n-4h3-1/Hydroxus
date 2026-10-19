@@ -174,6 +174,33 @@ impl GpuBufferTrait for WgpuBuffer {
         Ok(())
     }
 
+    fn write_data_at(&self, offset: usize, data: &[u8]) -> Result<(), FrameworkError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if offset + data.len() > self.size.get() {
+            return Err(FrameworkError::Custom(format!(
+                "Writing {} bytes at {offset} would go past the end of a {}-byte buffer",
+                data.len(),
+                self.size.get()
+            )));
+        }
+        let Some(server) = self.server.upgrade() else {
+            return Err(FrameworkError::GraphicsServerUnavailable);
+        };
+        // From the start, this is a write of the whole buffer as far as commands reading it are
+        // concerned (see `write_data`). Further in, the caller has promised nothing waiting to be
+        // submitted reads the part written, so there is no need to submit first.
+        if offset == 0 && self.bound.get() == Some(server.submissions.get()) {
+            server.submit_pending();
+        }
+        server
+            .state
+            .queue
+            .write_buffer(&self.buffer.borrow(), offset as u64, data);
+        Ok(())
+    }
+
     fn read_data(&self, data: &mut [u8]) -> Result<(), FrameworkError> {
         let Some(server) = self.server.upgrade() else {
             return Err(FrameworkError::GraphicsServerUnavailable);
