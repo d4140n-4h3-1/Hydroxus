@@ -1,0 +1,15 @@
+[package]
+name = "yoctite"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Yoctite: virtualized, cluster-based geometry for Hydroxus - meshes split into clusters with a DAG of levels of detail"
+keywords = ["lod", "meshlet", "cluster", "virtual-geometry"]
+categories = ["game-development", "rendering"]
+rust-version = "1.94"
+
+[dependencies]
+
+[dev-dependencies]
+# Only for the example that builds the clusters of a glTF model's meshes.
+gltf = { version = "1.4.0", default-features = false, features = ["import", "utils", "names"] }

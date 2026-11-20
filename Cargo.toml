@@ -23,7 +23,8 @@ members = [
     "fyrox-autotile",
     "fyrox-material",
     "fyrox-graphics-gl",
-    "fyrox-graphics-wgpu"]
+    "fyrox-graphics-wgpu",
+    "yoctite"]
 resolver = "2"
 
 [profile.editor-standalone]
