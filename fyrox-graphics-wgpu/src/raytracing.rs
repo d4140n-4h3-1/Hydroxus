@@ -18,6 +18,12 @@
 //! through it, and each copy of it says how much of each colour of light it lets through, so the
 //! shadows it casts are the colour of the light that came through it.
 //!
+//! Cutouts ([`WgpuGraphicsServer::build_ray_traced_cutout`]) - leaves, needles, grass, a chain-link
+//! fence: cards whose texture says where they are solid - stop a ray only where it crosses a
+//! solid part of the texture, as the renderer draws them. Each keeps its triangles' texture
+//! coordinates and a [`CutoutMask`] of which texels are solid, which the scene hands to the shader
+//! alongside its acceleration structure.
+//!
 //! Availability: [`WgpuGraphicsServer::ray_tracing`] is false unless the adapter reported ray
 //! queries, in which case everything here returns [`None`] and the caller falls back to whatever
 //! it did before.
@@ -28,7 +34,74 @@ use fyrox_graphics::{
     gpu_texture::{GpuTexture, GpuTextureDescriptor, GpuTextureKind, PixelKind},
     server::GraphicsServer,
 };
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use wgpu::util::DeviceExt;
+
+/// Which texels of a texture are solid, a bit each, row by row: for a cutout, where a ray is
+/// stopped and where it goes on through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutoutMask {
+    width: u32,
+    height: u32,
+    bits: Vec<u32>,
+}
+
+impl CutoutMask {
+    /// A `width` by `height` mask, solid wherever `solid(x, y)` says, with row 0 the texture's
+    /// first row of texels - the one texture coordinate v = 0 samples.
+    pub fn new(width: u32, height: u32, solid: impl Fn(u32, u32) -> bool) -> Self {
+        let (width, height) = (width.max(1), height.max(1));
+        let mut bits = vec![0u32; (width as usize * height as usize).div_ceil(32)];
+        for y in 0..height {
+            for x in 0..width {
+                if solid(x, y) {
+                    let bit = (y * width + x) as usize;
+                    bits[bit / 32] |= 1 << (bit % 32);
+                }
+            }
+        }
+        Self { width, height, bits }
+    }
+
+    /// Whether the texel at `x`, `y` is solid.
+    pub fn is_solid(&self, x: u32, y: u32) -> bool {
+        let bit = (y.min(self.height - 1) * self.width + x.min(self.width - 1)) as usize;
+        self.bits[bit / 32] & (1 << (bit % 32)) != 0
+    }
+
+    /// How many texels wide it is.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// How many texels high it is.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+/// What a cutout keeps for the shader: the texture coordinates of each of its triangles'
+/// corners, and its mask.
+struct Cutout {
+    corners: Vec<[f32; 2]>,
+    mask: Arc<CutoutMask>,
+}
+
+/// How geometry stands in a ray's way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Solid,
+    Glass,
+    Cutout,
+}
+
+/// Every piece of geometry gets its own number, for a scene to tell which cutouts it holds.
+static NEXT_GEOMETRY: AtomicU64 = AtomicU64::new(1);
 
 /// One mesh's triangles in a form the ray tracing hardware can trace against, in the mesh's own
 /// space, for a [`RayTracedScene`] to place copies of.
@@ -43,6 +116,9 @@ pub struct RayTracedGeometry {
     updatable: bool,
     /// Whether it is glass, which rays go on through, rather than solid.
     see_through: bool,
+    /// For a cutout, where it is solid.
+    cutout: Option<Cutout>,
+    id: u64,
 }
 
 impl RayTracedGeometry {
@@ -60,6 +136,12 @@ impl RayTracedGeometry {
     /// [`WgpuGraphicsServer::build_ray_traced_glass`].
     pub fn is_see_through(&self) -> bool {
         self.see_through
+    }
+
+    /// Whether it is a cutout, solid only where its texture is: see
+    /// [`WgpuGraphicsServer::build_ray_traced_cutout`].
+    pub fn is_cutout(&self) -> bool {
+        self.cutout.is_some()
     }
 
     fn build_entry(&self) -> wgpu::BlasBuildEntry<'_> {
@@ -88,14 +170,160 @@ pub struct RayTracedInstance<'a> {
     /// row by row.
     pub transform: [f32; 12],
     /// For glass, how much of the red, green and blue of a light it lets through, each from 0 to
-    /// 1, where a ray crosses it. Solid geometry lets nothing through whatever this says.
+    /// 1, where a ray crosses it. Solid geometry, and cutouts, let nothing through whatever this
+    /// says.
     pub lets_through: [f32; 3],
 }
 
-/// `lets_through` as an instance's custom data: a byte for each of red, green and blue.
+/// The bit of an instance's custom data that marks a cutout; the bits below it say which of the
+/// scene's cutouts it is. Without it, the custom data is the light glass lets through.
+const CUTOUT_BIT: u32 = 1 << 23;
+
+/// `lets_through` as an instance's custom data: seven bits for each of red, green and blue, a
+/// byte apart, leaving the top bit of each byte clear - and so [`CUTOUT_BIT`].
 fn lets_through_bits([r, g, b]: [f32; 3]) -> u32 {
-    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-    byte(r) | (byte(g) << 8) | (byte(b) << 16)
+    let seven = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u32;
+    seven(r) | (seven(g) << 8) | (seven(b) << 16)
+}
+
+/// What the shaders read about a scene's cutouts, in storage buffers: one record per cutout,
+/// the texture coordinates of each of their triangles' corners, and their masks' bits.
+struct CutoutBuffers {
+    /// Which geometry each record is, in order.
+    ids: Vec<u64>,
+    records: wgpu::Buffer,
+    corners: wgpu::Buffer,
+    masks: wgpu::Buffer,
+}
+
+/// A cutout's record, as the shaders read it.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CutoutRecord {
+    /// Where its triangles' corners start, counted in triangles.
+    first_triangle: u32,
+    /// Where its mask starts, counted in 32-bit words.
+    first_word: u32,
+    width: u32,
+    height: u32,
+}
+
+impl CutoutBuffers {
+    /// Buffers for `cutouts`, in that order. Never empty, as a binding has to have something in
+    /// it.
+    fn new(device: &wgpu::Device, cutouts: &[&RayTracedGeometry]) -> Self {
+        let mut records = Vec::with_capacity(cutouts.len());
+        let mut corners: Vec<[f32; 2]> = Vec::new();
+        let mut masks: Vec<u32> = Vec::new();
+        for geometry in cutouts {
+            let Some(cutout) = &geometry.cutout else {
+                continue;
+            };
+            records.push(CutoutRecord {
+                first_triangle: (corners.len() / 3) as u32,
+                first_word: masks.len() as u32,
+                width: cutout.mask.width,
+                height: cutout.mask.height,
+            });
+            corners.extend_from_slice(&cutout.corners);
+            masks.extend_from_slice(&cutout.mask.bits);
+        }
+        if records.is_empty() {
+            records.push(<CutoutRecord as bytemuck::Zeroable>::zeroed());
+        }
+        if corners.is_empty() {
+            corners.push([0.0; 2]);
+        }
+        if masks.is_empty() {
+            masks.push(0);
+        }
+        let buffer = |label, contents: &[u8]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        };
+        Self {
+            ids: cutouts.iter().map(|geometry| geometry.id).collect(),
+            records: buffer("CutoutRecords", bytemuck::cast_slice(&records)),
+            corners: buffer("CutoutCorners", bytemuck::cast_slice(&corners)),
+            masks: buffer("CutoutMasks", bytemuck::cast_slice(&masks)),
+        }
+    }
+
+    /// The bindings, from `first` on, a shader reads them through.
+    fn entries(&self, first: u32) -> [wgpu::BindGroupEntry<'_>; 3] {
+        [
+            wgpu::BindGroupEntry {
+                binding: first,
+                resource: self.records.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: first + 1,
+                resource: self.corners.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: first + 2,
+                resource: self.masks.as_entire_binding(),
+            },
+        ]
+    }
+}
+
+/// The layout entries for [`CutoutBuffers::entries`], from binding `first` on.
+pub(crate) fn cutout_layout_entries(first: u32, visibility: wgpu::ShaderStages) -> [wgpu::BindGroupLayoutEntry; 3] {
+    let storage = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    [storage(first), storage(first + 1), storage(first + 2)]
+}
+
+/// The WGSL that reads a scene's cutouts, for a shader that binds them in group 0 from binding
+/// `first` on: `cutout_blocks(customData, primitiveIndex, barycentrics)` says whether a candidate
+/// hit on a cutout is on a solid part of it.
+pub(crate) fn cutout_wgsl(first: u32) -> String {
+    format!(
+        r#"
+const CUTOUT_BIT: u32 = 0x800000u;
+
+struct CutoutRecord {{
+    firstTriangle: u32,
+    firstWord: u32,
+    width: u32,
+    height: u32,
+}};
+
+@group(0) @binding({records}) var<storage, read> cutoutRecords: array<CutoutRecord>;
+@group(0) @binding({corners}) var<storage, read> cutoutCorners: array<vec2f>;
+@group(0) @binding({masks}) var<storage, read> cutoutMasks: array<u32>;
+
+// Whether a hit on triangle `primitive` of the cutout `data` names, at `barycentrics`, is on a
+// texel its mask says is solid. Texture coordinates repeat, as the renderer samples them.
+fn cutout_blocks(data: u32, primitive: u32, barycentrics: vec2f) -> bool {{
+    let record = cutoutRecords[data & (CUTOUT_BIT - 1u)];
+    let corner = (record.firstTriangle + primitive) * 3u;
+    let uv = cutoutCorners[corner] * (1.0 - barycentrics.x - barycentrics.y)
+        + cutoutCorners[corner + 1u] * barycentrics.x
+        + cutoutCorners[corner + 2u] * barycentrics.y;
+    let wrapped = fract(uv);
+    let x = min(u32(wrapped.x * f32(record.width)), record.width - 1u);
+    let y = min(u32(wrapped.y * f32(record.height)), record.height - 1u);
+    let bit = y * record.width + x;
+    return ((cutoutMasks[record.firstWord + bit / 32u] >> (bit % 32u)) & 1u) != 0u;
+}}
+"#,
+        records = first,
+        corners = first + 1,
+        masks = first + 2,
+    )
 }
 
 /// The transform that leaves geometry where it is.
@@ -110,6 +338,8 @@ pub struct RayTracedScene {
     capacity: u32,
     used: u32,
     triangle_count: u32,
+    /// What the shaders read about the cutouts it holds.
+    cutouts: CutoutBuffers,
     /// For a scene built from triangles alone, the geometry it holds.
     _geometry: Option<RayTracedGeometry>,
 }
@@ -118,6 +348,12 @@ impl RayTracedScene {
     /// How many triangles were put into the structure, counting each copy.
     pub fn triangle_count(&self) -> u32 {
         self.triangle_count
+    }
+
+    /// The bindings, from `first` on, through which a shader reads its cutouts (see
+    /// [`cutout_wgsl`]).
+    pub(crate) fn cutout_entries(&self, first: u32) -> [wgpu::BindGroupEntry<'_>; 3] {
+        self.cutouts.entries(first)
     }
 }
 
@@ -181,6 +417,15 @@ pub struct ShadowTracer {
 }
 
 const SHADER: &str = include_str!("shaders/shadow_rays.wgsl");
+/// Where the shadow rays' shader binds the scene's cutouts from (see [`cutout_wgsl`]).
+const SHADOW_CUTOUT_BINDING: u32 = 5;
+
+/// The shadow rays' shader, with what reads the scene's cutouts.
+fn shadow_rays_source() -> String {
+    // The `enable` has to come before anything else.
+    let (enable, rest) = SHADER.split_once('\n').unwrap_or(("", SHADER));
+    format!("{enable}\n{}{rest}", cutout_wgsl(SHADOW_CUTOUT_BINDING))
+}
 const BLUR_SHADER: &str = include_str!("shaders/shadow_blur.wgsl");
 
 /// How far off a pixel's plane, in meters, a neighbor may lie and still be blurred with it.
@@ -350,7 +595,7 @@ impl WgpuGraphicsServer {
         indices: &[u32],
         updatable: bool,
     ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
-        self.build_geometry(vertices, indices, updatable, false)
+        self.build_geometry(vertices, indices, updatable, Kind::Solid, None)
     }
 
     /// As [`Self::build_ray_traced_geometry`], but glass: rays go on through it rather than
@@ -362,7 +607,26 @@ impl WgpuGraphicsServer {
         indices: &[u32],
         updatable: bool,
     ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
-        self.build_geometry(vertices, indices, updatable, true)
+        self.build_geometry(vertices, indices, updatable, Kind::Glass, None)
+    }
+
+    /// As [`Self::build_ray_traced_geometry`], but a cutout: a ray is stopped only where it
+    /// crosses a texel `mask` says is solid. `uvs` are the vertices' texture coordinates, two
+    /// floats each, as the renderer samples the texture the mask was made from.
+    pub fn build_ray_traced_cutout(
+        &self,
+        vertices: &[f32],
+        indices: &[u32],
+        uvs: &[f32],
+        mask: Arc<CutoutMask>,
+        updatable: bool,
+    ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
+        let uv = |i: u32| {
+            let i = i as usize * 2;
+            [uvs.get(i).copied().unwrap_or(0.0), uvs.get(i + 1).copied().unwrap_or(0.0)]
+        };
+        let corners = indices[..indices.len() / 3 * 3].iter().map(|&i| uv(i)).collect();
+        self.build_geometry(vertices, indices, updatable, Kind::Cutout, Some(Cutout { corners, mask }))
     }
 
     fn build_geometry(
@@ -370,7 +634,8 @@ impl WgpuGraphicsServer {
         vertices: &[f32],
         indices: &[u32],
         updatable: bool,
-        see_through: bool,
+        kind: Kind,
+        cutout: Option<Cutout>,
     ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
         if !self.ray_tracing || vertices.is_empty() || indices.len() < 3 {
             return Ok(None);
@@ -396,11 +661,13 @@ impl WgpuGraphicsServer {
             vertex_count,
             index_format: Some(wgpu::IndexFormat::Uint32),
             index_count: Some(index_count),
-            // Glass is only ever passed through, and each pane has to be counted once.
-            flags: if see_through {
-                wgpu::AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION
-            } else {
-                wgpu::AccelerationStructureGeometryFlags::OPAQUE
+            // Glass is only ever passed through, and each pane has to be counted once. A cutout
+            // is not opaque either, so that the shader is asked about each hit on it.
+            flags: match kind {
+                Kind::Solid => wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+                Kind::Glass | Kind::Cutout => {
+                    wgpu::AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION
+                }
             },
         };
         let (flags, update_mode) = if updatable {
@@ -433,7 +700,9 @@ impl WgpuGraphicsServer {
             vertex_count,
             triangle_count: index_count / 3,
             updatable,
-            see_through,
+            see_through: kind == Kind::Glass,
+            cutout,
+            id: NEXT_GEOMETRY.fetch_add(1, Ordering::Relaxed),
         };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -500,6 +769,7 @@ impl WgpuGraphicsServer {
             capacity,
             used: 0,
             triangle_count: 0,
+            cutouts: CutoutBuffers::new(&self.state.device, &[]),
             _geometry: None,
         };
         self.update_ray_traced_instances(&mut scene, instances)?;
@@ -527,6 +797,37 @@ impl WgpuGraphicsServer {
             scene.capacity = wanted;
             scene.used = 0;
         }
+        // Each cutout placed gets a record for the shaders, in the order they first come; the
+        // records are only written again when which cutouts there are changes.
+        let mut cutouts: Vec<&RayTracedGeometry> = Vec::new();
+        let mut custom_data: Vec<u32> = Vec::with_capacity(instances.len());
+        for instance in instances {
+            let geometry = instance.geometry;
+            custom_data.push(if geometry.cutout.is_some() {
+                let record = match cutouts.iter().position(|had| had.id == geometry.id) {
+                    Some(index) => index,
+                    None => {
+                        cutouts.push(geometry);
+                        cutouts.len() - 1
+                    }
+                };
+                CUTOUT_BIT | record as u32
+            } else {
+                lets_through_bits(instance.lets_through)
+            });
+        }
+        if cutouts.len() >= CUTOUT_BIT as usize {
+            return Err(FrameworkError::Custom(format!(
+                "{} cutouts in one ray traced scene; at most {} fit",
+                cutouts.len(),
+                CUTOUT_BIT - 1
+            )));
+        }
+        let ids: Vec<u64> = cutouts.iter().map(|geometry| geometry.id).collect();
+        if ids != scene.cutouts.ids {
+            scene.cutouts = CutoutBuffers::new(&self.state.device, &cutouts);
+        }
+
         // Only the slots given copies now or last time; those past them are empty already.
         let end = (instances.len() as u32).max(scene.used) as usize;
         scene.used = instances.len() as u32;
@@ -537,16 +838,12 @@ impl WgpuGraphicsServer {
         for (slot, instance) in slots.iter_mut().zip(
             instances
                 .iter()
+                .zip(&custom_data)
                 .map(Some)
                 .chain(std::iter::repeat(None)),
         ) {
-            *slot = instance.map(|instance| {
-                wgpu::TlasInstance::new(
-                    &instance.geometry.blas,
-                    instance.transform,
-                    lets_through_bits(instance.lets_through),
-                    0xff,
-                )
+            *slot = instance.map(|(instance, &custom_data)| {
+                wgpu::TlasInstance::new(&instance.geometry.blas, instance.transform, custom_data, 0xff)
             });
         }
         scene.triangle_count = instances
@@ -571,6 +868,7 @@ impl WgpuGraphicsServer {
         }
         let device = &self.state.device;
         let non_filtering = wgpu::TextureSampleType::Float { filterable: false };
+        let cutouts = cutout_layout_entries(SHADOW_CUTOUT_BINDING, wgpu::ShaderStages::FRAGMENT);
 
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ShadowRays"),
@@ -592,9 +890,12 @@ impl WgpuGraphicsServer {
                 },
                 uniform_entry(3),
                 texture_entry(4, non_filtering),
+                cutouts[0].clone(),
+                cutouts[1].clone(),
+                cutouts[2].clone(),
             ],
         });
-        let pipeline = mask_pipeline(device, "ShadowRays", SHADER, &layout);
+        let pipeline = mask_pipeline(device, "ShadowRays", &shadow_rays_source(), &layout);
 
         let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ShadowBlur"),
@@ -740,6 +1041,7 @@ impl ShadowTracer {
                 aspect: wgpu::TextureAspect::DepthOnly,
                 ..Default::default()
             });
+        let cutouts = scene.cutout_entries(SHADOW_CUTOUT_BINDING);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ShadowRays"),
             layout: &self.layout,
@@ -764,6 +1066,9 @@ impl ShadowTracer {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(normals.wgpu_view()),
                 },
+                cutouts[0].clone(),
+                cutouts[1].clone(),
+                cutouts[2].clone(),
             ],
         });
 
@@ -847,5 +1152,45 @@ impl ShadowTracer {
         *server.frame_encoder.borrow_mut() = Some(encoder);
 
         Ok(Some(result))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn validate(source: &str) {
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|e| panic!("{}\n{source}", e.emit_to_string(source)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}\n{source}"));
+    }
+
+    #[test]
+    fn the_shadow_rays_shader_is_valid() {
+        validate(&shadow_rays_source());
+    }
+
+    #[test]
+    fn a_mask_keeps_which_texels_are_solid() {
+        let mask = CutoutMask::new(7, 5, |x, y| (x + y) % 3 == 0);
+        for y in 0..5 {
+            for x in 0..7 {
+                assert_eq!(mask.is_solid(x, y), (x + y) % 3 == 0, "{x}, {y}");
+            }
+        }
+        assert_eq!(mask.bits.len(), 2);
+    }
+
+    #[test]
+    fn glass_never_looks_like_a_cutout() {
+        for through in [[0.0; 3], [1.0; 3], [0.5, 0.25, 1.0]] {
+            assert_eq!(lets_through_bits(through) & CUTOUT_BIT, 0);
+        }
+        assert_eq!(lets_through_bits([1.0, 0.0, 1.0]), 127 | (127 << 16));
     }
 }

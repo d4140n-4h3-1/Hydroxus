@@ -12,8 +12,14 @@ enable wgpu_ray_query;
 //
 // Glass is traced too, but lets light through: its geometry is not opaque, so a ray passes on
 // through it, and each copy of it carries in its custom data how much of the red, green and blue
-// of the light it lets through, a byte each. A ray is lit by what is left of the light once every
-// pane it crosses has taken its share - coloured by the glass - and by nothing past anything solid.
+// of the light it lets through, seven bits each, a byte apart. A ray is lit by what is left of the
+// light once every pane it crosses has taken its share - coloured by the glass - and by nothing
+// past anything solid.
+//
+// Cutouts - leaves, needles, grass - are not opaque either. Their custom data has CUTOUT_BIT set
+// and says which of the scene's cutouts they are (see `cutout_blocks`, put in ahead of this
+// shader): a hit on one stops the ray only where its texture is solid there, and elsewhere the ray
+// goes on, as the renderer leaves those texels undrawn.
 //
 // A real light has a size, and a shadow's edge is soft where only part of it is hidden. With more
 // than one sample, the rays spread over a disk the size of the light - or, for the sun, over the
@@ -52,8 +58,9 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
 }
 
 // How much of the light gets through along the ray within `reach`, colour by colour: none past
-// anything solid - any solid hit will do, so the search stops at the first one - and through each
-// pane of glass it crosses, as much as that glass lets through.
+// anything solid - any solid hit will do, so the search stops at the first one, a solid texel of
+// a cutout included - and through each pane of glass it crosses, as much as that glass lets
+// through.
 fn transmitted(origin: vec3f, direction: vec3f, reach: f32) -> vec3f {
     const TERMINATE_ON_FIRST_HIT = 0x4u;
     var query: ray_query;
@@ -66,14 +73,22 @@ fn transmitted(origin: vec3f, direction: vec3f, reach: f32) -> vec3f {
         direction,
     ));
     var through = vec3f(1.0);
-    // Glass is only a candidate, never taken for the hit: the ray goes on through it.
+    // Glass is only a candidate, never taken for the hit: the ray goes on through it. A cutout
+    // is taken for the hit where it is solid.
     while (rayQueryProceed(&query)) {
-        let lets = rayQueryGetCandidateIntersection(&query).instance_custom_data;
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        let data = candidate.instance_custom_data;
+        if ((data & CUTOUT_BIT) != 0u) {
+            if (cutout_blocks(data, candidate.primitive_index, candidate.barycentrics)) {
+                rayQueryConfirmIntersection(&query);
+            }
+            continue;
+        }
         through *= vec3f(
-            f32(lets & 0xFFu),
-            f32((lets >> 8u) & 0xFFu),
-            f32((lets >> 16u) & 0xFFu),
-        ) / 255.0;
+            f32(data & 0x7Fu),
+            f32((data >> 8u) & 0x7Fu),
+            f32((data >> 16u) & 0x7Fu),
+        ) / 127.0;
     }
     if (rayQueryGetCommittedIntersection(&query).kind != RAY_QUERY_INTERSECTION_NONE) {
         return vec3f(0.0);

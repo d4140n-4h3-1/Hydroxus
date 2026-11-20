@@ -69,7 +69,7 @@ pub struct AreaLighter {
 const SHADER: &str = include_str!("shaders/area_lights.wgsl");
 const BLUR_SHADER: &str = include_str!("shaders/area_lights_blur.wgsl");
 
-/// Shadow rays towards each point of a light, through glass.
+/// Shadow rays towards each point of a light, through glass; cutouts block them as if solid.
 const TRACED: &str = r#"enable wgpu_ray_query;
 
 @group(0) @binding(0) var sceneGeometry: acceleration_structure;
@@ -88,11 +88,19 @@ fn visible(origin: vec3f, direction: vec3f, reach: f32) -> vec3f {
     var through = vec3f(1.0);
     while (rayQueryProceed(&query)) {
         let lets = rayQueryGetCandidateIntersection(&query).instance_custom_data;
+        // A cutout (the custom data's top bit: see the shadow rays) is taken as solid all over
+        // here, without looking up its texture: an area light's glow is soft enough not to show
+        // the holes.
+        if ((lets & 0x800000u) != 0u) {
+            rayQueryConfirmIntersection(&query);
+            continue;
+        }
+        // Glass: how much of each colour it lets through, seven bits each.
         through *= vec3f(
-            f32(lets & 0xFFu),
-            f32((lets >> 8u) & 0xFFu),
-            f32((lets >> 16u) & 0xFFu),
-        ) / 255.0;
+            f32(lets & 0x7Fu),
+            f32((lets >> 8u) & 0x7Fu),
+            f32((lets >> 16u) & 0x7Fu),
+        ) / 127.0;
     }
     if (rayQueryGetCommittedIntersection(&query).kind != RAY_QUERY_INTERSECTION_NONE) {
         return vec3f(0.0);
@@ -552,5 +560,19 @@ mod tests {
     fn the_shader_holds_as_many_lights_as_are_sent() {
         assert!(SHADER.contains(&format!("lights: array<Light, {MAX_AREA_LIGHTS}>")));
         assert!(SHADER.contains(&format!("min(uniforms.lightCount, {MAX_AREA_LIGHTS}u)")));
+    }
+
+    #[test]
+    fn the_traced_and_plain_shaders_are_valid() {
+        for source in [format!("{TRACED}{SHADER}"), format!("{PLAIN}{SHADER}")] {
+            let module = wgpu::naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        }
     }
 }
