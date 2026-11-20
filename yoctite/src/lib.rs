@@ -43,6 +43,9 @@ use std::collections::HashMap;
 pub struct Mesh<'a> {
     pub positions: &'a [[f32; 3]],
     pub indices: &'a [u32],
+    /// Each vertex's texture coordinates, if it has them: then how far simplifying moves the
+    /// texture over the surface counts as error too (see [`Self::with_texture_coordinates`]).
+    pub uvs: Option<&'a [[f32; 2]]>,
     /// Which vertices are at the same position: the same welded index for all of them.
     weld: Vec<u32>,
     welded_count: usize,
@@ -65,9 +68,23 @@ impl<'a> Mesh<'a> {
         Self {
             positions,
             indices,
+            uvs: None,
             weld,
             welded_count: seen.len(),
         }
+    }
+
+    /// The mesh with texture coordinates, one for each vertex. Simplifying a flat surface - a
+    /// leaf card, a plank - moves none of it, but can drag its texture across it; with these,
+    /// how far the texture is dragged, in the surface's own units, counts as error, so a level
+    /// of detail that smears a texture is only drawn from where the smear is too small to see.
+    /// Where the texture is laid flat across a plane, as on ground, dragging it moves nothing,
+    /// and nothing is counted.
+    pub fn with_texture_coordinates(mut self, uvs: &'a [[f32; 2]]) -> Self {
+        if uvs.len() == self.positions.len() {
+            self.uvs = Some(uvs);
+        }
+        self
     }
 
     pub(crate) fn position(&self, v: u32) -> V3 {

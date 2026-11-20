@@ -30,7 +30,7 @@
 //! now I don't know better solution.
 
 use crate::{
-    core::{algebra::Vector2, color::Color, math::Rect, sstorage::ImmutableString},
+    core::{algebra::Vector2, color::Color, math::Rect, pool::Handle, sstorage::ImmutableString},
     graphics::{
         error::FrameworkError,
         framebuffer::{Attachment, GpuFrameBuffer},
@@ -47,10 +47,12 @@ use crate::{
         observer::Observer,
         occlusion::OcclusionTester,
         resources::RendererResources,
-        GeometryCache, QualitySettings, RenderPassStatistics, TextureCache,
+        GBufferPassContext, GeometryCache, QualitySettings, RenderPassStatistics, SceneRenderPass,
+        TextureCache,
     },
-    scene::{decal::Decal, graph::Graph, mesh::RenderPath},
+    scene::{decal::Decal, graph::Graph, mesh::RenderPath, Scene},
 };
+use std::{cell::RefCell, rc::Rc};
 use fxhash::FxHashSet;
 use fyrox_resource::manager::ResourceManager;
 
@@ -79,6 +81,12 @@ pub(crate) struct GBufferRenderContext<'a, 'b> {
     #[allow(dead_code)]
     pub screen_space_debug_renderer: &'a mut DebugRenderer,
     pub resource_manager: &'a ResourceManager,
+    /// Custom passes, which draw into the G-Buffer after the meshes (see
+    /// [`crate::renderer::SceneRenderPass::on_gbuffer_render`]).
+    pub scene_render_passes: &'a [Rc<RefCell<dyn SceneRenderPass>>],
+    pub scene: &'b Scene,
+    pub scene_handle: Handle<Scene>,
+    pub elapsed_time: f32,
 }
 
 impl GBuffer {
@@ -197,6 +205,10 @@ impl GBuffer {
             uniform_buffer_cache,
             uniform_memory_allocator,
             resource_manager,
+            scene_render_passes,
+            scene,
+            scene_handle,
+            elapsed_time,
             ..
         } = args;
 
@@ -242,6 +254,22 @@ impl GBuffer {
                 scene_depth: None,           // TODO. Add z-pre-pass.
             },
         )?;
+
+        // Custom passes' own geometry, after the meshes, so that the decals and the occlusion
+        // test see it too.
+        for render_pass in scene_render_passes {
+            statistics += render_pass.borrow_mut().on_gbuffer_render(GBufferPassContext {
+                elapsed_time,
+                server,
+                texture_cache,
+                resource_manager,
+                renderer_resources,
+                framebuffer: &self.framebuffer,
+                scene,
+                scene_handle,
+                observer,
+            })?;
+        }
 
         if quality_settings.use_occlusion_culling {
             let mut objects = FxHashSet::default();

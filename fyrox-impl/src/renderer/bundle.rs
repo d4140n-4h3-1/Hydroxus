@@ -78,7 +78,7 @@ use crate::{
         probe::ReflectionProbe,
     },
 };
-use fxhash::{FxBuildHasher, FxHashMap, FxHasher};
+use fxhash::{FxBuildHasher, FxHashMap, FxHashSet, FxHasher};
 use fyrox_graph::NodeWrapper;
 use fyrox_resource::manager::ResourceManager;
 use std::{
@@ -916,6 +916,32 @@ impl RenderDataBundleStorage {
         options: RenderDataBundleStorageOptions,
         dynamic_surface_cache: &mut DynamicSurfaceCache,
     ) -> Self {
+        Self::from_graph_skipping(
+            graph,
+            render_mask,
+            elapsed_time,
+            observer_position,
+            render_pass_name,
+            options,
+            dynamic_surface_cache,
+            None,
+        )
+    }
+
+    /// As [`Self::from_graph`], but leaving out the render data of the nodes in `skip` - those
+    /// another renderer draws itself (see [`crate::renderer::Renderer::set_taken_over_meshes`]).
+    /// Their children are still visited.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_graph_skipping(
+        graph: &Graph,
+        render_mask: BitMask,
+        elapsed_time: f32,
+        observer_position: &ObserverPosition,
+        render_pass_name: ImmutableString,
+        options: RenderDataBundleStorageOptions,
+        dynamic_surface_cache: &mut DynamicSurfaceCache,
+        skip: Option<&FxHashSet<Handle<Node>>>,
+    ) -> Self {
         // Aim for the worst-case scenario when every node has unique render data.
         let capacity = graph.node_count() as usize;
         let mut storage = Self {
@@ -1028,19 +1054,25 @@ impl RenderDataBundleStorage {
             node_handle: Handle<Node>,
             graph: &Graph,
             lod_filter: &[bool],
+            skip: Option<&FxHashSet<Handle<Node>>>,
             ctx: &mut RenderContext,
         ) {
             if lod_filter[node_handle.index() as usize] {
                 let node = graph.node(node_handle);
-                if let RdcControlFlow::Continue = node.collect_render_data(ctx) {
+                let flow = if skip.is_some_and(|skip| skip.contains(&node_handle)) {
+                    RdcControlFlow::Continue
+                } else {
+                    node.collect_render_data(ctx)
+                };
+                if let RdcControlFlow::Continue = flow {
                     for child in node.children() {
-                        iterate_recursive(*child, graph, lod_filter, ctx);
+                        iterate_recursive(*child, graph, lod_filter, skip, ctx);
                     }
                 }
             }
         }
 
-        iterate_recursive(graph.root(), graph, &lod_filter, &mut ctx);
+        iterate_recursive(graph.root(), graph, &lod_filter, skip, &mut ctx);
 
         storage.sort();
 

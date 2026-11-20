@@ -36,6 +36,68 @@ const MIN_TURN_COSINE: f64 = 0.2;
 pub(crate) struct Simplified {
     pub triangles: Vec<[u32; 3]>,
     pub error: f32,
+    /// How far the texture was dragged across the surface, measured afterwards against the
+    /// triangles simplified: at every vertex they had, by the triangle now covering it. Relative
+    /// to them, not to the full mesh: drag adds up, level on level.
+    pub dragged: f32,
+}
+
+/// How far `after` drags the texture across the surface from `before`, at most, in the surface's
+/// units: at each vertex of `before`, the texture coordinate the triangle of `after` covering it
+/// gives there, against its own. On a seam a vertex is covered from both sides, so of the
+/// triangles nearest it, the one that drags it least is taken. Without texture coordinates,
+/// nothing.
+fn measure_drag(mesh: &Mesh, before: &[[u32; 3]], after: &[[u32; 3]]) -> f64 {
+    let Some(uvs) = mesh.uvs else {
+        return 0.0;
+    };
+    let uv = |v: u32| uvs[v as usize].map(f64::from);
+    // Each triangle of `after`: its corners, their texture coordinates, and its scale from
+    // texture to surface; those with no area in either left out.
+    let covers: Vec<([V3; 3], [[f64; 2]; 3], f64)> = after
+        .iter()
+        .filter_map(|t| {
+            let p = t.map(|v| mesh.position(v));
+            let u = t.map(uv);
+            let area = (p[1] - p[0]).cross(p[2] - p[0]).length();
+            let texture_area =
+                ((u[1][0] - u[0][0]) * (u[2][1] - u[0][1]) - (u[2][0] - u[0][0]) * (u[1][1] - u[0][1])).abs();
+            (area > 0.0 && texture_area > 1e-14).then(|| (p, u, (area / texture_area).sqrt()))
+        })
+        .collect();
+    let mut vertices: Vec<u32> = before.iter().flatten().copied().collect();
+    vertices.sort_unstable();
+    vertices.dedup();
+    let mut worst: f64 = 0.0;
+    for v in vertices {
+        let (at, own) = (mesh.position(v), uv(v));
+        // Each triangle's distance from the vertex, and how far it drags the texture there.
+        let mut nearest = f64::MAX;
+        let mut found: Vec<(f64, f64)> = Vec::new();
+        for (p, u, scale) in &covers {
+            let Some(w) = barycentric(at, *p) else {
+                continue;
+            };
+            let clamped = w.map(|w| w.max(0.0));
+            let sum: f64 = clamped.iter().sum();
+            let closest = (p[0] * clamped[0] + p[1] * clamped[1] + p[2] * clamped[2]) * (1.0 / sum.max(1e-30));
+            let distance = (closest - at).length();
+            let there = [0, 1].map(|i| w[0] * u[0][i] + w[1] * u[1][i] + w[2] * u[2][i]);
+            let off = ((there[0] - own[0]).powi(2) + (there[1] - own[1]).powi(2)).sqrt() * scale;
+            nearest = nearest.min(distance);
+            found.push((distance, off));
+        }
+        let tolerance = nearest * 1e-3 + 1e-6;
+        if let Some(off) = found
+            .iter()
+            .filter(|(d, _)| *d <= nearest + tolerance)
+            .map(|&(_, off)| off)
+            .min_by(f64::total_cmp)
+        {
+            worst = worst.max(off);
+        }
+    }
+    worst
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -58,6 +120,9 @@ impl Ord for Cost {
 struct Vertex {
     position: V3,
     quadric: Quadric,
+    /// How far, at most, the texture has been dragged across the surface by the collapses onto
+    /// it so far, in the surface's units.
+    dragged: f64,
     locked: bool,
     alive: bool,
     /// Its triangles, some perhaps no longer alive.
@@ -72,24 +137,102 @@ struct Triangle {
     alive: bool,
 }
 
-struct Simplifier {
+struct Simplifier<'a> {
     vertices: Vec<Vertex>,
     triangles: Vec<Triangle>,
     alive: usize,
+    /// The mesh's texture coordinates, by its own vertices, if it has them.
+    uvs: Option<&'a [[f32; 2]]>,
 }
 
-impl Simplifier {
-    /// How far collapsing `from` onto `to` moves the surface, squared: by its quadrics, or by the
-    /// edge's length if it breaks a seam.
+/// Where `p` is in the plane of triangle `t`, as weights of its corners: all of them at least
+/// zero inside it. [`None`] for a triangle with no area.
+fn barycentric(p: V3, t: [V3; 3]) -> Option<[f64; 3]> {
+    let (e0, e1, e2) = (t[1] - t[0], t[2] - t[0], p - t[0]);
+    let (d00, d01, d11) = (e0.dot(e0), e0.dot(e1), e1.dot(e1));
+    let (d20, d21) = (e2.dot(e0), e2.dot(e1));
+    let denominator = d00 * d11 - d01 * d01;
+    if denominator.abs() < 1e-30 {
+        return None;
+    }
+    let b = (d11 * d20 - d01 * d21) / denominator;
+    let c = (d00 * d21 - d01 * d20) / denominator;
+    Some([1.0 - b - c, b, c])
+}
+
+impl Simplifier<'_> {
+    /// How far collapsing `from` onto `to` moves the surface, squared: by its quadrics, by how far
+    /// it drags the texture, or by the edge's length if it breaks a seam.
     fn cost(&self, from: usize, to: usize) -> f64 {
         let q = self.vertices[from].quadric + self.vertices[to].quadric;
         let moved = q.error(self.vertices[to].position) / q.weight.max(1e-30);
+        let dragged = self.dragged(from, to);
+        let moved = moved.max(dragged * dragged);
         if self.keeps_seams(from, to) {
             moved
         } else {
             let edge = self.vertices[to].position - self.vertices[from].position;
             moved.max(edge.dot(edge))
         }
+    }
+
+    /// How far collapsing `from` onto `to` drags the texture across the surface, added to how far
+    /// collapses onto `from` dragged it already: in the surface's units. Where `from` was, the
+    /// triangle that covers it once moved gives some other texture coordinate than `from`'s own;
+    /// that difference, in the surface's units by the triangle's own scale between texture and
+    /// surface, is how far the texture has been dragged there. Each side of a seam is judged by
+    /// its own triangles. Without texture coordinates, nothing.
+    fn dragged(&self, from: usize, to: usize) -> f64 {
+        let Some(uvs) = self.uvs else {
+            return 0.0;
+        };
+        let uv = |v: u32| uvs[v as usize].map(f64::from);
+        let sides = self.sides(from, to);
+        let Some(&(_, fallback)) = sides.first() else {
+            return self.vertices[from].dragged;
+        };
+        let at = self.vertices[from].position;
+        // For each of `from`'s own vertices - each side of a seam - the triangle covering where
+        // `from` was, the most nearly: whose least weight there is greatest; and how far it drags.
+        let mut covering: Vec<(u32, f64, f64)> = Vec::new();
+        for t in self.live(from) {
+            let tri = &self.triangles[t];
+            if tri.corners.contains(&to) {
+                continue;
+            }
+            let k = tri.corners.iter().position(|&c| c == from).unwrap();
+            let own = tri.originals[k];
+            let becomes = sides.iter().find(|(o, _)| *o == own).map_or(fallback, |(_, b)| *b);
+            let positions = tri
+                .corners
+                .map(|c| if c == from { self.vertices[to].position } else { self.vertices[c].position });
+            let mut texture = tri.originals.map(uv);
+            texture[k] = uv(becomes);
+            let Some(w) = barycentric(at, positions) else {
+                continue;
+            };
+            let inside = w[0].min(w[1]).min(w[2]);
+            // The triangle's own mapping from the surface to the texture, carried on to where
+            // `from` was: exact for a texture laid linearly across a plane.
+            let there = [0, 1].map(|i| w[0] * texture[0][i] + w[1] * texture[1][i] + w[2] * texture[2][i]);
+            let should = uv(own);
+            let area = (positions[1] - positions[0]).cross(positions[2] - positions[0]).length();
+            let texture_area = ((texture[1][0] - texture[0][0]) * (texture[2][1] - texture[0][1])
+                - (texture[2][0] - texture[0][0]) * (texture[1][1] - texture[0][1]))
+                .abs();
+            if texture_area < 1e-14 || area <= 0.0 {
+                continue;
+            }
+            let scale = (area / texture_area).sqrt();
+            let off = ((there[0] - should[0]).powi(2) + (there[1] - should[1]).powi(2)).sqrt() * scale;
+            match covering.iter_mut().find(|(o, ..)| *o == own) {
+                Some(best) if best.1 >= inside => {}
+                Some(best) => *best = (own, inside, off),
+                None => covering.push((own, inside, off)),
+            }
+        }
+        let worst = covering.iter().map(|&(_, _, off)| off).fold(0.0, f64::max);
+        self.vertices[from].dragged + worst
     }
 
     /// The way triangle `t` faces, not of unit length.
@@ -223,6 +366,8 @@ impl Simplifier {
 
     /// Moves `a` onto `b`.
     fn collapse(&mut self, a: usize, b: usize) {
+        let dragged = self.dragged(a, b);
+        self.vertices[b].dragged = self.vertices[b].dragged.max(dragged);
         let sides = self.sides(a, b);
         // For a corner with no vertex of its own side to become: `b`'s vertex in each of `b`'s
         // triangles, and the way that triangle faces.
@@ -280,6 +425,7 @@ pub(crate) fn simplify(
         vertices: Vec::new(),
         triangles: Vec::with_capacity(triangles.len()),
         alive: 0,
+        uvs: mesh.uvs,
     };
     for originals in triangles {
         let corners = originals.map(|v| {
@@ -288,6 +434,7 @@ pub(crate) fn simplify(
                 s.vertices.push(Vertex {
                     position: mesh.position(v),
                     quadric: Quadric::default(),
+                    dragged: 0.0,
                     locked: locked(w),
                     alive: true,
                     triangles: Vec::new(),
@@ -383,13 +530,11 @@ pub(crate) fn simplify(
         }
     }
 
+    let simplified: Vec<[u32; 3]> = s.triangles.iter().filter(|t| t.alive).map(|t| t.originals).collect();
+    let dragged = measure_drag(mesh, triangles, &simplified) as f32;
     Simplified {
-        triangles: s
-            .triangles
-            .iter()
-            .filter(|t| t.alive)
-            .map(|t| t.originals)
-            .collect(),
+        triangles: simplified,
         error: worst.sqrt() as f32,
+        dragged,
     }
 }

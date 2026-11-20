@@ -21,10 +21,12 @@
 //! levels of detail chosen. The GPU will make that list itself, culling and choosing levels of
 //! detail every frame, in the next phase.
 
-use crate::{server::WgpuGraphicsServer, texture::WgpuTexture};
+use crate::{sampler::WgpuSampler, server::WgpuGraphicsServer, texture::WgpuTexture};
 use fyrox_graphics::{
     error::FrameworkError,
+    framebuffer::GpuFrameBuffer,
     gpu_texture::{GpuTexture, GpuTextureDescriptor, GpuTextureKind, PixelKind},
+    sampler::GpuSampler,
     server::GraphicsServer,
 };
 use std::marker::PhantomData;
@@ -104,8 +106,11 @@ pub struct GpuInstance {
     pub mesh: u32,
     /// [`INSTANCE_ALIVE`], or 0 for a free slot.
     pub flags: u32,
+    /// Which material it is drawn with: a slot the caller numbers, from 0 (see
+    /// [`CullParameters::material_slots`]).
+    pub material: u32,
     /// To a multiple of sixteen bytes.
-    pub _padding: [u32; 2],
+    pub _padding: u32,
 }
 
 /// An instance slot in use.
@@ -433,20 +438,23 @@ impl GeometryPool {
         self.places.get(id.0 as usize).copied().flatten().map(|p| p.record)
     }
 
-    /// Places a copy of `mesh` at `transform` (three rows of four, from its space to the world).
+    /// Places a copy of `mesh` at `transform` (three rows of four, from its space to the world),
+    /// drawn with the material in slot `material`.
     pub fn add_instance(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         mesh: MeshId,
         transform: [f32; 12],
+        material: u32,
     ) -> InstanceId {
         let slot = self.instances.allocate(device, queue, 1);
         let record = GpuInstance {
             transform,
             mesh: mesh.0,
             flags: INSTANCE_ALIVE,
-            _padding: [0; 2],
+            material,
+            _padding: 0,
         };
         self.instances.write(queue, slot, &[record]);
         if self.placed.len() <= slot as usize {
@@ -642,6 +650,8 @@ impl ClusterView {
             view_projection,
             eye,
             threshold,
+            // The view draws every material alike.
+            material_slots: 1,
         };
         self.render(server, pool, view_projection, width, height, Source::Culled(culler, parameters))
     }
@@ -736,7 +746,7 @@ impl ClusterView {
         }
         let list_buffer = match (&draw_list, culler) {
             (Some((buffer, _)), _) => buffer,
-            (None, Some(culler)) => &culler.draw_list,
+            (None, Some(culler)) => &culler.lists,
             (None, None) => unreachable!("one or the other"),
         };
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -791,7 +801,7 @@ impl ClusterView {
                 // Room for a whole cluster in every instance of the draw; a cluster with fewer
                 // triangles makes the rest of its vertices nothing.
                 (Some((_, count)), _) if *count > 0 => pass.draw(0..CLUSTER_VERTICES, 0..*count),
-                (None, Some(culler)) => pass.draw_indirect(&culler.draw_args, 0),
+                (None, Some(culler)) => pass.draw_indirect(&culler.args, ALL_DRAW_OFFSET),
                 _ => {}
             }
         }
@@ -818,6 +828,9 @@ pub struct CullParameters {
     pub eye: [f32; 3],
     /// An error over its distance as big as may show: about a pixel's angle.
     pub threshold: f32,
+    /// How many material slots instances are numbered in (see [`GpuInstance::material`]): the
+    /// list is sorted by them, and each gets its own indirect draw.
+    pub material_slots: u32,
 }
 
 /// What [`Culler`] chose, a frame or two ago.
@@ -835,6 +848,14 @@ pub struct CullStats {
 
 const CULL_SHADER: &str = include_str!("shaders/yoctite_cull.wgsl");
 
+/// Where in [`Culler::args`] the draw of every cluster listed is, in bytes.
+pub const ALL_DRAW_OFFSET: u64 = 16;
+
+/// Where in [`Culler::args`] the draw of the clusters of material slot `material` is, in bytes.
+pub fn material_draw_offset(material: u32) -> u64 {
+    32 + 16 * material as u64
+}
+
 /// The culling's uniforms, as the shader reads them.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -845,7 +866,7 @@ struct CullUniforms {
     instance_slots: u32,
     capacity: u32,
     cluster_vertices: u32,
-    _padding: u32,
+    material_slots: u32,
 }
 
 /// The six planes of the view of `view_projection` (column by column, OpenGL's clip space),
@@ -885,10 +906,10 @@ enum Readback {
 
 /// Chooses on the GPU which clusters of which instances to draw: instances and clusters out of
 /// view left out, and for each instance the cut through its clusters whose error looks no
-/// bigger than the threshold (see `shaders/yoctite_cull.wgsl`), into a draw list and the
-/// indirect arguments of a draw of it. Nothing is read back to draw it; what it chose is read
-/// back a frame or two later, for statistics and to make the list bigger when it runs out of
-/// room.
+/// bigger than the threshold (see `shaders/yoctite_cull.wgsl`), into a list sorted by material,
+/// and the indirect arguments of a draw of each material's clusters, and of them all. Nothing is
+/// read back to draw them; what it chose is read back a frame or two later, for statistics and
+/// to make the list bigger when it runs out of room.
 pub struct Culler {
     layout: wgpu::BindGroupLayout,
     args_layout: wgpu::BindGroupLayout,
@@ -896,14 +917,21 @@ pub struct Culler {
     instances: wgpu::ComputePipeline,
     prepare: wgpu::ComputePipeline,
     clusters: wgpu::ComputePipeline,
-    finalize: wgpu::ComputePipeline,
+    offsets: wgpu::ComputePipeline,
+    scatter: wgpu::ComputePipeline,
     counts: wgpu::Buffer,
-    dispatch_args: wgpu::Buffer,
-    /// The draw's indirect arguments: [`CLUSTER_VERTICES`] vertices, an instance a cluster.
-    pub draw_args: wgpu::Buffer,
-    /// The clusters to draw, as instance slot and pool cluster.
-    pub draw_list: wgpu::Buffer,
+    /// The indirect arguments: the cluster pass's dispatch, the draw of every cluster listed at
+    /// [`ALL_DRAW_OFFSET`], and each material's draw at [`material_draw_offset`]. A draw is
+    /// [`CLUSTER_VERTICES`] vertices, an instance a cluster.
+    pub args: wgpu::Buffer,
+    /// The clusters to draw, as instance slot and pool cluster: as listed from 0, and sorted by
+    /// material from [`Self::capacity`] on.
+    pub lists: wgpu::Buffer,
+    /// Each material's range of the sorted list: count, start, and a cursor, a word each and one
+    /// spare (see `MaterialRange` in the shader).
+    pub materials: wgpu::Buffer,
     capacity: u32,
+    material_capacity: u32,
     visible: wgpu::Buffer,
     visible_capacity: u32,
     readback: wgpu::Buffer,
@@ -914,6 +942,16 @@ pub struct Culler {
 
 /// How many clusters a draw list holds to begin with.
 const FIRST_CAPACITY: u32 = 1 << 16;
+
+fn storage_buffer(device: &wgpu::Device, label: &str, size: u64, more: wgpu::BufferUsages) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size.max(16),
+        // Copied from too, to read them back when looking into what was drawn.
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | more,
+        mapped_at_creation: false,
+    })
+}
 
 impl Culler {
     /// The culling's pipelines, made once.
@@ -947,11 +985,12 @@ impl Culler {
                 buffer(4, false),
                 buffer(5, false),
                 buffer(6, false),
+                buffer(7, false),
             ],
         });
         let args_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("YoctiteCullArgs"),
-            entries: &[buffer(0, false), buffer(1, false)],
+            entries: &[buffer(0, false)],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("YoctiteCull"),
@@ -978,29 +1017,28 @@ impl Culler {
                 cache: None,
             })
         };
-        let storage = |label, size: u64, more: wgpu::BufferUsages| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | more,
-                mapped_at_creation: false,
-            })
-        };
+        let material_capacity = 64;
         Self {
             reset: pipeline("reset", &with_args),
             instances: pipeline("cull_instances", &without_args),
             prepare: pipeline("prepare", &with_args),
             clusters: pipeline("cull_clusters", &without_args),
-            finalize: pipeline("finalize", &with_args),
+            offsets: pipeline("offsets", &with_args),
+            scatter: pipeline("scatter", &without_args),
             layout,
             args_layout,
-            counts: storage("YoctiteCounts", 16, wgpu::BufferUsages::COPY_SRC),
-            dispatch_args: storage("YoctiteDispatch", 12, wgpu::BufferUsages::INDIRECT),
-            // Copied from too, to read them back when looking into what was drawn.
-            draw_args: storage("YoctiteDrawArgs", 16, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC),
-            draw_list: storage("YoctiteDrawList", FIRST_CAPACITY as u64 * 8, wgpu::BufferUsages::COPY_SRC),
+            counts: storage_buffer(device, "YoctiteCounts", 16, wgpu::BufferUsages::empty()),
+            args: storage_buffer(
+                device,
+                "YoctiteArgs",
+                material_draw_offset(material_capacity),
+                wgpu::BufferUsages::INDIRECT,
+            ),
+            lists: storage_buffer(device, "YoctiteLists", FIRST_CAPACITY as u64 * 16, wgpu::BufferUsages::empty()),
+            materials: storage_buffer(device, "YoctiteMaterialRanges", material_capacity as u64 * 16, wgpu::BufferUsages::empty()),
             capacity: FIRST_CAPACITY,
-            visible: storage("YoctiteVisible", 1024 * 4, wgpu::BufferUsages::empty()),
+            material_capacity,
+            visible: storage_buffer(device, "YoctiteVisible", 1024 * 4, wgpu::BufferUsages::empty()),
             visible_capacity: 1024,
             readback: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("YoctiteCountsRead"),
@@ -1019,20 +1057,16 @@ impl Culler {
         self.stats
     }
 
-    /// How many clusters its draw list holds.
+    /// How many clusters each of its lists holds: where the sorted list starts in
+    /// [`Self::lists`], counted in entries.
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
 
-    /// Makes the draw list hold `capacity` clusters, for the next culling.
+    /// Makes the lists hold `capacity` clusters, for the next culling.
     pub fn set_capacity(&mut self, device: &wgpu::Device, capacity: u32) {
         self.capacity = capacity.max(1);
-        self.draw_list = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("YoctiteDrawList"),
-            size: self.capacity as u64 * 8,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        self.lists = storage_buffer(device, "YoctiteLists", self.capacity as u64 * 16, wgpu::BufferUsages::empty());
     }
 
     /// Takes in the counts read back, if they have arrived, and starts reading back the last
@@ -1064,7 +1098,7 @@ impl Culler {
                 };
                 // Room for what it chose, and some to spare, from the next culling on.
                 if stats.clusters > self.capacity {
-                    let wanted = (stats.clusters as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64) as u32;
+                    let wanted = (stats.clusters as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64 / 2) as u32;
                     self.set_capacity(device, wanted);
                 }
                 self.stats = Some(stats);
@@ -1075,7 +1109,7 @@ impl Culler {
     }
 
     /// Records the culling of `pool`'s instances as `parameters` see them into `encoder`: its
-    /// draw list and draw arguments are ready for a draw recorded after it.
+    /// lists and draw arguments are ready for draws recorded after it.
     pub fn record(
         &mut self,
         device: &wgpu::Device,
@@ -1087,12 +1121,23 @@ impl Culler {
         let slots = pool.instance_slots();
         if slots > self.visible_capacity {
             self.visible_capacity = slots.next_power_of_two();
-            self.visible = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("YoctiteVisible"),
-                size: self.visible_capacity as u64 * 4,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
+            self.visible = storage_buffer(device, "YoctiteVisible", self.visible_capacity as u64 * 4, wgpu::BufferUsages::empty());
+        }
+        let material_slots = parameters.material_slots.max(1);
+        if material_slots > self.material_capacity {
+            self.material_capacity = material_slots.next_power_of_two();
+            self.args = storage_buffer(
+                device,
+                "YoctiteArgs",
+                material_draw_offset(self.material_capacity),
+                wgpu::BufferUsages::INDIRECT,
+            );
+            self.materials = storage_buffer(
+                device,
+                "YoctiteMaterialRanges",
+                self.material_capacity as u64 * 16,
+                wgpu::BufferUsages::empty(),
+            );
         }
         let uniforms = CullUniforms {
             planes: frustum_planes(&parameters.view_projection),
@@ -1101,7 +1146,7 @@ impl Culler {
             instance_slots: slots,
             capacity: self.capacity,
             cluster_vertices: CLUSTER_VERTICES,
-            _padding: 0,
+            material_slots,
         };
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("YoctiteCull"),
@@ -1115,7 +1160,8 @@ impl Culler {
             pool.instances.buffer(),
             &self.visible,
             &self.counts,
-            &self.draw_list,
+            &self.lists,
+            &self.materials,
         ]
         .into_iter()
         .enumerate()
@@ -1132,16 +1178,10 @@ impl Culler {
         let args = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("YoctiteCullArgs"),
             layout: &self.args_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.dispatch_args.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.draw_args.as_entire_binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.args.as_entire_binding(),
+            }],
         });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1151,17 +1191,19 @@ impl Culler {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.set_pipeline(&self.reset);
             pass.set_bind_group(1, &args, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            pass.dispatch_workgroups(material_slots.div_ceil(64), 1, 1);
             pass.set_pipeline(&self.instances);
             pass.dispatch_workgroups(slots.div_ceil(64).max(1), 1, 1);
             pass.set_pipeline(&self.prepare);
             pass.set_bind_group(1, &args, &[]);
             pass.dispatch_workgroups(1, 1, 1);
             pass.set_pipeline(&self.clusters);
-            pass.dispatch_workgroups_indirect(&self.dispatch_args, 0);
-            pass.set_pipeline(&self.finalize);
+            pass.dispatch_workgroups_indirect(&self.args, 0);
+            pass.set_pipeline(&self.offsets);
             pass.set_bind_group(1, &args, &[]);
             pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.scatter);
+            pass.dispatch_workgroups(self.capacity.div_ceil(64).min(65535), 1, 1);
         }
         if self.state == Readback::Idle {
             encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, 16);
@@ -1170,10 +1212,456 @@ impl Culler {
     }
 }
 
+const GBUFFER_SHADER: &str = include_str!("shaders/yoctite_gbuffer.wgsl");
+
+/// What a material's draw into the G-Buffer reads besides its textures, as the shader reads it
+/// (see `shaders/yoctite_gbuffer.wgsl`): the properties of the engine's standard and glTF
+/// shaders that their G-Buffer pass uses.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MaterialParams {
+    /// Times the diffuse texture: red, green, blue and alpha, from 0 to 1.
+    pub diffuse_color: [f32; 4],
+    /// Times the emission texture.
+    pub emission_strength: [f32; 3],
+    /// Times the metallic texture's channel [`Self::metallic_channel`].
+    pub metallic_factor: f32,
+    /// Times the texture coordinates.
+    pub tex_coord_scale: [f32; 2],
+    /// Times the roughness texture's channel [`Self::roughness_channel`].
+    pub roughness_factor: f32,
+    /// The decal layer written into the G-Buffer's decal mask.
+    pub layer_index: u32,
+    /// Which channel of the metallic texture is metallic: 0 red to 3 alpha.
+    pub metallic_channel: u32,
+    /// Which channel of the roughness texture is roughness.
+    pub roughness_channel: u32,
+    /// The material's slot, which its instances are numbered with (see
+    /// [`GpuInstance::material`]). Filled in by [`GBufferDrawer::draw`].
+    pub slot: u32,
+    /// To a multiple of sixteen bytes.
+    pub _padding: u32,
+}
+
+impl Default for MaterialParams {
+    fn default() -> Self {
+        Self {
+            diffuse_color: [1.0; 4],
+            emission_strength: [0.0; 3],
+            metallic_factor: 1.0,
+            tex_coord_scale: [1.0; 2],
+            roughness_factor: 1.0,
+            layer_index: 0,
+            metallic_channel: 0,
+            roughness_channel: 0,
+            slot: 0,
+            _padding: 0,
+        }
+    }
+}
+
+/// A material for [`GBufferDrawer::draw`]: its slot, what it reads, and its textures, each with
+/// its sampler: diffuse, normal, metallic, roughness, occlusion and emission, in that order.
+#[derive(Clone)]
+pub struct YoctiteMaterial {
+    /// The slot its instances are numbered with.
+    pub slot: u32,
+    /// What it reads besides its textures.
+    pub params: MaterialParams,
+    /// Its textures and their samplers, in the order above.
+    pub textures: [(GpuTexture, GpuSampler); 6],
+}
+
+/// The formats of the G-Buffer drawn into: a pipeline is made for each set of them.
+#[derive(Debug, Clone, PartialEq)]
+struct TargetFormats {
+    colour: Vec<wgpu::TextureFormat>,
+    depth: wgpu::TextureFormat,
+}
+
+/// Draws the clusters a [`Culler`] chose into the renderer's G-Buffer, a draw for each material,
+/// as the engine draws its own deferred meshes: see `shaders/yoctite_gbuffer.wgsl`.
+pub struct GBufferDrawer {
+    frame_layout: wgpu::BindGroupLayout,
+    material_layout: wgpu::BindGroupLayout,
+    module: wgpu::ShaderModule,
+    pipeline: Option<(TargetFormats, wgpu::RenderPipeline)>,
+}
+
+/// What [`GBufferDrawer::draw`] drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GBufferDraws {
+    /// How many draws: one for each material.
+    pub draw_calls: u32,
+}
+
+impl GBufferDrawer {
+    /// The drawer's layouts and shader, made once; its pipeline is made at the first draw, for
+    /// the G-Buffer's formats.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let uniform = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteGBufferFrame"),
+            entries: &[
+                uniform(0, wgpu::ShaderStages::VERTEX),
+                storage(1),
+                storage(2),
+                storage(3),
+                storage(4),
+                storage(5),
+                storage(6),
+                storage(7),
+            ],
+        });
+        let mut entries = vec![uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT)];
+        for binding in 1..=6 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            });
+        }
+        for binding in 7..=12 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            });
+        }
+        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteGBufferMaterial"),
+            entries: &entries,
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YoctiteGBuffer"),
+            source: wgpu::ShaderSource::Wgsl(GBUFFER_SHADER.into()),
+        });
+        Self {
+            frame_layout,
+            material_layout,
+            module,
+            pipeline: None,
+        }
+    }
+
+    fn pipeline(&mut self, device: &wgpu::Device, formats: &TargetFormats) -> &wgpu::RenderPipeline {
+        if self.pipeline.as_ref().is_none_or(|(had, _)| had != formats) {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("YoctiteGBuffer"),
+                bind_group_layouts: &[Some(&self.frame_layout), Some(&self.material_layout)],
+                immediate_size: 0,
+            });
+            let targets: Vec<Option<wgpu::ColorTargetState>> = formats
+                .colour
+                .iter()
+                .map(|&format| {
+                    Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                })
+                .collect();
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("YoctiteGBuffer"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &self.module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.module,
+                    entry_point: Some("fs_main"),
+                    targets: &targets,
+                    compilation_options: Default::default(),
+                }),
+                // As the engine's G-Buffer pass: faces seen from behind culled, counter-clockwise
+                // in front.
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: formats.depth,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.pipeline = Some((formats.clone(), pipeline));
+        }
+        &self.pipeline.as_ref().expect("made above").1
+    }
+
+    /// Culls `pool`'s instances as `parameters` see them with `culler`, and draws what it chose
+    /// into `gbuffer` - the renderer's G-Buffer: depth and stencil, then diffuse, normal,
+    /// ambient, material and decal mask - one draw for each of `materials`, on top of what is
+    /// there. Instances numbered with a material slot not among `materials` are culled but not
+    /// drawn.
+    pub fn draw(
+        &mut self,
+        server: &WgpuGraphicsServer,
+        pool: &GeometryPool,
+        culler: &mut Culler,
+        parameters: &CullParameters,
+        gbuffer: &GpuFrameBuffer,
+        materials: &[YoctiteMaterial],
+    ) -> Result<GBufferDraws, FrameworkError> {
+        let wgpu_texture = |texture: &GpuTexture| -> Result<wgpu::Texture, FrameworkError> {
+            texture
+                .as_any()
+                .downcast_ref::<WgpuTexture>()
+                .map(|t| t.wgpu_texture().clone())
+                .ok_or_else(|| FrameworkError::Custom("Yoctite: a G-Buffer texture not of wgpu".into()))
+        };
+        let colour: Vec<wgpu::Texture> = gbuffer
+            .color_attachments()
+            .iter()
+            .map(|a| wgpu_texture(&a.texture))
+            .collect::<Result<_, _>>()?;
+        let depth = wgpu_texture(
+            &gbuffer
+                .depth_attachment()
+                .ok_or_else(|| FrameworkError::Custom("Yoctite: a G-Buffer with no depth".into()))?
+                .texture,
+        )?;
+        let resolved = materials
+            .iter()
+            .map(|material| {
+                let mut views = Vec::with_capacity(6);
+                let mut samplers = Vec::with_capacity(6);
+                for (texture, sampler) in &material.textures {
+                    let (Some(texture), Some(sampler)) = (
+                        texture.as_any().downcast_ref::<WgpuTexture>(),
+                        sampler.as_any().downcast_ref::<WgpuSampler>(),
+                    ) else {
+                        return Err(FrameworkError::Custom("Yoctite: a material texture not of wgpu".into()));
+                    };
+                    views.push(texture.wgpu_view().clone());
+                    samplers.push(sampler.wgpu_sampler().clone());
+                }
+                Ok(ResolvedMaterial {
+                    slot: material.slot,
+                    params: material.params,
+                    views: views.try_into().expect("six"),
+                    samplers: samplers.try_into().expect("six"),
+                })
+            })
+            .collect::<Result<Vec<_>, FrameworkError>>()?;
+
+        let device = &server.state.device;
+        server.flush_active_pass();
+        let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("YoctiteGBuffer"),
+            })
+        });
+        let drawn = self.record(device, &mut encoder, pool, culler, parameters, &colour, &depth, &resolved);
+        *server.frame_encoder.borrow_mut() = Some(encoder);
+        drawn
+    }
+
+    /// As [`Self::draw`], into `colour` (diffuse, normal, ambient, material, decal mask) and
+    /// `depth`, recorded into `encoder`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        culler: &mut Culler,
+        parameters: &CullParameters,
+        colour: &[wgpu::Texture],
+        depth: &wgpu::Texture,
+        materials: &[ResolvedMaterial],
+    ) -> Result<GBufferDraws, FrameworkError> {
+        if colour.len() != 5 {
+            return Err(FrameworkError::Custom(format!(
+                "Yoctite: a G-Buffer of {} colour targets, not 5",
+                colour.len()
+            )));
+        }
+        let formats = TargetFormats {
+            colour: colour.iter().map(|t| t.format()).collect(),
+            depth: depth.format(),
+        };
+        culler.record(device, encoder, pool, parameters);
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Frame {
+            view_projection: [[f32; 4]; 4],
+            sorted_start: u32,
+            _padding: [u32; 3],
+        }
+        let frame = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteGBufferFrame"),
+            contents: bytemuck::bytes_of(&Frame {
+                view_projection: parameters.view_projection,
+                sorted_start: culler.capacity(),
+                _padding: [0; 3],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let frame_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteGBufferFrame"),
+            layout: &self.frame_layout,
+            entries: &[
+                &frame,
+                pool.vertices.buffer(),
+                pool.cluster_vertices.buffer(),
+                pool.triangles.buffer(),
+                pool.clusters.buffer(),
+                pool.instances.buffer(),
+                &culler.lists,
+                &culler.materials,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect::<Vec<_>>(),
+        });
+
+        // Each material's own bind group: what it reads, and its textures.
+        let mut groups = Vec::with_capacity(materials.len());
+        for material in materials.iter().filter(|m| m.slot < parameters.material_slots) {
+            let params = MaterialParams {
+                slot: material.slot,
+                ..material.params
+            };
+            let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("YoctiteMaterial"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }];
+            for (i, view) in material.views.iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 1 + i as u32,
+                    resource: wgpu::BindingResource::TextureView(view),
+                });
+            }
+            for (i, sampler) in material.samplers.iter().enumerate() {
+                entries.push(wgpu::BindGroupEntry {
+                    binding: 7 + i as u32,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                });
+            }
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("YoctiteMaterial"),
+                layout: &self.material_layout,
+                entries: &entries,
+            });
+            groups.push((material.slot, group));
+        }
+
+        let pipeline = self.pipeline(device, &formats).clone();
+        let colour_views: Vec<wgpu::TextureView> = colour
+            .iter()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
+            .collect();
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let keep = wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        };
+        let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colour_views
+            .iter()
+            .map(|view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: keep,
+                })
+            })
+            .collect();
+        let has_stencil = formats.depth.has_stencil_aspect();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("YoctiteGBuffer"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: has_stencil.then_some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &frame_group, &[]);
+        for (slot, group) in &groups {
+            pass.set_bind_group(1, group, &[]);
+            pass.draw_indirect(&culler.args, material_draw_offset(*slot));
+        }
+        Ok(GBufferDraws {
+            draw_calls: groups.len() as u32,
+        })
+    }
+}
+
+/// A material with its textures as wgpu's own: see [`GBufferDrawer::record`].
+#[derive(Debug, Clone)]
+pub struct ResolvedMaterial {
+    /// The slot its instances are numbered with.
+    pub slot: u32,
+    /// What it reads besides its textures.
+    pub params: MaterialParams,
+    /// Its diffuse, normal, metallic, roughness, occlusion and emission textures.
+    pub views: [wgpu::TextureView; 6],
+    /// And their samplers.
+    pub samplers: [wgpu::Sampler; 6],
+}
+
 /// The view's and the culling's shaders, for validation.
 #[cfg(test)]
-pub(crate) fn shaders() -> [&'static str; 2] {
-    [VIEW_SHADER, CULL_SHADER]
+pub(crate) fn shaders() -> [&'static str; 3] {
+    [VIEW_SHADER, CULL_SHADER, GBUFFER_SHADER]
 }
 
 #[cfg(test)]
@@ -1352,6 +1840,9 @@ mod test {
         out
     }
 
+    /// How many materials the culling tests' instances are drawn with.
+    const MATERIALS: u32 = 5;
+
     #[test]
     fn the_gpu_chooses_the_clusters_the_cpu_does() {
         let Some((device, queue)) = device() else {
@@ -1375,7 +1866,8 @@ mod test {
             for z in 0..30 {
                 let mesh = if (x + z) % 3 == 0 { b } else { a };
                 let at = [x as f32 * 50.0 - 750.0, random() * 4.0, z as f32 * 50.0 - 750.0];
-                instances.push(pool.add_instance(&device, &queue, mesh, placed(random() * std::f32::consts::TAU, 0.5 + random() * 1.5, at)));
+                let material = ((x * 7 + z) % MATERIALS as usize) as u32;
+                instances.push(pool.add_instance(&device, &queue, mesh, placed(random() * std::f32::consts::TAU, 0.5 + random() * 1.5, at), material));
             }
         }
         // Some slots freed, which the culling has to pass over.
@@ -1395,19 +1887,39 @@ mod test {
                 view_projection: camera(eye, at, 1.2, 16.0 / 9.0),
                 eye,
                 threshold,
+                material_slots: MATERIALS,
             };
             let mut encoder = device.create_command_encoder(&Default::default());
             culler.record(&device, &mut encoder, &pool, &parameters);
             queue.submit([encoder.finish()]);
-            let args: Vec<u32> = read(&device, &queue, &culler.draw_args, 4);
+            let args: Vec<u32> = read(&device, &queue, &culler.args, (material_draw_offset(MATERIALS) / 4) as u32);
             let counts: Vec<u32> = read(&device, &queue, &culler.counts, 4);
-            let drawn = args[1];
-            assert_eq!(args[0], CLUSTER_VERTICES);
+            let all = (ALL_DRAW_OFFSET / 4) as usize;
+            let drawn = args[all + 1];
+            assert_eq!(args[all], CLUSTER_VERTICES);
             assert_eq!(drawn, counts[1], "every cluster chosen is drawn");
             assert_eq!(counts[3], 0, "the list held them all");
-            let mut gpu: Vec<[u32; 2]> = read(&device, &queue, &culler.draw_list, drawn);
+            let capacity = culler.capacity();
+            let lists: Vec<[u32; 2]> = read(&device, &queue, &culler.lists, capacity * 2);
+            let mut gpu: Vec<[u32; 2]> = lists[..drawn as usize].to_vec();
             gpu.sort_unstable();
             assert!(gpu.windows(2).all(|w| w[0] != w[1]), "a cluster listed twice");
+
+            // Sorted by material: each material's draw covers its range, which holds its
+            // instances' clusters and nothing else, and the ranges together are the list.
+            let ranges: Vec<[u32; 4]> = read(&device, &queue, &culler.materials, MATERIALS);
+            let mut sorted = Vec::new();
+            for m in 0..MATERIALS {
+                let draw = (material_draw_offset(m) / 4) as usize;
+                let [count, offset, ..] = ranges[m as usize];
+                assert_eq!((args[draw], args[draw + 1]), (CLUSTER_VERTICES, count), "material {m}'s draw");
+                for item in &lists[(capacity + offset) as usize..(capacity + offset + count) as usize] {
+                    assert_eq!(pool.instance(InstanceId(item[0])).unwrap().material, m, "{item:?} in material {m}'s range");
+                    sorted.push(*item);
+                }
+            }
+            sorted.sort_unstable();
+            assert_eq!(sorted, gpu, "the sorted list is the list");
 
             let reference = cull_on_cpu(&pool, &dags, &parameters);
             let triangles: u32 = gpu
@@ -1445,7 +1957,7 @@ mod test {
         let (vertices, dag) = hill(40, 6.0);
         let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
         for i in 0..50 {
-            pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [i as f32 * 45.0, 0.0, -60.0]));
+            pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [i as f32 * 45.0, 0.0, -60.0]), 0);
         }
         let mut culler = Culler::new(&device);
         culler.set_capacity(&device, 10);
@@ -1453,6 +1965,7 @@ mod test {
             view_projection: camera([1000.0, 20.0, 40.0], [1000.0, 0.0, -60.0], 2.5, 1.0),
             eye: [1000.0, 20.0, 40.0],
             threshold: 0.0005,
+            material_slots: 1,
         };
         let cull = |culler: &mut Culler| {
             let mut encoder = device.create_command_encoder(&Default::default());
@@ -1461,8 +1974,10 @@ mod test {
             device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         };
         cull(&mut culler);
-        let args: Vec<u32> = read(&device, &queue, &culler.draw_args, 4);
-        assert_eq!(args[1], 10, "no more drawn than the list holds");
+        let all = (ALL_DRAW_OFFSET / 4) as usize;
+        let args: Vec<u32> = read(&device, &queue, &culler.args, 12);
+        assert_eq!(args[all + 1], 10, "no more drawn than the list holds");
+        assert_eq!(args[8 + 1], 10, "nor by the material");
         // The counts arrive over the next cullings, and the list grows to hold them.
         for _ in 0..3 {
             cull(&mut culler);
@@ -1471,15 +1986,215 @@ mod test {
         assert!(stats.overflowed && stats.clusters > 10, "{stats:?}");
         assert!(culler.capacity() >= stats.clusters, "{} for {} clusters", culler.capacity(), stats.clusters);
         cull(&mut culler);
-        let args: Vec<u32> = read(&device, &queue, &culler.draw_args, 4);
-        assert_eq!(args[1], stats.clusters, "all drawn once it has room");
+        let args: Vec<u32> = read(&device, &queue, &culler.args, 12);
+        assert_eq!(args[all + 1], stats.clusters, "all drawn once it has room");
+    }
+
+    /// A 1x1 texture of one colour, and a sampler.
+    fn swatch(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4]) -> (wgpu::TextureView, wgpu::Sampler) {
+        let texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            Default::default(),
+            &rgba,
+        );
+        (texture.create_view(&Default::default()), device.create_sampler(&Default::default()))
+    }
+
+    /// The pixels of a `size` by `size` texture of 4-byte texels (or 1-byte with `narrow`),
+    /// read back, a texel a word.
+    fn pixels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, size: u32, narrow: bool) -> Vec<u32> {
+        let row = 256u32;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (row * size) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None },
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("mapped"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("polled");
+        let data = buffer.slice(..).get_mapped_range().expect("mapped range");
+        let mut out = Vec::new();
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let at = y * row as usize;
+                out.push(if narrow {
+                    data[at + x] as u32
+                } else {
+                    u32::from_le_bytes(data[at + x * 4..at + x * 4 + 4].try_into().unwrap())
+                });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn clusters_are_drawn_into_the_gbuffer_as_the_engine_draws_meshes() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        const SIZE: u32 = 64;
+        // The G-Buffer's own formats, as the renderer makes them.
+        let target = |format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let colour = vec![
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::R8Uint),
+        ];
+        let depth = target(wgpu::TextureFormat::Depth24PlusStencil8);
+
+        // Two flat squares side by side, seen from above: on the left one drawn, on the right one
+        // whose diffuse texture is see-through all over.
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (vertices, dag) = hill(16, 0.0);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0);
+        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [0.0, 0.0, 0.0]), 1);
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let clear = swatch(&device, &queue, [255, 255, 255, 0]);
+        let material = |slot, diffuse: &(wgpu::TextureView, wgpu::Sampler)| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: [1.0, 0.5, 0.25, 1.0],
+                emission_strength: [0.1, 0.2, 0.3],
+                metallic_factor: 0.25,
+                roughness_factor: 0.75,
+                layer_index: 3,
+                metallic_channel: 2,
+                roughness_channel: 1,
+                ..Default::default()
+            },
+            views: [diffuse.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [diffuse.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, &white), material(1, &clear)];
+
+        let eye = [0.0, 40.0, 8.0];
+        let parameters = CullParameters {
+            view_projection: camera(eye, [0.0, 0.0, 7.0], 1.2, 1.0),
+            eye,
+            threshold: 0.001,
+            material_slots: 2,
+        };
+        let mut culler = Culler::new(&device);
+        let mut drawer = GBufferDrawer::new(&device);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            // Cleared as the renderer clears it.
+            let views: Vec<_> = colour.iter().map(|t| t.create_view(&Default::default())).collect();
+            let depth_view = depth.create_view(&Default::default());
+            let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &views
+                    .iter()
+                    .map(|view| {
+                        Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Store }),
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        let drawn = drawer
+            .record(&device, &mut encoder, &pool, &mut culler, &parameters, &colour, &depth, &materials)
+            .expect("drawn");
+        queue.submit([encoder.finish()]);
+        assert_eq!(drawn.draw_calls, 2);
+
+        let diffuse = pixels(&device, &queue, &colour[0], SIZE, false);
+        let normal = pixels(&device, &queue, &colour[1], SIZE, false);
+        let ambient = pixels(&device, &queue, &colour[2], SIZE, false);
+        let surface = pixels(&device, &queue, &colour[3], SIZE, false);
+        let decal = pixels(&device, &queue, &colour[4], SIZE, true);
+        let at = |x: u32, y: u32| (y * SIZE + x) as usize;
+        let rgba = |v: u32| v.to_le_bytes();
+        let ten = |v: u32| [v & 1023, (v >> 10) & 1023, (v >> 20) & 1023].map(|c| c as f32 / 1023.0);
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+
+        // The left square: its colour, facing up, its factors read from their channels, its
+        // emission and its decal layer.
+        let left = at(SIZE / 4, SIZE / 2);
+        assert_eq!(rgba(diffuse[left]), [255, 128, 64, 255], "diffuse colour times texture");
+        let n = ten(normal[left]);
+        assert!(near(n[0], 0.5) && near(n[1], 1.0) && near(n[2], 0.5), "normal straight up: {n:?}");
+        let m = rgba(surface[left]);
+        assert_eq!([m[0], m[1], m[2], m[3]], [64, 191, 255, 255], "metallic, roughness, occlusion");
+        let e = ten(ambient[left]);
+        assert!(near(e[0], 0.1) && near(e[1], 0.2) && near(e[2], 0.3), "emission: {e:?}");
+        assert_eq!(decal[left], 3, "decal layer");
+
+        // The right square: left out by the alpha test, the G-Buffer as cleared.
+        let right = at(SIZE * 3 / 4, SIZE / 2);
+        assert_eq!((diffuse[right], normal[right], surface[right], decal[right]), (0, 0, 0, 0), "see-through");
+        // The left square covers what it should, whole - every level of detail of a flat square
+        // is the square - and nothing of the right one is drawn. From 40 m up, with a field of
+        // view of 1.2 radians across 64 pixels, a meter is 32 / (40 tan 0.6) pixels.
+        let covered = |range: std::ops::Range<u32>| {
+            range.map(|x| (0..SIZE).filter(|&y| diffuse[at(x, y)] != 0).count()).sum::<usize>()
+        };
+        let side = 16.0 * SIZE as f32 / 2.0 / (40.0 * 0.6f32.tan());
+        let expected = side * side;
+        let left_covered = covered(0..SIZE / 2) as f32;
+        assert!((left_covered - expected).abs() < expected * 0.1, "{left_covered} pixels drawn, about {expected} expected");
+        assert_eq!(covered(SIZE / 2 + 1..SIZE), 0, "the right square not");
     }
 
     /// A device of this machine's, if it has one: the tests that need a GPU skip without.
     fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-        block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+        // The adapter's own limits, as the renderer asks for: the G-Buffer's five targets take
+        // more bytes a pixel than the defaults allow.
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .ok()
     }
 
     /// Runs a future that is ready at once, as wgpu's are on native backends.
@@ -1591,14 +2306,14 @@ mod test {
         check_mesh(&device, &queue, &pool, c, &vertices_c, &dag_c);
 
         let at = |x: f32| [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        let instances: Vec<InstanceId> = (0..2000).map(|i| pool.add_instance(&device, &queue, if i % 2 == 0 { b } else { c }, at(i as f32))).collect();
+        let instances: Vec<InstanceId> = (0..2000).map(|i| pool.add_instance(&device, &queue, if i % 2 == 0 { b } else { c }, at(i as f32), 0)).collect();
         pool.move_instance(&queue, instances[7], at(-1.0));
         pool.remove_instance(&queue, instances[3]);
         let gpu: Vec<GpuInstance> = read(&device, &queue, pool.instances.buffer(), pool.instance_slots());
         assert_eq!(gpu[7].transform[3], -1.0);
         assert_eq!(gpu[3].flags, 0, "a removed instance is marked free");
         assert_eq!((gpu[8].mesh, gpu[8].flags, gpu[8].transform[3]), (b.0, INSTANCE_ALIVE, 8.0));
-        assert_eq!(pool.add_instance(&device, &queue, b, at(0.0)), instances[3], "its slot reused");
+        assert_eq!(pool.add_instance(&device, &queue, b, at(0.0), 0), instances[3], "its slot reused");
 
         let stats = pool.stats();
         assert_eq!((stats.meshes, stats.instances), (2, 2000));

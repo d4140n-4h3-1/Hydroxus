@@ -497,6 +497,82 @@ fn doubled_cards_are_drawn_from_everywhere() {
     }
 }
 
+/// The flat grid with texture coordinates from `map`, given x and z from 0 to 1.
+fn textured_grid(n: u32, map: impl Fn(f32, f32) -> [f32; 2]) -> (Vec<[f32; 3]>, Vec<u32>, Vec<[f32; 2]>) {
+    let (positions, indices) = grid(n);
+    let uvs = positions.iter().map(|p| map(p[0] / n as f32, p[2] / n as f32)).collect();
+    (positions, indices, uvs)
+}
+
+/// How far each cluster above level 0 really drags the texture: at every vertex of the full
+/// grid its triangles cover, the texture coordinate the triangle gives there against the vertex's
+/// own, in the surface's units by the triangle's own scale. With the cluster's error.
+fn real_drags(dag: &ClusterDag, positions: &[[f32; 3]], uvs: &[[f32; 2]]) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    for c in dag.clusters.iter().filter(|c| c.level > 0) {
+        let mut worst: f32 = 0.0;
+        for t in c.mesh_triangles() {
+            let p = t.map(|v| [positions[v as usize][0], positions[v as usize][2]]);
+            let u = t.map(|v| uvs[v as usize]);
+            let cross = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]);
+            let area = cross(p[0], p[1], p[2]);
+            let texture_area = cross(u[0], u[1], u[2]).abs();
+            if area.abs() < 1e-9 || texture_area < 1e-12 {
+                continue;
+            }
+            let scale = (area.abs() / texture_area).sqrt();
+            for (v, q) in positions.iter().enumerate() {
+                let q = [q[0], q[2]];
+                let w = [cross(q, p[1], p[2]) / area, cross(p[0], q, p[2]) / area, cross(p[0], p[1], q) / area];
+                if w.iter().any(|&w| w < -1e-5) {
+                    continue;
+                }
+                let there = [0, 1].map(|i| w[0] * u[0][i] + w[1] * u[1][i] + w[2] * u[2][i]);
+                let off = ((there[0] - uvs[v][0]).powi(2) + (there[1] - uvs[v][1]).powi(2)).sqrt();
+                worst = worst.max(off * scale);
+            }
+        }
+        out.push((worst, c.error));
+    }
+    out
+}
+
+#[test]
+fn a_texture_laid_flat_simplifies_with_no_error() {
+    let (positions, indices, uvs) = textured_grid(32, |x, z| [x * 3.0, z * 3.0]);
+    let dag = build(&Mesh::new(&positions, &indices).with_texture_coordinates(&uvs), Settings::default());
+    assert!(dag.levels() > 3, "only {} levels", dag.levels());
+    assert!(dag.clusters.iter().all(|c| c.error < 1e-4), "a linear texture is dragged nowhere");
+}
+
+#[test]
+fn a_texture_dragged_across_a_flat_surface_counts_as_error() {
+    // Flat, so no collapse moves the surface; but the texture is curved across it both ways, so
+    // every collapse drags it.
+    let (positions, indices, uvs) =
+        textured_grid(32, |x, z| [2.0 * x * x + 0.3 * (6.0 * z).sin(), 2.0 * z * z + 0.3 * (5.0 * x).sin()]);
+    let untextured = built(&positions, &indices);
+    let dag = build(&Mesh::new(&positions, &indices).with_texture_coordinates(&uvs), Settings::default());
+    check_structure(&dag, positions.len());
+    check_monotonic(&dag);
+    assert!(untextured.clusters.iter().all(|c| c.error < 1e-4), "flat: no error from the shape alone");
+    let coarsest = dag.clusters.iter().filter(|c| c.is_root()).map(|c| c.error).fold(0.0, f32::max);
+    assert!(coarsest > 0.5, "the coarsest level's error {coarsest}");
+    // From close by, nothing coarse is drawn.
+    let near = select(&dag, [16.0, 0.5, 16.0], 0.001);
+    assert!(near.iter().any(|&c| dag.clusters[c as usize].level == 0));
+    // And the error is honest: how far a cluster really drags the texture is within what it
+    // claims, give or take the estimate.
+    let drags = real_drags(&dag, &positions, &uvs);
+    let mut over = 0;
+    for &(real, claimed) in &drags {
+        if real > claimed * 1.5 + 0.05 {
+            over += 1;
+        }
+    }
+    assert!(over * 20 <= drags.len(), "{over} of {} clusters drag the texture further than they claim", drags.len());
+}
+
 #[test]
 fn bytes_make_the_same_graph() {
     let (positions, indices) = icosphere(3);

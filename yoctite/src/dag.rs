@@ -128,11 +128,14 @@ pub fn build(mesh: &Mesh, settings: Settings) -> ClusterDag {
                 continue;
             }
 
+            // How far from the full mesh, at most: as the simplification moved the surface, or
+            // as far as the children are and the texture was dragged from them on top, as drag
+            // adds up level on level.
             let mut error = simplified.error;
             let mut bounds: Option<Sphere> = None;
             for &c in &children {
                 let child = &dag.clusters[c as usize];
-                error = error.max(child.error);
+                error = error.max(child.error).max(child.error + simplified.dragged);
                 bounds = Some(bounds.map_or(child.lod_bounds, |b| b.enclosing(child.lod_bounds)));
             }
             let bounds = bounds.expect("a group has clusters");

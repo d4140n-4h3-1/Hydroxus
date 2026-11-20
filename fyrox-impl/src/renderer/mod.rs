@@ -417,6 +417,9 @@ pub fn make_deferred_viewport_matrix(viewport: Rect<i32>) -> Matrix4<f32> {
 pub struct Renderer {
     backbuffer: GpuFrameBuffer,
     scene_render_passes: Vec<Rc<RefCell<dyn SceneRenderPass>>>,
+    /// Meshes another renderer draws, left out of the camera's own draw: see
+    /// [`Self::set_taken_over_meshes`].
+    taken_over_meshes: Option<TakenOverMeshes>,
     /// Makes shadows for lights in place of shadow maps, when set.
     light_shadow_tracer: Option<Box<dyn LightShadowTracer>>,
     /// How far every camera's view is shifted this frame, in pixels. See
@@ -591,8 +594,48 @@ pub struct SceneRenderPassContext<'a, 'b> {
     pub resource_manager: &'a ResourceManager,
 }
 
+/// A set of meshes another renderer draws, shared with it: see
+/// [`Renderer::set_taken_over_meshes`].
+pub type TakenOverMeshes = Rc<RefCell<fxhash::FxHashSet<Handle<Node>>>>;
+
+/// A context for custom scene render passes that draw into the G-Buffer, as the renderer's own
+/// meshes do (see [`SceneRenderPass::on_gbuffer_render`]).
+pub struct GBufferPassContext<'a, 'b> {
+    /// Amount of time (in seconds) that passed from creation of the engine.
+    pub elapsed_time: f32,
+    /// A graphics server that is used as a wrapper to underlying graphics API.
+    pub server: &'a dyn GraphicsServer,
+    /// A texture cache that uploads engine's `Texture` as internal `GpuTexture` to GPU: to get the
+    /// GPU textures of materials.
+    pub texture_cache: &'a mut TextureCache,
+    /// A reference to the resource manager.
+    pub resource_manager: &'a ResourceManager,
+    /// Stub textures and common samplers.
+    pub renderer_resources: &'a RendererResources,
+    /// The G-Buffer's framebuffer: its depth-stencil attachment, then its diffuse, normal,
+    /// ambient, material and decal mask attachments, in that order.
+    pub framebuffer: &'a GpuFrameBuffer,
+    /// The scene being rendered.
+    pub scene: &'b Scene,
+    /// The scene's handle.
+    pub scene_handle: Handle<Scene>,
+    /// A camera from the scene that is used as "eyes".
+    pub observer: &'b Observer,
+}
+
 /// A trait for custom scene rendering pass. It could be used to add your own rendering techniques.
 pub trait SceneRenderPass {
+    /// Draws into the G-Buffer, after the renderer's own deferred meshes and before decals,
+    /// lighting and everything after: what is drawn here is lit, shadowed and fogged as they are.
+    /// It will be called for **each** scene registered in the engine, but you are able to filter
+    /// out scene by its handle.
+    fn on_gbuffer_render(
+        &mut self,
+        _ctx: GBufferPassContext,
+    ) -> Result<RenderPassStatistics, FrameworkError> {
+        Ok(RenderPassStatistics::default())
+    }
+
     /// Renders scene into high dynamic range target. It will be called for **each** scene
     /// registered in the engine, but you are able to filter out scene by its handle.
     fn on_hdr_render(
@@ -729,6 +772,7 @@ impl Renderer {
             texture_event_receiver,
             shader_cache,
             scene_render_passes: Default::default(),
+            taken_over_meshes: None,
             light_shadow_tracer: None,
             projection_jitter: Vector2::zeros(),
             uniform_buffer_cache: UniformBufferCache::new(server.clone()),
@@ -756,6 +800,14 @@ impl Renderer {
     /// Whether shadows are made by a [`LightShadowTracer`] rather than by shadow maps.
     pub fn has_light_shadow_tracer(&self) -> bool {
         self.light_shadow_tracer.is_some()
+    }
+
+    /// Leaves the meshes in `meshes` out of what the renderer draws through cameras, because
+    /// another renderer draws them - into the G-Buffer from
+    /// [`SceneRenderPass::on_gbuffer_render`], say. They still cast shadows from shadow maps, and
+    /// the set can change from frame to frame. [`None`] draws every mesh again.
+    pub fn set_taken_over_meshes(&mut self, meshes: Option<TakenOverMeshes>) {
+        self.taken_over_meshes = meshes;
     }
 
     /// Adds a custom render pass.
@@ -1081,7 +1133,8 @@ impl Renderer {
             .visibility_cache
             .get_or_register(&scene.graph, observer.handle);
 
-        let mut bundle_storage = RenderDataBundleStorage::from_graph(
+        let taken_over = self.taken_over_meshes.as_ref().map(|set| set.borrow());
+        let mut bundle_storage = RenderDataBundleStorage::from_graph_skipping(
             &scene.graph,
             observer.render_mask,
             elapsed_time,
@@ -1092,7 +1145,9 @@ impl Renderer {
                 collect_environment: true,
             },
             &mut self.dynamic_surface_cache,
+            taken_over.as_deref(),
         );
+        drop(taken_over);
         if observer.reflection_probe_data.is_some() {
             bundle_storage.environment_map = None;
         }
@@ -1116,6 +1171,10 @@ impl Renderer {
             uniform_memory_allocator: &mut self.uniform_memory_allocator,
             screen_space_debug_renderer: &mut self.screen_space_debug_renderer,
             resource_manager,
+            scene_render_passes: &self.scene_render_passes,
+            scene,
+            scene_handle,
+            elapsed_time,
         })?;
 
         server.set_polygon_fill_mode(PolygonFace::FrontAndBack, PolygonFillMode::Fill);
