@@ -69,7 +69,7 @@ pub struct GpuCluster {
     pub parent_bounds: [f32; 4],
     /// How far its surface is from the full mesh's, at most.
     pub error: f32,
-    /// The same for its parent group: infinite for a root.
+    /// The same for its parent group: [`f32::MAX`] for a root.
     pub parent_error: f32,
     /// Which mesh it is of.
     pub mesh: u32,
@@ -377,7 +377,9 @@ impl GeometryPool {
                 lod_bounds: sphere(&cluster.lod_bounds),
                 parent_bounds: sphere(&cluster.parent_bounds),
                 error: cluster.error,
-                parent_error: cluster.parent_error,
+                // Infinite in the builder; the largest float here, which every GPU compares the
+                // same way.
+                parent_error: cluster.parent_error.min(f32::MAX),
                 mesh,
                 level: cluster.level,
             });
@@ -605,10 +607,10 @@ impl ClusterView {
         }
     }
 
-    /// Draws `list` - each an instance slot and a cluster index in `pool` - as seen through
-    /// `view_projection` (column by column, with OpenGL's clip depth from -1 to 1, as the
-    /// renderer makes it), into a `width` by `height` texture, which it returns. Where nothing
-    /// is drawn it is clear, alpha 0.
+    /// Draws `list` - each an instance slot and a cluster index in `pool`, chosen on the CPU -
+    /// as seen through `view_projection` (column by column, with OpenGL's clip depth from -1 to
+    /// 1, as the renderer makes it), into a `width` by `height` texture, which it returns. Where
+    /// nothing is drawn it is clear, alpha 0.
     pub fn draw(
         &mut self,
         server: &WgpuGraphicsServer,
@@ -617,6 +619,41 @@ impl ClusterView {
         width: u32,
         height: u32,
         list: &[[u32; 2]],
+    ) -> Result<GpuTexture, FrameworkError> {
+        self.render(server, pool, view_projection, width, height, Source::List(list))
+    }
+
+    /// As [`Self::draw`], but the clusters chosen on the GPU by `culler`, from `eye`, where an
+    /// error over its distance as big as `threshold` is as much as may show: nothing is read
+    /// back to choose them, and they are drawn by an indirect draw.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_culled(
+        &mut self,
+        server: &WgpuGraphicsServer,
+        pool: &GeometryPool,
+        culler: &mut Culler,
+        view_projection: [[f32; 4]; 4],
+        eye: [f32; 3],
+        threshold: f32,
+        width: u32,
+        height: u32,
+    ) -> Result<GpuTexture, FrameworkError> {
+        let parameters = CullParameters {
+            view_projection,
+            eye,
+            threshold,
+        };
+        self.render(server, pool, view_projection, width, height, Source::Culled(culler, parameters))
+    }
+
+    fn render(
+        &mut self,
+        server: &WgpuGraphicsServer,
+        pool: &GeometryPool,
+        view_projection: [[f32; 4]; 4],
+        width: u32,
+        height: u32,
+        source: Source,
     ) -> Result<GpuTexture, FrameworkError> {
         let (width, height) = (width.max(1), height.max(1));
         let matches = self.colour.as_ref().is_some_and(|t| {
@@ -662,17 +699,34 @@ impl ClusterView {
             )));
         }
 
+        server.flush_active_pass();
+        let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("YoctiteView"),
+            })
+        });
+        // The list to draw: made here, or by the culler in the same encoder.
+        let (draw_list, culler) = match source {
+            Source::List(list) => {
+                // Never empty: a binding needs something in it.
+                let items: Vec<[u32; 2]> = if list.is_empty() { vec![[0, 0]] } else { list.to_vec() };
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("YoctiteDrawList"),
+                    contents: bytemuck::cast_slice(&items),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+                (Some((buffer, list.len() as u32)), None)
+            }
+            Source::Culled(culler, parameters) => {
+                culler.record(device, &mut encoder, pool, &parameters);
+                (None, Some(&*culler))
+            }
+        };
+
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("YoctiteView"),
             contents: bytemuck::cast_slice(&view_projection),
             usage: wgpu::BufferUsages::UNIFORM,
-        });
-        // Never empty: a binding needs something in it.
-        let items: Vec<[u32; 2]> = if list.is_empty() { vec![[0, 0]] } else { list.to_vec() };
-        let draw_list = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("YoctiteDrawList"),
-            contents: bytemuck::cast_slice(&items),
-            usage: wgpu::BufferUsages::STORAGE,
         });
         fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
             wgpu::BindGroupEntry {
@@ -680,6 +734,11 @@ impl ClusterView {
                 resource: buffer.as_entire_binding(),
             }
         }
+        let list_buffer = match (&draw_list, culler) {
+            (Some((buffer, _)), _) => buffer,
+            (None, Some(culler)) => &culler.draw_list,
+            (None, None) => unreachable!("one or the other"),
+        };
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("YoctiteView"),
             layout: &self.layout,
@@ -690,15 +749,8 @@ impl ClusterView {
                 entry(3, pool.triangles.buffer()),
                 entry(4, pool.clusters.buffer()),
                 entry(5, pool.instances.buffer()),
-                entry(6, &draw_list),
+                entry(6, list_buffer),
             ],
-        });
-
-        server.flush_active_pass();
-        let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("YoctiteView"),
-            })
         });
         {
             let depth_view = self
@@ -733,12 +785,14 @@ impl ClusterView {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if !list.is_empty() {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            match (&draw_list, culler) {
                 // Room for a whole cluster in every instance of the draw; a cluster with fewer
                 // triangles makes the rest of its vertices nothing.
-                pass.draw(0..yoctite::MAX_TRIANGLES as u32 * 3, 0..list.len() as u32);
+                (Some((_, count)), _) if *count > 0 => pass.draw(0..CLUSTER_VERTICES, 0..*count),
+                (None, Some(culler)) => pass.draw_indirect(&culler.draw_args, 0),
+                _ => {}
             }
         }
         *server.frame_encoder.borrow_mut() = Some(encoder);
@@ -746,10 +800,380 @@ impl ClusterView {
     }
 }
 
-/// The view's shader, for validation.
+/// Where the clusters [`ClusterView`] draws come from.
+enum Source<'a> {
+    List(&'a [[u32; 2]]),
+    Culled(&'a mut Culler, CullParameters),
+}
+
+/// How many vertices a cluster's draw has: three for every triangle a cluster can have.
+const CLUSTER_VERTICES: u32 = yoctite::MAX_TRIANGLES as u32 * 3;
+
+/// Where the camera is, for [`Culler`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CullParameters {
+    /// From the world to clip space, column by column, with OpenGL's clip depth from -1 to 1.
+    pub view_projection: [[f32; 4]; 4],
+    /// Where the camera is, in the world.
+    pub eye: [f32; 3],
+    /// An error over its distance as big as may show: about a pixel's angle.
+    pub threshold: f32,
+}
+
+/// What [`Culler`] chose, a frame or two ago.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CullStats {
+    /// Instances at least partly in view.
+    pub instances: u32,
+    /// Clusters chosen: more than were drawn if the list ran out of room.
+    pub clusters: u32,
+    /// Their triangles.
+    pub triangles: u32,
+    /// Whether the list ran out of room; it is made bigger for the frames after.
+    pub overflowed: bool,
+}
+
+const CULL_SHADER: &str = include_str!("shaders/yoctite_cull.wgsl");
+
+/// The culling's uniforms, as the shader reads them.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CullUniforms {
+    planes: [[f32; 4]; 6],
+    eye: [f32; 3],
+    threshold: f32,
+    instance_slots: u32,
+    capacity: u32,
+    cluster_vertices: u32,
+    _padding: u32,
+}
+
+/// The six planes of the view of `view_projection` (column by column, OpenGL's clip space),
+/// facing in, each normal of unit length.
+pub fn frustum_planes(view_projection: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
+    let row = |i: usize| [0, 1, 2, 3].map(|j| view_projection[j][i]);
+    let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+    let combine = |a: [f32; 4], b: [f32; 4], sign: f32| [0, 1, 2, 3].map(|k| a[k] + sign * b[k]);
+    [
+        combine(r3, r0, 1.0),
+        combine(r3, r0, -1.0),
+        combine(r3, r1, 1.0),
+        combine(r3, r1, -1.0),
+        combine(r3, r2, 1.0),
+        combine(r3, r2, -1.0),
+    ]
+    .map(|p| {
+        let length = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if length > 0.0 {
+            p.map(|v| v / length)
+        } else {
+            p
+        }
+    })
+}
+
+/// Where the read-back of the culling's counts is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readback {
+    /// Free: the next culling copies its counts into it.
+    Idle,
+    /// A culling's counts were copied into it; mapped at the next.
+    Copied,
+    /// Waiting for the GPU to hand it over.
+    Mapping,
+}
+
+/// Chooses on the GPU which clusters of which instances to draw: instances and clusters out of
+/// view left out, and for each instance the cut through its clusters whose error looks no
+/// bigger than the threshold (see `shaders/yoctite_cull.wgsl`), into a draw list and the
+/// indirect arguments of a draw of it. Nothing is read back to draw it; what it chose is read
+/// back a frame or two later, for statistics and to make the list bigger when it runs out of
+/// room.
+pub struct Culler {
+    layout: wgpu::BindGroupLayout,
+    args_layout: wgpu::BindGroupLayout,
+    reset: wgpu::ComputePipeline,
+    instances: wgpu::ComputePipeline,
+    prepare: wgpu::ComputePipeline,
+    clusters: wgpu::ComputePipeline,
+    finalize: wgpu::ComputePipeline,
+    counts: wgpu::Buffer,
+    dispatch_args: wgpu::Buffer,
+    /// The draw's indirect arguments: [`CLUSTER_VERTICES`] vertices, an instance a cluster.
+    pub draw_args: wgpu::Buffer,
+    /// The clusters to draw, as instance slot and pool cluster.
+    pub draw_list: wgpu::Buffer,
+    capacity: u32,
+    visible: wgpu::Buffer,
+    visible_capacity: u32,
+    readback: wgpu::Buffer,
+    state: Readback,
+    mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stats: Option<CullStats>,
+}
+
+/// How many clusters a draw list holds to begin with.
+const FIRST_CAPACITY: u32 = 1 << 16;
+
+impl Culler {
+    /// The culling's pipelines, made once.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let buffer = |binding, read_only| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteCull"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                buffer(1, true),
+                buffer(2, true),
+                buffer(3, true),
+                buffer(4, false),
+                buffer(5, false),
+                buffer(6, false),
+            ],
+        });
+        let args_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteCullArgs"),
+            entries: &[buffer(0, false), buffer(1, false)],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YoctiteCull"),
+            source: wgpu::ShaderSource::Wgsl(CULL_SHADER.into()),
+        });
+        // The passes that write the indirect arguments bind them; those dispatched from them, not.
+        let with_args = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("YoctiteCullWithArgs"),
+            bind_group_layouts: &[Some(&layout), Some(&args_layout)],
+            immediate_size: 0,
+        });
+        let without_args = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("YoctiteCull"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |entry: &str, layout: &wgpu::PipelineLayout| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let storage = |label, size: u64, more: wgpu::BufferUsages| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | more,
+                mapped_at_creation: false,
+            })
+        };
+        Self {
+            reset: pipeline("reset", &with_args),
+            instances: pipeline("cull_instances", &without_args),
+            prepare: pipeline("prepare", &with_args),
+            clusters: pipeline("cull_clusters", &without_args),
+            finalize: pipeline("finalize", &with_args),
+            layout,
+            args_layout,
+            counts: storage("YoctiteCounts", 16, wgpu::BufferUsages::COPY_SRC),
+            dispatch_args: storage("YoctiteDispatch", 12, wgpu::BufferUsages::INDIRECT),
+            // Copied from too, to read them back when looking into what was drawn.
+            draw_args: storage("YoctiteDrawArgs", 16, wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC),
+            draw_list: storage("YoctiteDrawList", FIRST_CAPACITY as u64 * 8, wgpu::BufferUsages::COPY_SRC),
+            capacity: FIRST_CAPACITY,
+            visible: storage("YoctiteVisible", 1024 * 4, wgpu::BufferUsages::empty()),
+            visible_capacity: 1024,
+            readback: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("YoctiteCountsRead"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            state: Readback::Idle,
+            mapped: Default::default(),
+            stats: None,
+        }
+    }
+
+    /// What it chose, as last read back: a frame or two behind.
+    pub fn stats(&self) -> Option<CullStats> {
+        self.stats
+    }
+
+    /// How many clusters its draw list holds.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Makes the draw list hold `capacity` clusters, for the next culling.
+    pub fn set_capacity(&mut self, device: &wgpu::Device, capacity: u32) {
+        self.capacity = capacity.max(1);
+        self.draw_list = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("YoctiteDrawList"),
+            size: self.capacity as u64 * 8,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+    }
+
+    /// Takes in the counts read back, if they have arrived, and starts reading back the last
+    /// culling's.
+    fn poll(&mut self, device: &wgpu::Device) {
+        use std::sync::atomic::Ordering;
+        match self.state {
+            Readback::Copied => {
+                let mapped = self.mapped.clone();
+                mapped.store(false, Ordering::Release);
+                self.readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                    if result.is_ok() {
+                        mapped.store(true, Ordering::Release);
+                    }
+                });
+                self.state = Readback::Mapping;
+            }
+            Readback::Mapping if self.mapped.load(Ordering::Acquire) => {
+                let counts: [u32; 4] = {
+                    let data = self.readback.slice(..).get_mapped_range().expect("mapped");
+                    bytemuck::pod_read_unaligned(&data[..16])
+                };
+                self.readback.unmap();
+                let stats = CullStats {
+                    instances: counts[0],
+                    clusters: counts[1],
+                    triangles: counts[2],
+                    overflowed: counts[3] != 0,
+                };
+                // Room for what it chose, and some to spare, from the next culling on.
+                if stats.clusters > self.capacity {
+                    let wanted = (stats.clusters as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64) as u32;
+                    self.set_capacity(device, wanted);
+                }
+                self.stats = Some(stats);
+                self.state = Readback::Idle;
+            }
+            _ => {}
+        }
+    }
+
+    /// Records the culling of `pool`'s instances as `parameters` see them into `encoder`: its
+    /// draw list and draw arguments are ready for a draw recorded after it.
+    pub fn record(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        parameters: &CullParameters,
+    ) {
+        self.poll(device);
+        let slots = pool.instance_slots();
+        if slots > self.visible_capacity {
+            self.visible_capacity = slots.next_power_of_two();
+            self.visible = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("YoctiteVisible"),
+                size: self.visible_capacity as u64 * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+        }
+        let uniforms = CullUniforms {
+            planes: frustum_planes(&parameters.view_projection),
+            eye: parameters.eye,
+            threshold: parameters.threshold,
+            instance_slots: slots,
+            capacity: self.capacity,
+            cluster_vertices: CLUSTER_VERTICES,
+            _padding: 0,
+        };
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteCull"),
+            contents: bytemuck::bytes_of(&uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let entries = [
+            &uniforms,
+            pool.clusters.buffer(),
+            pool.meshes.buffer(),
+            pool.instances.buffer(),
+            &self.visible,
+            &self.counts,
+            &self.draw_list,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(binding, buffer)| wgpu::BindGroupEntry {
+            binding: binding as u32,
+            resource: buffer.as_entire_binding(),
+        })
+        .collect::<Vec<_>>();
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteCull"),
+            layout: &self.layout,
+            entries: &entries,
+        });
+        let args = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteCullArgs"),
+            layout: &self.args_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.dispatch_args.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.draw_args.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("YoctiteCull"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&self.reset);
+            pass.set_bind_group(1, &args, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.instances);
+            pass.dispatch_workgroups(slots.div_ceil(64).max(1), 1, 1);
+            pass.set_pipeline(&self.prepare);
+            pass.set_bind_group(1, &args, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_pipeline(&self.clusters);
+            pass.dispatch_workgroups_indirect(&self.dispatch_args, 0);
+            pass.set_pipeline(&self.finalize);
+            pass.set_bind_group(1, &args, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        if self.state == Readback::Idle {
+            encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, 16);
+            self.state = Readback::Copied;
+        }
+    }
+}
+
+/// The view's and the culling's shaders, for validation.
 #[cfg(test)]
-pub(crate) fn view_shader() -> &'static str {
-    VIEW_SHADER
+pub(crate) fn shaders() -> [&'static str; 2] {
+    [VIEW_SHADER, CULL_SHADER]
 }
 
 #[cfg(test)]
@@ -800,15 +1224,255 @@ mod test {
     }
 
     #[test]
-    fn the_view_shader_is_valid() {
-        let module = wgpu::naga::front::wgsl::parse_str(view_shader())
-            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(view_shader())));
-        wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap_or_else(|e| panic!("{e:?}"));
+    fn the_shaders_are_valid() {
+        for source in shaders() {
+            let module = wgpu::naga::front::wgsl::parse_str(source)
+                .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        }
+    }
+
+    /// A camera at `eye` looking at `at`, OpenGL's perspective: column by column.
+    fn camera(eye: [f32; 3], at: [f32; 3], fov: f32, aspect: f32) -> [[f32; 4]; 4] {
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let unit = |a: [f32; 3]| {
+            let l = dot(a, a).sqrt();
+            a.map(|v| v / l)
+        };
+        let f = unit(sub(at, eye));
+        let r = unit(cross(f, [0.0, 1.0, 0.0]));
+        let u = cross(r, f);
+        // Rows of the view matrix.
+        let view = [
+            [r[0], r[1], r[2], -dot(r, eye)],
+            [u[0], u[1], u[2], -dot(u, eye)],
+            [-f[0], -f[1], -f[2], dot(f, eye)],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (near, far) = (0.1, 1000.0);
+        let t = 1.0 / (fov / 2.0).tan();
+        let projection = [
+            [t / aspect, 0.0, 0.0, 0.0],
+            [0.0, t, 0.0, 0.0],
+            [0.0, 0.0, (far + near) / (near - far), 2.0 * far * near / (near - far)],
+            [0.0, 0.0, -1.0, 0.0],
+        ];
+        let mut out = [[0.0; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                // Column j, row i.
+                out[j][i] = (0..4).map(|k| projection[i][k] * view[k][j]).sum();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn planes_keep_what_is_in_view() {
+        let view = camera([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], 1.0, 1.0);
+        let planes = frustum_planes(&view);
+        let inside = |c: [f32; 3], r: f32| planes.iter().all(|p| p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] >= -r);
+        assert!(inside([0.0, 0.0, -10.0], 1.0));
+        assert!(!inside([0.0, 0.0, 10.0], 1.0), "behind");
+        assert!(!inside([50.0, 0.0, -10.0], 1.0), "off to the side");
+        assert!(inside([11.0, 0.0, -10.0], 6.0), "partly in");
+        assert!(!inside([0.0, 0.0, -2000.0], 1.0), "past the far plane");
+    }
+
+    /// A turn about the vertical by `yaw` and a scale, then a move: three rows of four.
+    fn placed(yaw: f32, scale: f32, at: [f32; 3]) -> [f32; 12] {
+        let (s, c) = yaw.sin_cos();
+        [c * scale, 0.0, s * scale, at[0], 0.0, scale, 0.0, at[1], -s * scale, 0.0, c * scale, at[2]]
+    }
+
+    /// The culling worked out on the CPU, as the shader does it: each chosen instance slot and
+    /// pool cluster, and for each cluster how near any of the comparisons deciding it came to
+    /// going the other way, as a share.
+    fn cull_on_cpu(pool: &GeometryPool, dags: &[(MeshId, &ClusterDag)], parameters: &CullParameters) -> Vec<([u32; 2], bool, f32)> {
+        let planes = frustum_planes(&parameters.view_projection);
+        let eye = parameters.eye;
+        let mut out = Vec::new();
+        for slot in 0..pool.instance_slots() {
+            let Some(instance) = pool.instance(InstanceId(slot)) else { continue };
+            let t = instance.transform;
+            let place = |p: [f32; 3]| [0, 1, 2].map(|r| t[r * 4] * p[0] + t[r * 4 + 1] * p[1] + t[r * 4 + 2] * p[2] + t[r * 4 + 3]);
+            let scale = (0..3)
+                .map(|c| (t[c] * t[c] + t[4 + c] * t[4 + c] + t[8 + c] * t[8 + c]).sqrt())
+                .fold(0.0, f32::max);
+            // Whether a sphere is in view, and how near its nearest plane came to deciding
+            // otherwise.
+            let view = |c: [f32; 3], r: f32| {
+                let mut nearest = f32::MAX;
+                let mut inside = true;
+                for p in &planes {
+                    let d = p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] + r;
+                    nearest = nearest.min(d.abs() / (r + 1.0));
+                    inside &= d >= 0.0;
+                }
+                (inside, nearest)
+            };
+            let projected = |e: f32, c: [f32; 3], r: f32| {
+                if e <= 0.0 {
+                    return 0.0;
+                }
+                let d = ((c[0] - eye[0]).powi(2) + (c[1] - eye[1]).powi(2) + (c[2] - eye[2]).powi(2)).sqrt() - r;
+                if d <= 0.0 { 3.0e38 } else { e / d }
+            };
+            let mesh = pool.mesh(MeshId(instance.mesh)).unwrap();
+            let b = mesh.bounds;
+            if !view(place([b[0], b[1], b[2]]), b[3] * scale).0 {
+                continue;
+            }
+            let dag = dags.iter().find(|(id, _)| id.0 == instance.mesh).unwrap().1;
+            let th = parameters.threshold;
+            for (i, c) in dag.clusters.iter().enumerate() {
+                let own = projected(c.error * scale, place(c.lod_bounds.center), c.lod_bounds.radius * scale);
+                let mut margin = ((own - th) / th).abs();
+                let mut chosen = own <= th;
+                if chosen && !c.is_root() {
+                    let parent = projected(c.parent_error * scale, place(c.parent_bounds.center), c.parent_bounds.radius * scale);
+                    margin = margin.min(((parent - th) / th).abs());
+                    chosen = parent > th;
+                }
+                if chosen {
+                    let (inside, near) = view(place(c.bounds.center), c.bounds.radius * scale);
+                    margin = margin.min(near);
+                    chosen = inside;
+                }
+                out.push(([slot, mesh.first_cluster + i as u32], chosen, margin));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_gpu_chooses_the_clusters_the_cpu_does() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (vertices_a, dag_a) = hill(40, 6.0);
+        let (vertices_b, dag_b) = hill(24, 2.0);
+        let a = pool.add_mesh(&device, &queue, &dag_a, &vertices_a);
+        let b = pool.add_mesh(&device, &queue, &dag_b, &vertices_b);
+        let mut seed = 7u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let mut instances = Vec::new();
+        for x in 0..30 {
+            for z in 0..30 {
+                let mesh = if (x + z) % 3 == 0 { b } else { a };
+                let at = [x as f32 * 50.0 - 750.0, random() * 4.0, z as f32 * 50.0 - 750.0];
+                instances.push(pool.add_instance(&device, &queue, mesh, placed(random() * std::f32::consts::TAU, 0.5 + random() * 1.5, at)));
+            }
+        }
+        // Some slots freed, which the culling has to pass over.
+        for i in (0..instances.len()).step_by(17) {
+            pool.remove_instance(&queue, instances[i]);
+        }
+        let dags = [(a, &dag_a), (b, &dag_b)];
+        let mut culler = Culler::new(&device);
+        let mut compared = 0;
+        for (eye, at, threshold) in [
+            ([0.0, 30.0, 0.0], [300.0, 0.0, 200.0], 0.001),
+            ([0.0, 30.0, 0.0], [300.0, 0.0, 200.0], 0.0002),
+            ([-700.0, 5.0, -700.0], [0.0, 0.0, 0.0], 0.001),
+            ([10.0, 3.0, 10.0], [-200.0, 0.0, 30.0], 0.01),
+        ] {
+            let parameters = CullParameters {
+                view_projection: camera(eye, at, 1.2, 16.0 / 9.0),
+                eye,
+                threshold,
+            };
+            let mut encoder = device.create_command_encoder(&Default::default());
+            culler.record(&device, &mut encoder, &pool, &parameters);
+            queue.submit([encoder.finish()]);
+            let args: Vec<u32> = read(&device, &queue, &culler.draw_args, 4);
+            let counts: Vec<u32> = read(&device, &queue, &culler.counts, 4);
+            let drawn = args[1];
+            assert_eq!(args[0], CLUSTER_VERTICES);
+            assert_eq!(drawn, counts[1], "every cluster chosen is drawn");
+            assert_eq!(counts[3], 0, "the list held them all");
+            let mut gpu: Vec<[u32; 2]> = read(&device, &queue, &culler.draw_list, drawn);
+            gpu.sort_unstable();
+            assert!(gpu.windows(2).all(|w| w[0] != w[1]), "a cluster listed twice");
+
+            let reference = cull_on_cpu(&pool, &dags, &parameters);
+            let triangles: u32 = gpu
+                .iter()
+                .map(|&[slot, c]| {
+                    let instance = pool.instance(InstanceId(slot)).unwrap();
+                    let (id, dag) = dags.iter().find(|(id, _)| id.0 == instance.mesh).unwrap();
+                    dag.clusters[(c - pool.mesh(*id).unwrap().first_cluster) as usize].triangles.len() as u32
+                })
+                .sum();
+            assert_eq!(triangles, counts[2], "triangles counted as listed");
+            let mut differ = 0;
+            for (item, chosen, margin) in &reference {
+                if gpu.binary_search(item).is_ok() != *chosen {
+                    // Only where single precision on the GPU and the CPU could round apart.
+                    assert!(*margin < 1e-4, "{item:?}: chosen on the CPU {chosen}, a margin of {margin}");
+                    differ += 1;
+                }
+            }
+            let chosen = reference.iter().filter(|r| r.1).count();
+            assert!(chosen > 100, "only {chosen} clusters chosen from {eye:?}");
+            assert!(differ * 1000 <= chosen, "{differ} of {chosen} differ");
+            compared += chosen;
+        }
+        assert!(compared > 1000);
+    }
+
+    #[test]
+    fn a_list_too_small_is_made_bigger() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (vertices, dag) = hill(40, 6.0);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+        for i in 0..50 {
+            pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [i as f32 * 45.0, 0.0, -60.0]));
+        }
+        let mut culler = Culler::new(&device);
+        culler.set_capacity(&device, 10);
+        let parameters = CullParameters {
+            view_projection: camera([1000.0, 20.0, 40.0], [1000.0, 0.0, -60.0], 2.5, 1.0),
+            eye: [1000.0, 20.0, 40.0],
+            threshold: 0.0005,
+        };
+        let cull = |culler: &mut Culler| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            culler.record(&device, &mut encoder, &pool, &parameters);
+            queue.submit([encoder.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        };
+        cull(&mut culler);
+        let args: Vec<u32> = read(&device, &queue, &culler.draw_args, 4);
+        assert_eq!(args[1], 10, "no more drawn than the list holds");
+        // The counts arrive over the next cullings, and the list grows to hold them.
+        for _ in 0..3 {
+            cull(&mut culler);
+        }
+        let stats = culler.stats().expect("read back by now");
+        assert!(stats.overflowed && stats.clusters > 10, "{stats:?}");
+        assert!(culler.capacity() >= stats.clusters, "{} for {} clusters", culler.capacity(), stats.clusters);
+        cull(&mut culler);
+        let args: Vec<u32> = read(&device, &queue, &culler.draw_args, 4);
+        assert_eq!(args[1], stats.clusters, "all drawn once it has room");
     }
 
     /// A device of this machine's, if it has one: the tests that need a GPU skip without.
@@ -890,7 +1554,7 @@ mod test {
         for (i, built) in dag.clusters.iter().enumerate() {
             let gpu = clusters[(record.first_cluster as usize) + i];
             assert_eq!((gpu.triangle_count as usize, gpu.vertex_count as usize), (built.triangles.len(), built.vertices.len()));
-            assert_eq!((gpu.error, gpu.parent_error, gpu.level, gpu.mesh), (built.error, built.parent_error, built.level, mesh.0));
+            assert_eq!((gpu.error, gpu.parent_error, gpu.level, gpu.mesh), (built.error, built.parent_error.min(f32::MAX), built.level, mesh.0));
             for (t, expected) in built.mesh_triangles().enumerate() {
                 let packed = triangles[(gpu.first_triangle as usize) + t];
                 for k in 0..3 {

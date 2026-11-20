@@ -42,11 +42,17 @@ What each one buys:
    Known: foliage holds its detail until far off (a pine's needles draw all 2,948 triangles at
    80 m, 91 at 320 m), because cards cannot lose triangles without whole cards vanishing. To be
    taken up with alpha-masked clusters (6), e.g. merging neighbouring cards at coarse levels.
-2. **Geometry pool**: every cluster of every mesh in shared GPU vertex/index buffers, plus an
-   instance buffer, uploaded once and updated as instances come and go.
-3. **GPU culling and LOD selection** (compute): per instance frustum cull; per cluster group,
-   draw it where its own projected error is under a pixel and its parent's is not; frustum cull
-   clusters; write indirect draw arguments.
+2. **Geometry pool** - done (`fyrox_graphics_wgpu::yoctite::GeometryPool`): every cluster of
+   every mesh in shared GPU buffers, plus an instance buffer, uploaded once and updated as
+   instances come and go; `ClusterView` draws clusters from it in one instanced draw, and
+   fyrox-gfx's `GraphicsEffects::with_yoctite_view` shows the scene's meshes as their clusters.
+3. **GPU culling and LOD selection** - done (`Culler`, `shaders/yoctite_cull.wgsl`): five compute
+   passes - instances frustum-culled, then a workgroup per visible instance choosing the cut
+   (own error under a pixel, parent's not, in world space with the instance's largest scale) and
+   frustum-culling clusters - into a draw list and indirect draw arguments, drawn with
+   `draw_indirect`; counts read back without stalling, and the list grown when it overflows.
+   Tested to choose exactly the clusters the CPU reference does. In Wilderness choosing and
+   drawing costs the CPU 0.02 ms, against 1.3-1.6 ms on the CPU.
 4. **Visibility buffer**: hardware-rasterize visible clusters in one indirect draw into a
    depth plus (instance, cluster, triangle) buffer; a material pass resolves it into the existing
    G-buffer, so lights, traced shadows, fog and the rest work unchanged.
