@@ -471,6 +471,33 @@ fn foliage_cards_make_full_clusters_and_thin_out() {
 }
 
 #[test]
+fn doubled_cards_are_drawn_from_everywhere() {
+    // Each card twice, once each way round, as a game makes single sheets seen from both sides.
+    let (positions, mut indices) = cards(3000);
+    let back: Vec<u32> = indices.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).collect();
+    indices.extend(back);
+    let mesh = Mesh::new(&positions, &indices);
+    let dag = build(&mesh, Settings::default());
+    check_structure(&dag, positions.len());
+    check_monotonic(&dag);
+    for (eye, threshold) in views() {
+        let eye = [eye[0] + 5.0, eye[1] + 5.0, eye[2] + 5.0];
+        let drawn: usize = select(&dag, eye, threshold).iter().map(|&c| dag.clusters[c as usize].triangles.len()).sum();
+        assert!(drawn > 0, "nothing drawn from {eye:?} at {threshold}");
+    }
+    // Doubled, a card is no easier to lose than single: its outline holds it, as an open border
+    // does, so it thins out as slowly - not to nothing at no error, as a flat closed surface would.
+    let single = built(&positions, &indices[..indices.len() / 2]);
+    let level_error = |dag: &ClusterDag, level: u32| {
+        dag.clusters.iter().filter(|c| c.level == level).map(|c| c.error).fold(f32::INFINITY, f32::min)
+    };
+    for level in 1..single.levels().min(dag.levels()) {
+        let (one, two) = (level_error(&single, level), level_error(&dag, level));
+        assert!(two >= one * 0.5 && two > 0.0, "level {level}: doubled cards' least error {two}, single cards' {one}");
+    }
+}
+
+#[test]
 fn bytes_make_the_same_graph() {
     let (positions, indices) = icosphere(3);
     let dag = built(&positions, &indices);

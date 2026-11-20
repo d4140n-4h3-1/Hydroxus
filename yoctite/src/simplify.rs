@@ -311,8 +311,11 @@ pub(crate) fn simplify(
     s.alive = s.triangles.len();
 
     // Each vertex's quadric: the planes of its triangles, weighted by their areas, and of the
-    // open borders through it, at right angles to their triangles.
-    let mut edges: HashMap<(usize, usize), (u32, usize)> = HashMap::new();
+    // borders through it, at right angles to their triangles. A border is an edge of one
+    // triangle, or the fold of a sheet made double-sided by a reversed copy of each triangle:
+    // an edge of just two triangles facing opposite ways. Without its plane a doubled card would
+    // seem a closed, flat surface, which collapses away to nothing at no cost at all.
+    let mut edges: HashMap<(usize, usize), (u32, usize, usize)> = HashMap::new();
     for (t, tri) in s.triangles.iter().enumerate() {
         let p = tri.corners.map(|c| s.vertices[c].position);
         let normal = (p[1] - p[0]).cross(p[2] - p[0]);
@@ -325,20 +328,24 @@ pub(crate) fn simplify(
         }
         for k in 0..3 {
             let (x, y) = (tri.corners[k], tri.corners[(k + 1) % 3]);
-            edges.entry((x.min(y), x.max(y))).or_insert((0, t)).0 += 1;
+            let entry = edges.entry((x.min(y), x.max(y))).or_insert((0, t, t));
+            entry.0 += 1;
+            entry.2 = t;
         }
     }
-    for (&(x, y), &(uses, t)) in &edges {
-        if uses != 1 {
+    let mut borders = Vec::new();
+    for (&(x, y), &(uses, t, other)) in &edges {
+        let normal = s.facing(t).normalized();
+        let folded = uses == 2 && normal.dot(s.facing(other).normalized()) < -0.99;
+        if uses != 1 && !folded {
             continue;
         }
-        let tri = &s.triangles[t];
-        let p = tri.corners.map(|c| s.vertices[c].position);
-        let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
         let (px, py) = (s.vertices[x].position, s.vertices[y].position);
         let edge = py - px;
         let across = edge.cross(normal).normalized();
-        let q = Quadric::plane(across, px, edge.dot(edge) * BORDER_WEIGHT);
+        borders.push((x, y, Quadric::plane(across, px, edge.dot(edge) * BORDER_WEIGHT)));
+    }
+    for (x, y, q) in borders {
         s.vertices[x].quadric += q;
         s.vertices[y].quadric += q;
     }

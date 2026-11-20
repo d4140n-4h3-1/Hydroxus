@@ -95,3 +95,5 @@ pub mod server;
 /// Texture creation, upload, and format mapping.
 pub mod texture;
 pub mod vertex_depth;
+/// Yoctite's geometry on the GPU: every mesh's clusters, and every instance of them.
+pub mod yoctite;
