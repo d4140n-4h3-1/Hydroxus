@@ -5,10 +5,10 @@ use crate::{
     group::group,
     math::{Sphere, V3},
     prune,
-    simplify::simplify,
+    simplify::{simplify, DragPoint},
     Cluster, ClusterDag, ExtraVertex, Group, Mesh, Settings,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A cluster made from `triangles` (indices into the mesh's vertices).
 fn make_cluster(mesh: &Mesh, triangles: &[[u32; 3]], level: u32, made_from: Option<u32>) -> Cluster {
@@ -84,8 +84,21 @@ pub fn build(mesh: &Mesh, settings: Settings) -> ClusterDag {
         .collect();
     let mut dag = ClusterDag::default();
     let mut current = add_clusters(&mut dag, mesh, &triangles, 0, None);
-    // The mesh's positions and texture coordinates, with the grown cards' corners added on.
     let original_count = mesh.positions.len() as u32;
+    // Every vertex of the full mesh, to measure texture drag at against every level (see
+    // `DragPoint`): the way the surface faced there, and the vertex now at its place.
+    let mut facing = vec![V3::new(0.0, 0.0, 0.0); original_count as usize];
+    if mesh.uvs.is_some() {
+        for t in &triangles {
+            let p = t.map(|v| mesh.position(v));
+            let n = (p[1] - p[0]).cross(p[2] - p[0]);
+            for &v in t {
+                facing[v as usize] += n;
+            }
+        }
+    }
+    let mut now_at: Vec<u32> = (0..original_count).collect();
+    // The mesh's positions and texture coordinates, with the grown cards' corners added on.
     let mut positions: Vec<[f32; 3]> = mesh.positions.to_vec();
     let mut uvs: Option<Vec<[f32; 2]>> = mesh.uvs.map(<[_]>::to_vec);
     // The welded vertices of clusters that became roots below the top: whatever is made next
@@ -108,6 +121,31 @@ pub fn build(mesh: &Mesh, settings: Settings) -> ClusterDag {
             } else {
                 dag.extra_vertices[(v - original_count) as usize].source
             }
+        };
+
+        // The full mesh's vertices now at each welded vertex, and those under some triangles,
+        // with a vertex of theirs at that place.
+        let mut under: HashMap<u32, Vec<u32>> = HashMap::new();
+        if at.uvs.is_some() {
+            for (original, &v) in now_at.iter().enumerate() {
+                under.entry(at.weld[v as usize]).or_default().push(original as u32);
+            }
+        }
+        let (under, facing) = (&under, &facing);
+        let points_of = |triangles: &[[u32; 3]]| -> Vec<DragPoint> {
+            let mut places: Vec<(u32, u32)> = triangles.iter().flatten().map(|&v| (at.weld[v as usize], v)).collect();
+            places.sort_unstable();
+            places.dedup_by_key(|p| p.0);
+            places
+                .iter()
+                .flat_map(|&(w, v)| {
+                    under.get(&w).into_iter().flatten().map(move |&original| DragPoint {
+                        original,
+                        at: v,
+                        facing: facing[original as usize],
+                    })
+                })
+                .collect()
         };
 
         let described: Vec<(Vec<[u32; 3]>, V3)> = current
@@ -153,16 +191,34 @@ pub fn build(mesh: &Mesh, settings: Settings) -> ClusterDag {
             let locked = |w: u32| border.contains(&w);
             // Foliage: its cards thinned out, and whatever else there is collapsed.
             let mut grown: Vec<(u32, [f32; 3])> = Vec::new();
+            // Where the full mesh's vertices under the group have come to.
+            let mut moves: Vec<(u32, u32)> = Vec::new();
             let (simplified, thinned_error) = match prune::split(at, &triangles, locked) {
                 Some(split) => {
                     let first_new = positions.len() as u32 + new_vertices.len() as u32;
                     let thinned = prune::thin(at, &split.cards, first_new, settings.card_error, source);
                     grown = thinned.new_vertices;
-                    let mut rest = simplify(at, &split.rest, locked, split.rest.len() / 2);
+                    // Those on kept cards go with them; those on cards left out are covered by
+                    // nothing any more, and never measured again.
+                    for card in &split.cards {
+                        for point in points_of(card) {
+                            if let Some(&to) = thinned.moved.get(&point.at) {
+                                moves.push((point.original, to));
+                            }
+                        }
+                    }
+                    let points = points_of(&split.rest);
+                    let mut rest = simplify(at, &split.rest, locked, split.rest.len() / 2, &points);
+                    moves.extend(points.iter().map(|p| p.original).zip(rest.moved.iter().copied()));
                     rest.triangles.extend(thinned.triangles);
                     (rest, thinned.error)
                 }
-                None => (simplify(at, &triangles, locked, triangles.len() / 2), 0.0),
+                None => {
+                    let points = points_of(&triangles);
+                    let simplified = simplify(at, &triangles, locked, triangles.len() / 2, &points);
+                    moves.extend(points.iter().map(|p| p.original).zip(simplified.moved.iter().copied()));
+                    (simplified, 0.0)
+                }
             };
             let reduced = (simplified.triangles.len() as f32)
                 <= triangles.len() as f32 * settings.least_reduction;
@@ -176,15 +232,18 @@ pub fn build(mesh: &Mesh, settings: Settings) -> ClusterDag {
                 continue;
             }
             new_vertices.extend(grown.into_iter().map(|(source, position)| ExtraVertex { source, position }));
+            for (original, to) in moves {
+                now_at[original as usize] = to;
+            }
 
-            // How far from the full mesh, at most: as the simplification moved the surface, or
-            // as far as the children are and the texture was dragged from them on top, as drag
-            // adds up level on level; and as the cards were thinned.
-            let mut error = simplified.error.max(thinned_error);
+            // How far from the full mesh, at most: as far as the children are, as the
+            // simplification moved the surface, as far as the texture is now dragged from where
+            // the full mesh has it, and as the cards were thinned.
+            let mut error = simplified.error.max(thinned_error).max(simplified.dragged);
             let mut bounds: Option<Sphere> = None;
             for &c in &children {
                 let child = &dag.clusters[c as usize];
-                error = error.max(child.error).max(child.error + simplified.dragged);
+                error = error.max(child.error);
                 bounds = Some(bounds.map_or(child.lod_bounds, |b| b.enclosing(child.lod_bounds)));
             }
             made.push(Simplified {

@@ -42,10 +42,91 @@ const MIN_TURN_COSINE: f64 = 0.2;
 pub(crate) struct Simplified {
     pub triangles: Vec<[u32; 3]>,
     pub error: f32,
-    /// How far the texture was dragged across the surface, measured afterwards against the
-    /// triangles simplified: at every vertex they had, by the triangle now covering it. Relative
-    /// to them, not to the full mesh: drag adds up, level on level.
+    /// How far the texture was dragged across the surface from the full mesh, measured afterwards
+    /// at the drag points given (see [`DragPoint`]): at each, by the triangle now covering it.
     pub dragged: f32,
+    /// Where each drag point is now: a vertex at the place of the one it was moved onto.
+    pub moved: Vec<u32>,
+}
+
+/// How a triangle covers a full-mesh vertex: see [`cover`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Cover {
+    /// How far from the vertex the triangle comes nearest.
+    pub distance: f64,
+    /// How far the texture there is dragged from the vertex's own, and the texture coordinate
+    /// there.
+    pub drag: f64,
+    pub there: [f64; 2],
+    /// Whether the vertex's place falls inside the triangle, seen square on; and whether well
+    /// inside, not on an edge or corner.
+    pub inside: bool,
+    pub within: bool,
+}
+
+/// How triangle `p`, with texture coordinates `u`, stands for a full-mesh vertex at `at` with
+/// texture coordinate `own` and its surface facing `faced`. [`None`] for a triangle facing
+/// another way, or with no area.
+fn cover(at: V3, own: [f64; 2], faced: V3, p: [V3; 3], u: [[f64; 2]; 3]) -> Option<Cover> {
+    let map = TextureMap::of(p, u)?;
+    let w = barycentric(at, p)?;
+    // Only a triangle facing much as the vertex's surface did stands for it: the cap at the foot
+    // of a trunk, facing down, has a texture of its own, which the side of the trunk just above
+    // it was never drawn with.
+    let n = (p[1] - p[0]).cross(p[2] - p[0]);
+    if n.dot(faced) < MIN_SAME_FACING * n.length() * faced.length() {
+        return None;
+    }
+    let inside = w.iter().all(|&w| w >= -1e-6);
+    let within = w.iter().all(|&w| w > 1e-4);
+    let clamped = w.map(|w| w.max(0.0));
+    let sum: f64 = clamped.iter().sum();
+    let clamped = clamped.map(|w| w / sum.max(1e-30));
+    let closest = p[0] * clamped[0] + p[1] * clamped[1] + p[2] * clamped[2];
+    let distance = (closest - at).length();
+    // The texture where the triangle comes nearest: off a triangle its mapping carried on past
+    // its edges means nothing, and from a sliver it runs off without end.
+    let there = [0, 1].map(|i| clamped[0] * u[0][i] + clamped[1] * u[1][i] + clamped[2] * u[2][i]);
+    Some(Cover {
+        distance,
+        drag: map.drag(there, own),
+        there,
+        inside,
+        within,
+    })
+}
+
+/// How far the texture is dragged at a full-mesh vertex, of the ways `found` triangles cover it:
+/// those it falls inside, nearest first. Where it is well inside one or more, or on edges the
+/// triangles there agree on the texture across, the most they drag it: two triangles over one
+/// place both show, and on a shared edge each carries the same slip over its own stretch of
+/// surface. Where it is on edges they disagree on - a seam, where two sides of the texture meet -
+/// the least: the side it was on. [`None`] if nothing covers it.
+fn drag_of(found: &[Cover]) -> Option<f64> {
+    let nearest = found.iter().filter(|f| f.inside).map(|f| f.distance).fold(f64::MAX, f64::min);
+    let tolerance = nearest * 1e-3 + 1e-6;
+    let near = || found.iter().filter(move |f| f.inside && f.distance <= nearest + tolerance);
+    let first = near().next()?.there;
+    let agree = near().all(|f| (f.there[0] - first[0]).abs() + (f.there[1] - first[1]).abs() < 1e-5);
+    if agree || near().any(|f| f.within) {
+        near().filter(|f| agree || f.within).map(|f| f.drag).max_by(f64::total_cmp)
+    } else {
+        near().map(|f| f.drag).min_by(f64::total_cmp)
+    }
+}
+
+/// A vertex of the full mesh, to measure texture drag at: as it was - its place, texture
+/// coordinate and the way its surface faced - against whatever level of detail now stands for
+/// it. Measured against the full mesh at every level, drag never has to be added up level on
+/// level, which overstates it more each time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DragPoint {
+    /// The full mesh's vertex.
+    pub original: u32,
+    /// A vertex of the triangles being simplified at the place it has come to.
+    pub at: u32,
+    /// The way the full mesh's surface faced there, not of unit length.
+    pub facing: V3,
 }
 
 
@@ -118,6 +199,8 @@ struct Vertex {
     dragged: f64,
     locked: bool,
     alive: bool,
+    /// One of the mesh's vertices at its place.
+    vertex: u32,
     /// The vertex it was moved onto, once collapsed.
     moved_onto: Option<usize>,
     /// Its triangles, some perhaps no longer alive.
@@ -156,40 +239,37 @@ fn barycentric(p: V3, t: [V3; 3]) -> Option<[f64; 3]> {
 }
 
 impl Simplifier<'_> {
-    /// How far the simplified triangles drag the texture across the surface from `before`, at
-    /// most, in the surface's units: at each vertex of `before`, the texture coordinate the
-    /// triangle now covering it gives there, against its own. Each vertex is judged by the
-    /// triangles round the one it was moved onto, and their neighbours - where it went - not
+    /// How far the simplified triangles drag the texture across the surface from the full mesh,
+    /// at most, in the surface's units, at `points`: at each, the texture coordinate the
+    /// triangle now covering its place gives there, against its own. Each point is judged by the
+    /// triangles round the vertex it was moved onto, and their neighbours - where it went - not
     /// by whatever triangle happens to be nearest: on a tree that is as likely the other side of
-    /// a twig, or another branch, whose texture has nothing to do with it. On a seam a vertex is
+    /// a twig, or another branch, whose texture has nothing to do with it. On a seam a point is
     /// covered from both sides, so of the triangles nearest it, the one that drags it least is
     /// taken. Without texture coordinates, nothing. `local` is each welded vertex's index here.
-    fn measure_drag(&self, mesh: &Mesh, before: &[[u32; 3]], local: &HashMap<u32, usize>) -> f64 {
-        let Some(uvs) = self.uvs else {
-            return 0.0;
-        };
-        let uv = |v: u32| uvs[v as usize].map(f64::from);
-        // Each vertex of `before` and the way its surface faced there: its triangles' facings
-        // added up, each weighted by its area.
-        let mut facing: HashMap<u32, V3> = HashMap::new();
-        for t in before {
-            let p = t.map(|v| mesh.position(v));
-            let n = (p[1] - p[0]).cross(p[2] - p[0]);
-            for &v in t {
-                let sum = facing.entry(v).or_insert(V3::new(0.0, 0.0, 0.0));
-                *sum = *sum + n;
-            }
-        }
+    /// With where each point is now.
+    /// A point nothing covers any more is where the surface was taken away - the tip of a twig
+    /// collapsed back along it - which is how far the surface moved, not how far its texture slid
+    /// over it: that is the quadrics' to measure.
+    fn measure_drag(&self, mesh: &Mesh, points: &[DragPoint], local: &HashMap<u32, usize>) -> (f64, Vec<u32>) {
+        let mut moved = Vec::with_capacity(points.len());
         let mut worst: f64 = 0.0;
         let (mut candidates, mut ring, mut seen) = (Vec::new(), Vec::new(), Vec::new());
-        for (&v, &faced) in &facing {
-            let Some(&start) = local.get(&mesh.weld[v as usize]) else {
+        for point in points {
+            let Some(&start) = local.get(&mesh.weld[point.at as usize]) else {
+                moved.push(point.at);
                 continue;
             };
             let mut at_now = start;
             while let Some(next) = self.vertices[at_now].moved_onto {
                 at_now = next;
             }
+            moved.push(self.vertices[at_now].vertex);
+            let Some(uvs) = self.uvs else {
+                continue;
+            };
+            let uv = |v: u32| uvs[v as usize].map(f64::from);
+            let (v, faced) = (point.original, point.facing);
             let (at, own) = (mesh.position(v), uv(v));
             // Ring after ring of triangles round where it went, until one covers it - its
             // place falls inside the triangle, seen square on.
@@ -198,7 +278,7 @@ impl Simplifier<'_> {
             seen.clear();
             seen.push(at_now);
             candidates.clear();
-            let mut found: Vec<(f64, f64, bool)> = Vec::new();
+            let mut found: Vec<Cover> = Vec::new();
             for _ in 0..MAX_DRAG_RINGS {
                 let start = candidates.len();
                 for &r in &ring {
@@ -207,30 +287,11 @@ impl Simplifier<'_> {
                 for &t in &candidates[start..] {
                     let tri = &self.triangles[t];
                     let p = tri.corners.map(|c| self.vertices[c].position);
-                    let u = tri.originals.map(uv);
-                    let (Some(map), Some(w)) = (TextureMap::of(p, u), barycentric(at, p)) else {
-                        continue;
-                    };
-                    // Only a triangle facing much as the vertex's surface did stands for it: the
-                    // cap at the foot of a trunk, facing down, has a texture of its own, which
-                    // the side of the trunk just above it was never drawn with.
-                    let n = (p[1] - p[0]).cross(p[2] - p[0]);
-                    if n.dot(faced) < MIN_SAME_FACING * n.length() * faced.length() {
-                        continue;
+                    if let Some(f) = cover(at, own, faced, p, tri.originals.map(uv)) {
+                        found.push(f);
                     }
-                    let inside = w.iter().all(|&w| w >= -1e-6);
-                    let clamped = w.map(|w| w.max(0.0));
-                    let sum: f64 = clamped.iter().sum();
-                    let clamped = clamped.map(|w| w / sum.max(1e-30));
-                    let closest = p[0] * clamped[0] + p[1] * clamped[1] + p[2] * clamped[2];
-                    let distance = (closest - at).length();
-                    // The texture where the triangle comes nearest: off a triangle its mapping
-                    // carried on past its edges means nothing, and from a sliver it runs off
-                    // without end.
-                    let there = [0, 1].map(|i| clamped[0] * u[0][i] + clamped[1] * u[1][i] + clamped[2] * u[2][i]);
-                    found.push((distance, map.drag(there, own), inside));
                 }
-                if found.iter().any(|f| f.2) {
+                if found.iter().any(|f| f.inside) {
                     break;
                 }
                 let next: Vec<usize> = ring
@@ -249,22 +310,12 @@ impl Simplifier<'_> {
                     break;
                 }
             }
-            // Of those covering it, the nearest, and of those the one that drags it least. A
-            // vertex nothing facing its way covers any more is where the surface was taken away -
-            // the tip of a twig collapsed back along it - which is how far the surface moved,
-            // not how far its texture slid over it: that is the quadrics' to measure.
-            let nearest = found.iter().filter(|f| f.2).map(|f| f.0).fold(f64::MAX, f64::min);
-            let tolerance = nearest * 1e-3 + 1e-6;
-            if let Some(off) = found
-                .iter()
-                .filter(|f| f.2 && f.0 <= nearest + tolerance)
-                .map(|f| f.1)
-                .min_by(f64::total_cmp)
-            {
-                worst = worst.max(off);
+            // Judged by those covering it (see `drag_of`); nothing covering it, it is left out.
+            if let Some(drag) = drag_of(&found) {
+                worst = worst.max(drag);
             }
         }
-        worst
+        (worst, moved)
     }
 
     /// How far collapsing `from` onto `to` moves the surface, squared: by its quadrics, by how far
@@ -515,12 +566,14 @@ impl Simplifier<'_> {
 }
 
 /// Simplifies `triangles` (indices into `mesh`'s vertices) to `target` triangles or as near as
-/// it can, never moving a vertex `locked` says to keep (given its welded index).
+/// it can, never moving a vertex `locked` says to keep (given its welded index); and measures
+/// how far that drags the texture from the full mesh at `points`.
 pub(crate) fn simplify(
     mesh: &Mesh,
     triangles: &[[u32; 3]],
     locked: impl Fn(u32) -> bool,
     target: usize,
+    points: &[DragPoint],
 ) -> Simplified {
     let mut local: HashMap<u32, usize> = HashMap::new();
     let mut s = Simplifier {
@@ -539,6 +592,7 @@ pub(crate) fn simplify(
                     dragged: 0.0,
                     locked: locked(w),
                     alive: true,
+                    vertex: v,
                     moved_onto: None,
                     triangles: Vec::new(),
                 });
@@ -634,10 +688,11 @@ pub(crate) fn simplify(
     }
 
     let simplified: Vec<[u32; 3]> = s.triangles.iter().filter(|t| t.alive).map(|t| t.originals).collect();
-    let dragged = s.measure_drag(mesh, triangles, &local) as f32;
+    let (dragged, moved) = s.measure_drag(mesh, points, &local);
     Simplified {
         triangles: simplified,
         error: worst.sqrt() as f32,
-        dragged,
+        dragged: dragged as f32,
+        moved,
     }
 }

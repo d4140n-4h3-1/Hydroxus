@@ -40,6 +40,8 @@ pub(crate) struct Thinned {
     pub new_vertices: Vec<(u32, [f32; 3])>,
     /// How far the thinned cards are from the full mesh, by how big the cards are.
     pub error: f32,
+    /// The vertex each of the kept cards' vertices became.
+    pub moved: HashMap<u32, u32>,
 }
 
 /// A group's triangles split into its loose cards and the rest.
@@ -179,7 +181,7 @@ pub(crate) fn thin(
         // A grown corner moves this far.
         error = error.max(reach * (growth as f64 - 1.0));
         let middle = middle.to_f32();
-        moved.clear();
+        // Cards share no vertices, so one map serves them all.
         for t in &cards[c] {
             triangles.push(t.map(|v| {
                 *moved.entry(v).or_insert_with(|| {
@@ -201,5 +203,6 @@ pub(crate) fn thin(
         triangles,
         new_vertices,
         error: error as f32 * card_error,
+        moved,
     }
 }

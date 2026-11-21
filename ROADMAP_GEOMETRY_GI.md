@@ -48,7 +48,10 @@ What each one buys:
    went (rings round the vertex it was collapsed onto, facing its way, covering it), and a whole
    number of repeats apart is a seam, not a drag: measured against the nearest triangle anywhere
    it had taken other branches and seams for drag, of metres, and held whole trees at full
-   detail. In Wilderness, 6.6 M triangles drawn became 3.4 M, and a tree builds in 20-70 ms.
+   detail. Drag is measured at every level against the full mesh's own vertices, followed to
+   where each went, so it is never added up level on level. In Wilderness, 6.6 M triangles drawn
+   became 3.4 M, and a tree builds in 20-70 ms, off the frame (fyrox-gfx builds on threads of
+   its own).
 2. **Geometry pool** - done (`fyrox_graphics_wgpu::yoctite::GeometryPool`): every cluster of
    every mesh in shared GPU buffers, plus an instance buffer, uploaded once and updated as
    instances come and go; `ClusterView` draws clusters from it in one instanced draw, and
