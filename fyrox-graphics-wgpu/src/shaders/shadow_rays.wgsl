@@ -29,6 +29,10 @@ enable wgpu_ray_query;
 // into a smooth edge. Where the frames are averaged after (temporal anti-aliasing), the pattern
 // turns from frame to frame as well, so one ray a pixel covers the whole light over a few frames:
 // soft shadows for the price of hard ones.
+//
+// At half resolution, one pixel of each 2x2 block is traced, a different one each frame where
+// frames are averaged; the blur pass (shadow_blur.wgsl) fills in the rest from the traced
+// pixels on the same surface.
 
 struct Uniforms {
     inverseViewProjection: mat4x4f,
@@ -47,9 +51,11 @@ struct Uniforms {
     // out from its middle, as fractions of the whole: zero where frames are not averaged.
     turn: f32,
     reachOut: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    // The mask's pixels to the screen's, across (1, or 2 at half resolution), and which pixel of
+    // each block this frame traces.
+    scale: u32,
+    offsetX: u32,
+    offsetY: u32,
 };
 
 @group(0) @binding(0) var sceneGeometry: acceleration_structure;
@@ -167,14 +173,16 @@ fn position_error(uv: vec2f, depth: f32, position: vec3f) -> f32 {
 
 @fragment
 fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
-    let pixel = vec2i(fragCoord.xy);
+    // The screen's pixel this one of the mask traces.
+    let block = vec2i(fragCoord.xy) * i32(uniforms.scale);
+    let pixel = min(block + vec2i(i32(uniforms.offsetX), i32(uniforms.offsetY)), vec2i(uniforms.screenSize) - 1);
     let depth = textureLoad(sceneDepth, pixel, 0);
     // Nothing was drawn here, so nothing can be in shadow.
     if (depth >= 1.0) {
         return vec4f(1.0);
     }
 
-    let uv = fragCoord.xy / uniforms.screenSize;
+    let uv = (vec2f(pixel) + 0.5) / uniforms.screenSize;
     let position = world_at(uv, depth);
 
     // The rays start a little way off along the surface's own normal rather than along the ray:

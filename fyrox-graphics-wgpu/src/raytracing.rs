@@ -406,6 +406,10 @@ pub struct ShadowRayParameters {
     /// the pattern of rays over the light then turns from frame to frame, and one ray a pixel
     /// covers the whole light over a few of them. [`None`] keeps the pattern still.
     pub frame: Option<u32>,
+    /// Whether to trace one pixel of each 2x2 block - a quarter of the rays - and fill in the
+    /// rest from the traced ones on the same surface. With [`Self::frame`], a different pixel of
+    /// each block is traced every frame, and the averaged frames come to the whole picture.
+    pub half_resolution: bool,
 }
 
 /// The passes that trace the rays and smooth the result, kept between frames so their pipelines
@@ -948,13 +952,23 @@ impl ShadowTracer {
         let GpuTextureKind::Rectangle { width, height } = depth.kind() else {
             return Ok(None);
         };
-        let mask = mask_texture(&mut self.mask, server, "RayTracedShadowMask", width, height)?;
+        let scale: usize = if parameters.half_resolution { 2 } else { 1 };
+        let (mask_width, mask_height) = (width.div_ceil(scale), height.div_ceil(scale));
+        let mask = mask_texture(&mut self.mask, server, "RayTracedShadowMask", mask_width, mask_height)?;
+        // Which pixel of each block is traced: each in turn, frame by frame, where the frames are
+        // averaged.
+        let offset = if scale > 1 {
+            [[0u32, 0], [1, 1], [1, 0], [0, 1]][parameters.frame.unwrap_or(0) as usize % 4]
+        } else {
+            [0, 0]
+        };
         // A light with a size casts soft edges, which the blur smooths.
         let soft = match parameters.light {
             ShadowRayLight::Directional { angular_size, .. } => angular_size > 0.0,
             ShadowRayLight::Positional { size, .. } => size > 0.0,
         };
-        let blurred = if soft {
+        // At half resolution the blur fills in the pixels not traced, soft or not.
+        let blurred = if soft || scale > 1 {
             Some(mask_texture(
                 &mut self.blurred,
                 server,
@@ -1008,7 +1022,8 @@ impl ShadowTracer {
             light_size: f32,
             turn: f32,
             reach_out: f32,
-            _padding: [u32; 3],
+            scale: u32,
+            offset: [u32; 2],
         }
         let (light_direction, reach, light_position, light_radius, positional, light_size) =
             match parameters.light {
@@ -1041,7 +1056,8 @@ impl ShadowTracer {
             // did not.
             turn: parameters.frame.map_or(0.0, |f| (f as f64 * 0.754_877_666_2).fract() as f32),
             reach_out: parameters.frame.map_or(0.0, |f| (f as f64 * 0.569_840_291_0).fract() as f32),
-            _padding: [0; 3],
+            scale: scale as u32,
+            offset,
         };
 
         let device = &server.state.device;
@@ -1099,13 +1115,20 @@ impl ShadowTracer {
                     label: Some("ShadowRays"),
                 })
             });
+        // The scissor in the mask's pixels: every block it touches.
+        let mask_scissor = scissor.map(|[x, y, w, h]| {
+            let s = scale as u32;
+            let (x0, y0) = (x / s, y / s);
+            let (x1, y1) = ((x + w).div_ceil(s).min(mask_width as u32), (y + h).div_ceil(s).min(mask_height as u32));
+            [x0, y0, x1 - x0, y1 - y0]
+        });
         draw_mask(
             &mut encoder,
             "ShadowRays",
             target,
             &self.pipeline,
             &bind_group,
-            scissor,
+            mask_scissor,
         );
         server.gpu_mark_in(&mut encoder, "Lighting: shadow rays");
 
@@ -1122,12 +1145,25 @@ impl ShadowTracer {
                 screen_size: [f32; 2],
                 flip_v: u32,
                 plane_tolerance: f32,
+                mask_size: [i32; 2],
+                offset: [i32; 2],
+                scale: i32,
+                radius: i32,
+                _padding: [u32; 2],
             }
             let blur_uniforms = BlurUniforms {
                 inverse_view_projection: parameters.inverse_view_projection,
                 screen_size,
                 flip_v: parameters.flip_v as u32,
                 plane_tolerance: BLUR_PLANE_TOLERANCE,
+                mask_size: [mask_width as i32, mask_height as i32],
+                offset: [offset[0] as i32, offset[1] as i32],
+                scale: scale as i32,
+                // Soft edges are averaged over the 4x4 turns of the pattern, 5x5 pixels; at half
+                // resolution 3x3 traced ones reach about as far, the turns over the frames
+                // averaged after. Hard edges are only filled in, from the traced pixels nearest.
+                radius: if soft && scale == 1 { 2 } else { 1 },
+                _padding: [0; 2],
             };
             let blur_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("ShadowBlur"),
@@ -1189,6 +1225,11 @@ mod test {
     #[test]
     fn the_shadow_rays_shader_is_valid() {
         validate(&shadow_rays_source());
+    }
+
+    #[test]
+    fn the_shadow_blur_shader_is_valid() {
+        validate(BLUR_SHADER);
     }
 
     #[test]

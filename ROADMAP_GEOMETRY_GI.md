@@ -109,3 +109,7 @@ Since: a doubled foliage card is traced once (fyrox-gfx), and soft shadows take 
 the pattern over the sun turning from frame to frame for temporal anti-aliasing to average -
 shadow rays 9.2 ms to 3.7 ms, the GPU's frame 12 ms to 7.7. Measured with WILDERNESS_BENCH=1,
 which holds the view still: with the view moving, the times swing by half.
+Then: one pixel of each 2x2 block traced, a different one each frame, the rest filled in from
+the traced pixels on the same surface - shadow rays 3.7 ms to 1.4 ms, the frame to 5.4 ms.
+Cutting cards into pieces and leaving out the empty ones was tried and did nothing: a ray's cost
+is its way through the crowns until a needle stops it, not the cards it is tested against.

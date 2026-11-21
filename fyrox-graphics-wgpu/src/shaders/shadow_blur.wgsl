@@ -5,6 +5,11 @@
 // turn of the 4x4 sample pattern and turns the speckle into a gradient. The average only takes in
 // neighbors on the same surface - facing the same way and lying in the same plane - so a shadow
 // does not bleed across a corner or from a wall onto the floor in front of it.
+//
+// A mask traced at half resolution has one traced pixel for each 2x2 block of the screen; this
+// pass then fills in every pixel from the traced ones near it on its surface - each judged by
+// the pixel it traced - weighting nearer ones more. A pixel no traced neighbour shares a surface
+// with - a needle against the sky - takes the nearest one's.
 
 struct Uniforms {
     inverseViewProjection: mat4x4f,
@@ -13,6 +18,15 @@ struct Uniforms {
     // How far off the pixel's plane, in meters, a neighbor may lie and still count as the same
     // surface.
     planeTolerance: f32,
+    // The mask's size, and which pixel of each block of the screen it traced.
+    maskSize: vec2i,
+    offset: vec2i,
+    // The mask's pixels to the screen's, across, and how many of the mask's pixels either way
+    // are averaged.
+    scale: i32,
+    radius: i32,
+    pad0: u32,
+    pad1: u32,
 };
 
 @group(0) @binding(0) var mask: texture_2d<f32>;
@@ -63,22 +77,43 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     // still the same surface.
     let tolerance = uniforms.planeTolerance + 2.0 * position_error(pixel, depth, position);
 
+    // The mask's pixel whose block this pixel is in.
+    let scale = uniforms.scale;
+    let center = clamp((pixel - uniforms.offset + vec2i(scale - 1)) / scale, vec2i(0), uniforms.maskSize - 1);
+    // At half resolution nearer traced pixels count more, as they stand for this one better.
+    let reach = f32(scale * (2 * uniforms.radius + 1));
     var sum = vec3f(0.0);
     var weights = 0.0;
-    for (var dy = -2; dy <= 2; dy++) {
-        for (var dx = -2; dx <= 2; dx++) {
-            let neighbor = clamp(pixel + vec2i(dx, dy), vec2i(0), last);
+    var nearest = vec3f(1.0);
+    var nearestDistance = 1.0e9;
+    for (var dy = -uniforms.radius; dy <= uniforms.radius; dy++) {
+        for (var dx = -uniforms.radius; dx <= uniforms.radius; dx++) {
+            let texel = clamp(center + vec2i(dx, dy), vec2i(0), uniforms.maskSize - 1);
+            let neighbor = clamp(texel * scale + uniforms.offset, vec2i(0), last);
+            let value = textureLoad(mask, texel, 0).rgb;
+            let away = length(vec2f(neighbor - pixel));
+            if (away < nearestDistance) {
+                nearestDistance = away;
+                nearest = value;
+            }
             let neighborDepth = textureLoad(sceneDepth, neighbor, 0);
             if (neighborDepth >= 1.0) {
                 continue;
             }
             let facing = pow(max(dot(normal, normal_at(neighbor)), 0.0), 8.0);
             let offPlane = abs(dot(normal, world_position(neighbor, neighborDepth) - position));
-            let weight = facing * max(1.0 - offPlane / tolerance, 0.0);
-            sum += textureLoad(mask, neighbor, 0).rgb * weight;
+            var weight = facing * max(1.0 - offPlane / tolerance, 0.0);
+            if (scale > 1) {
+                weight *= max(1.0 - away / reach, 0.0);
+            }
+            sum += value * weight;
             weights += weight;
         }
     }
-    // The pixel itself always counts fully, so there is always something to divide by.
+    // At full resolution the pixel itself always counts fully, so there is always something to
+    // divide by; at half resolution, it may not have been traced.
+    if (weights <= 0.0) {
+        return vec4f(nearest, 1.0);
+    }
     return vec4f(sum / weights, 1.0);
 }
