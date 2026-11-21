@@ -25,6 +25,7 @@ mod dag;
 mod format;
 mod group;
 mod math;
+mod prune;
 mod select;
 mod simplify;
 #[cfg(test)]
@@ -91,6 +92,10 @@ impl<'a> Mesh<'a> {
         V3::from_f32(self.positions[v as usize])
     }
 
+    pub(crate) fn position_f32(&self, v: u32) -> [f32; 3] {
+        self.positions[v as usize]
+    }
+
     pub(crate) fn welded_count(&self) -> usize {
         self.welded_count
     }
@@ -104,6 +109,11 @@ pub struct Settings {
     /// A group simplified to more than this share of its triangles has gone as far as it can:
     /// its clusters are roots, drawn however far off they are.
     pub least_reduction: f32,
+    /// How much of a foliage card's size counts as error when half the cards are left out and
+    /// the rest grown in their place (see the `prune` module): 1 counts a card moved as far as
+    /// it reaches, which keeps every card until it is smaller than a pixel; less lets the crown
+    /// thin out from where its cards are a few pixels across, keeping how much it covers.
+    pub card_error: f32,
 }
 
 impl Default for Settings {
@@ -111,14 +121,26 @@ impl Default for Settings {
         Self {
             group_size: 4,
             least_reduction: 0.85,
+            card_error: 0.25,
         }
     }
+}
+
+/// A vertex made by simplifying: a copy of one of the mesh's own vertices - its normal,
+/// texture coordinates and the rest - at a new position. Foliage cards grown in place of those
+/// left out have corners of these.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtraVertex {
+    /// The mesh's vertex it is a copy of.
+    pub source: u32,
+    pub position: [f32; 3],
 }
 
 /// A cluster: up to [`MAX_TRIANGLES`] triangles of the mesh at some level of detail.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cluster {
-    /// The mesh's vertices it uses, at most [`MAX_VERTICES`].
+    /// The vertices it uses, at most [`MAX_VERTICES`]: the mesh's own, and from the mesh's
+    /// vertex count on, the graph's [`ClusterDag::extra_vertices`].
     pub vertices: Vec<u32>,
     /// Its triangles, as indices into [`Self::vertices`].
     pub triangles: Vec<[u8; 3]>,
@@ -174,9 +196,24 @@ pub struct Group {
 pub struct ClusterDag {
     pub clusters: Vec<Cluster>,
     pub groups: Vec<Group>,
+    /// Vertices its coarser clusters use besides the mesh's own, numbered on from the mesh's
+    /// vertex count: see [`ExtraVertex`] and [`Self::extend_vertices`].
+    pub extra_vertices: Vec<ExtraVertex>,
 }
 
 impl ClusterDag {
+    /// Adds the graph's [`Self::extra_vertices`] to the mesh's own `vertices`, of whatever kind a
+    /// renderer keeps: each a clone of its source, put at its position by `place`. The clusters
+    /// index the vertices so extended.
+    pub fn extend_vertices<T: Clone>(&self, vertices: &mut Vec<T>, mut place: impl FnMut(&mut T, [f32; 3])) {
+        vertices.reserve(self.extra_vertices.len());
+        for extra in &self.extra_vertices {
+            let mut vertex = vertices[extra.source as usize].clone();
+            place(&mut vertex, extra.position);
+            vertices.push(vertex);
+        }
+    }
+
     /// How many levels of detail it has.
     pub fn levels(&self) -> u32 {
         self.clusters.iter().map(|c| c.level + 1).max().unwrap_or(0)

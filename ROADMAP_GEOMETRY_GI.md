@@ -39,9 +39,16 @@ What each one buys:
    trees build in 1-20 ms a mesh, halving level by level to one root of about 75 triangles;
    Maze's Lumen race city, 1.22 M triangles in 617 meshes, in 3.9 s on one thread, down to 51 k
    at its coarsest.
-   Known: foliage holds its detail until far off (a pine's needles draw all 2,948 triangles at
-   80 m, 91 at 320 m), because cards cannot lose triangles without whole cards vanishing. To be
-   taken up with alpha-masked clusters (6), e.g. merging neighbouring cards at coarse levels.
+   Foliage thins out (`prune`): cards cannot lose triangles without whole cards vanishing, so a
+   group that is mostly small loose cards keeps half of them at each level, at random, each grown
+   about its middle to keep the area they cover (Cook et al. 2007, stochastic pruning). Grown
+   corners are new vertices (`ClusterDag::extra_vertices`, format version 2), copies of the
+   mesh's own; their error is `Settings::card_error` (0.25) of the cards' reach, so a crown thins
+   from where its cards are about eight pixels across. Texture drag is measured where each vertex
+   went (rings round the vertex it was collapsed onto, facing its way, covering it), and a whole
+   number of repeats apart is a seam, not a drag: measured against the nearest triangle anywhere
+   it had taken other branches and seams for drag, of metres, and held whole trees at full
+   detail. In Wilderness, 6.6 M triangles drawn became 3.4 M, and a tree builds in 20-70 ms.
 2. **Geometry pool** - done (`fyrox_graphics_wgpu::yoctite::GeometryPool`): every cluster of
    every mesh in shared GPU buffers, plus an instance buffer, uploaded once and updated as
    instances come and go; `ClusterView` draws clusters from it in one instanced draw, and

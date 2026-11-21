@@ -161,8 +161,11 @@ fn built(positions: &[[f32; 3]], indices: &[u32]) -> ClusterDag {
     build(&Mesh::new(positions, indices), Settings::default())
 }
 
-/// The clusters' shapes and the numbers linking them hold together.
-fn check_structure(dag: &ClusterDag, vertex_count: usize) {
+/// The clusters' shapes and the numbers linking them hold together. `vertex_count` is the
+/// mesh's own; the graph's extra vertices come after them, each a copy of one of the mesh's.
+fn check_structure(dag: &ClusterDag, mesh_vertex_count: usize) {
+    assert!(dag.extra_vertices.iter().all(|v| (v.source as usize) < mesh_vertex_count));
+    let vertex_count = mesh_vertex_count + dag.extra_vertices.len();
     for (i, c) in dag.clusters.iter().enumerate() {
         assert!(!c.triangles.is_empty(), "cluster {i} is empty");
         assert!(c.triangles.len() <= MAX_TRIANGLES, "cluster {i}: {} triangles", c.triangles.len());
@@ -468,6 +471,99 @@ fn foliage_cards_make_full_clusters_and_thin_out() {
     assert!(first <= 6000 / MAX_TRIANGLES * 5 / 4, "{first} clusters for 6000 triangles");
     assert!(dag.levels() > 1);
     assert!(dag.triangles_at(1) < dag.triangles_at(0));
+}
+
+/// The mesh's positions and the graph's extra vertices' after them, as the clusters index them.
+fn extended_positions(dag: &ClusterDag, positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
+    let mut all = positions.to_vec();
+    dag.extend_vertices(&mut all, |p, at| *p = at);
+    all
+}
+
+/// How much its clusters at `level` cover between them: their triangles' areas added up.
+fn area_at(dag: &ClusterDag, positions: &[[f32; 3]], level: u32) -> f64 {
+    dag.clusters
+        .iter()
+        .filter(|c| c.level == level)
+        .flat_map(|c| c.mesh_triangles())
+        .map(|t| {
+            let p = t.map(|v| math::V3::from_f32(positions[v as usize]));
+            (p[1] - p[0]).cross(p[2] - p[0]).length() * 0.5
+        })
+        .sum()
+}
+
+#[test]
+fn foliage_thins_out_keeping_its_cover() {
+    // Doubled, as a game draws them.
+    let (positions, mut indices) = cards(3000);
+    let back: Vec<u32> = indices.chunks_exact(3).flat_map(|t| [t[0], t[2], t[1]]).collect();
+    indices.extend(back);
+    let dag = built(&positions, &indices);
+    check_structure(&dag, positions.len());
+    check_monotonic(&dag);
+    assert!(!dag.extra_vertices.is_empty(), "no card grown");
+    let all = extended_positions(&dag, &positions);
+
+    // Each level about half the triangles of the one before, and covering about as much: half
+    // the cards, each grown to twice the area.
+    let full = area_at(&dag, &all, 0);
+    for level in 1..dag.levels() {
+        let (now, before) = (dag.triangles_at(level), dag.triangles_at(level - 1));
+        assert!(now * 10 <= before * 6, "level {level}: {now} triangles from {before}");
+        let cover = area_at(&dag, &all, level) / full;
+        if dag.triangles_at(level) >= 64 {
+            assert!((0.8..1.25).contains(&cover), "level {level} covers {cover:.2} of the full mesh");
+        }
+    }
+
+    // A card's two sides grow to the same place, so a grown card is still one welded sheet,
+    // seen from both sides.
+    let grown = Mesh::new(&all, &indices);
+    for c in dag.clusters.iter().filter(|c| c.level > 0) {
+        for t in c.mesh_triangles() {
+            let w = t.map(|v| grown.weld[v as usize]);
+            assert!(w[0] != w[1] && w[1] != w[2] && w[0] != w[2], "a grown triangle has no area");
+        }
+    }
+    let welded_back = dag
+        .clusters
+        .iter()
+        .filter(|c| c.level == 1)
+        .flat_map(|c| c.mesh_triangles())
+        .map(|t| {
+            let mut w = t.map(|v| grown.weld[v as usize]);
+            w.sort_unstable();
+            w
+        })
+        .fold(HashMap::<[u32; 3], u32>::new(), |mut seen, w| {
+            *seen.entry(w).or_default() += 1;
+            seen
+        });
+    assert!(welded_back.values().all(|&n| n == 2), "every grown triangle has its reversed twin");
+
+    // From close by, every card; from far off, a few grown ones - but never nothing.
+    let drawn = |eye: [f32; 3], threshold: f32| -> usize {
+        select(&dag, eye, threshold).iter().map(|&c| dag.clusters[c as usize].triangles.len()).sum()
+    };
+    let pixel = 75f32.to_radians() / 1080.0;
+    assert_eq!(drawn([5.0, 5.0, 5.0], pixel), indices.len() / 3);
+    let far = drawn([5.0, 5.0, 300.0], pixel);
+    assert!(far > 0 && far * 4 < indices.len() / 3, "{far} triangles drawn from 300 m");
+}
+
+#[test]
+fn loose_parts_of_something_solid_are_not_thinned() {
+    // A sphere with a few small cards near it - bolts, say: too few, and too little of it, to
+    // be foliage.
+    let (mut positions, mut indices) = icosphere(3);
+    let (card_positions, card_indices) = cards(4);
+    let first = positions.len() as u32;
+    positions.extend(card_positions);
+    indices.extend(card_indices.iter().map(|i| i + first));
+    let dag = built(&positions, &indices);
+    check_structure(&dag, positions.len());
+    assert!(dag.extra_vertices.is_empty(), "{} vertices grown", dag.extra_vertices.len());
 }
 
 #[test]

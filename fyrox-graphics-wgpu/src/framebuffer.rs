@@ -269,7 +269,9 @@ pub struct WgpuFrameBuffer {
 pub struct PendingClear {
     /// What every colour attachment is cleared to.
     pub color: Option<wgpu::Color>,
+    /// What the depth attachment is cleared to.
     pub depth: Option<f32>,
+    /// What the stencil is cleared to.
     pub stencil: Option<u32>,
 }
 

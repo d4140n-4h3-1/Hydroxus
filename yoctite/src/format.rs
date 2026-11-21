@@ -1,12 +1,13 @@
 //! A cluster graph as bytes, to build it once per mesh and keep it next to the model.
 //!
-//! Little-endian throughout: the magic `YOCT`, a version, then the clusters and the groups,
-//! each list preceded by its length.
+//! Little-endian throughout: the magic `YOCT`, a version, then the clusters, the groups and the
+//! extra vertices, each list preceded by its length.
 
-use crate::{Cluster, ClusterDag, Group, Sphere};
+use crate::{Cluster, ClusterDag, ExtraVertex, Group, Sphere};
 
 const MAGIC: &[u8; 4] = b"YOCT";
-const VERSION: u32 = 1;
+/// 2 added the extra vertices of grown foliage cards.
+const VERSION: u32 = 2;
 
 /// Why bytes are not a cluster graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +128,13 @@ impl ClusterDag {
             w.sphere(&g.bounds);
             w.u32(g.level);
         }
+        w.u32(self.extra_vertices.len() as u32);
+        for v in &self.extra_vertices {
+            w.u32(v.source);
+            for p in v.position {
+                w.f32(p);
+            }
+        }
         w.0
     }
 
@@ -178,6 +186,14 @@ impl ClusterDag {
                 level: r.u32()?,
             });
         }
+        let extra_count = r.len(16)?;
+        let mut extra_vertices = Vec::with_capacity(extra_count);
+        for _ in 0..extra_count {
+            extra_vertices.push(ExtraVertex {
+                source: r.u32()?,
+                position: [r.f32()?, r.f32()?, r.f32()?],
+            });
+        }
         if !r.0.is_empty() {
             return Err(FormatError::Corrupt);
         }
@@ -191,6 +207,10 @@ impl ClusterDag {
         if !consistent {
             return Err(FormatError::Corrupt);
         }
-        Ok(Self { clusters, groups })
+        Ok(Self {
+            clusters,
+            groups,
+            extra_vertices,
+        })
     }
 }
