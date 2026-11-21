@@ -594,9 +594,10 @@ pub struct SceneRenderPassContext<'a, 'b> {
     pub resource_manager: &'a ResourceManager,
 }
 
-/// A set of meshes another renderer draws, shared with it: see
-/// [`Renderer::set_taken_over_meshes`].
-pub type TakenOverMeshes = Rc<RefCell<fxhash::FxHashSet<Handle<Node>>>>;
+/// The meshes another renderer draws, scene by scene, shared with it: see
+/// [`Renderer::set_taken_over_meshes`]. Node handles are only told apart within a scene, so
+/// each scene has a set of its own.
+pub type TakenOverMeshes = Rc<RefCell<fxhash::FxHashMap<Handle<Scene>, fxhash::FxHashSet<Handle<Node>>>>>;
 
 /// A context for custom scene render passes that draw into the G-Buffer, as the renderer's own
 /// meshes do (see [`SceneRenderPass::on_gbuffer_render`]).
@@ -802,9 +803,9 @@ impl Renderer {
         self.light_shadow_tracer.is_some()
     }
 
-    /// Leaves the meshes in `meshes` out of what the renderer draws through cameras, because
-    /// another renderer draws them - into the G-Buffer from
-    /// [`SceneRenderPass::on_gbuffer_render`], say. They still cast shadows from shadow maps, and
+    /// Leaves the meshes in `meshes`, each scene's under its handle, out of what the renderer
+    /// draws of that scene through cameras, because another renderer draws them - into the
+    /// G-Buffer from [`SceneRenderPass::on_gbuffer_render`], say. They still cast shadows from shadow maps, and
     /// the set can change from frame to frame. [`None`] draws every mesh again.
     pub fn set_taken_over_meshes(&mut self, meshes: Option<TakenOverMeshes>) {
         self.taken_over_meshes = meshes;
@@ -1133,7 +1134,8 @@ impl Renderer {
             .visibility_cache
             .get_or_register(&scene.graph, observer.handle);
 
-        let taken_over = self.taken_over_meshes.as_ref().map(|set| set.borrow());
+        let taken_over = self.taken_over_meshes.as_ref().map(|sets| sets.borrow());
+        let skipped = taken_over.as_ref().and_then(|sets| sets.get(&scene_handle));
         let mut bundle_storage = RenderDataBundleStorage::from_graph_skipping(
             &scene.graph,
             observer.render_mask,
@@ -1145,7 +1147,7 @@ impl Renderer {
                 collect_environment: true,
             },
             &mut self.dynamic_surface_cache,
-            taken_over.as_deref(),
+            skipped,
         );
         drop(taken_over);
         if observer.reflection_probe_data.is_some() {

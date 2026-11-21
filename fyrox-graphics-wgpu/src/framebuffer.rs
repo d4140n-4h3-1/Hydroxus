@@ -263,6 +263,26 @@ pub struct WgpuFrameBuffer {
     backbuffer_depth_cache: RefCell<Option<(u32, u32, wgpu::Texture)>>,
 }
 
+/// A framebuffer's clear not yet applied: see [`WgpuFrameBuffer::take_pending_clear`]. What is
+/// [`None`] is kept as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PendingClear {
+    /// What every colour attachment is cleared to.
+    pub color: Option<wgpu::Color>,
+    pub depth: Option<f32>,
+    pub stencil: Option<u32>,
+}
+
+impl PendingClear {
+    /// The load operations a render pass starts with to apply it: colour, depth, stencil.
+    pub fn load_ops(&self) -> (wgpu::LoadOp<wgpu::Color>, wgpu::LoadOp<f32>, wgpu::LoadOp<u32>) {
+        fn load<V>(clear: Option<V>) -> wgpu::LoadOp<V> {
+            clear.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear)
+        }
+        (load(self.color), load(self.depth), load(self.stencil))
+    }
+}
+
 impl WgpuFrameBuffer {
     /// Creates a new offscreen framebuffer with the given depth and color attachments.
     pub fn new(
@@ -280,6 +300,19 @@ impl WgpuFrameBuffer {
             pending_clear_stencil: Cell::new(None),
             backbuffer_depth_cache: RefCell::new(None),
         })
+    }
+
+    /// Takes the clear asked for by [`GpuFrameBufferTrait::clear`] and not yet applied, for a
+    /// render pass recorded outside this framebuffer's own draws to apply as it starts. A clear
+    /// waits for the next draw through the framebuffer; a pass that draws into its attachments
+    /// another way, before any such draw, would otherwise draw over what the last frame left -
+    /// and the clear would land on top of it at the next draw.
+    pub fn take_pending_clear(&self) -> PendingClear {
+        PendingClear {
+            color: self.pending_clear_color.take(),
+            depth: self.pending_clear_depth.take(),
+            stencil: self.pending_clear_stencil.take(),
+        }
     }
 
     fn has_pending_clear(&self) -> bool {

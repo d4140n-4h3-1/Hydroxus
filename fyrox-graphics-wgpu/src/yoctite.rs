@@ -21,7 +21,12 @@
 //! levels of detail chosen. The GPU will make that list itself, culling and choosing levels of
 //! detail every frame, in the next phase.
 
-use crate::{sampler::WgpuSampler, server::WgpuGraphicsServer, texture::WgpuTexture};
+use crate::{
+    framebuffer::{PendingClear, WgpuFrameBuffer},
+    sampler::WgpuSampler,
+    server::WgpuGraphicsServer,
+    texture::WgpuTexture,
+};
 use fyrox_graphics::{
     error::FrameworkError,
     framebuffer::GpuFrameBuffer,
@@ -1483,18 +1488,27 @@ impl GBufferDrawer {
 
         let device = &server.state.device;
         server.flush_active_pass();
+        // When the renderer drew none of its own meshes into the G-Buffer - all of them
+        // Yoctite's - its clear is still waiting for a draw: this pass applies it, or it would
+        // draw over the last frame's G-Buffer, and the clear would wipe this frame's out at the
+        // renderer's next draw into it.
+        let clear = gbuffer
+            .as_any()
+            .downcast_ref::<WgpuFrameBuffer>()
+            .map(WgpuFrameBuffer::take_pending_clear)
+            .unwrap_or_default();
         let mut encoder = server.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("YoctiteGBuffer"),
             })
         });
-        let drawn = self.record(device, &mut encoder, pool, culler, parameters, &colour, &depth, &resolved);
+        let drawn = self.record(device, &mut encoder, pool, culler, parameters, &colour, &depth, clear, &resolved);
         *server.frame_encoder.borrow_mut() = Some(encoder);
         drawn
     }
 
     /// As [`Self::draw`], into `colour` (diffuse, normal, ambient, material, decal mask) and
-    /// `depth`, recorded into `encoder`.
+    /// `depth`, recorded into `encoder`, applying `clear` first.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -1505,6 +1519,7 @@ impl GBufferDrawer {
         parameters: &CullParameters,
         colour: &[wgpu::Texture],
         depth: &wgpu::Texture,
+        clear: PendingClear,
         materials: &[ResolvedMaterial],
     ) -> Result<GBufferDraws, FrameworkError> {
         if colour.len() != 5 {
@@ -1599,8 +1614,9 @@ impl GBufferDrawer {
             .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
             .collect();
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let (colour_load, depth_load, stencil_load) = clear.load_ops();
         let keep = wgpu::Operations {
-            load: wgpu::LoadOp::Load,
+            load: colour_load,
             store: wgpu::StoreOp::Store,
         };
         let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colour_views
@@ -1621,11 +1637,11 @@ impl GBufferDrawer {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: depth_load,
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: has_stencil.then_some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: stencil_load,
                     store: wgpu::StoreOp::Store,
                 }),
             }),
@@ -2114,7 +2130,9 @@ mod test {
         let mut drawer = GBufferDrawer::new(&device);
         let mut encoder = device.create_command_encoder(&Default::default());
         {
-            // Cleared as the renderer clears it.
+            // What the last frame left: red all over, and nearer than anything, which would hide
+            // everything drawn - unless the renderer's clear, still waiting for a draw when
+            // Yoctite has every mesh, is applied first.
             let views: Vec<_> = colour.iter().map(|t| t.create_view(&Default::default())).collect();
             let depth_view = depth.create_view(&Default::default());
             let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2126,14 +2144,14 @@ mod test {
                             view,
                             resolve_target: None,
                             depth_slice: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::RED), store: wgpu::StoreOp::Store },
                         })
                     })
                     .collect::<Vec<_>>(),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
-                    stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1), store: wgpu::StoreOp::Store }),
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -2141,7 +2159,22 @@ mod test {
             });
         }
         let drawn = drawer
-            .record(&device, &mut encoder, &pool, &mut culler, &parameters, &colour, &depth, &materials)
+            .record(
+                &device,
+                &mut encoder,
+                &pool,
+                &mut culler,
+                &parameters,
+                &colour,
+                &depth,
+                // As the renderer clears it.
+                PendingClear {
+                    color: Some(wgpu::Color::TRANSPARENT),
+                    depth: Some(1.0),
+                    stencil: Some(0),
+                },
+                &materials,
+            )
             .expect("drawn");
         queue.submit([encoder.finish()]);
         assert_eq!(drawn.draw_calls, 2);
