@@ -80,6 +80,8 @@ pub mod format_helpers;
 pub mod framebuffer;
 /// Geometry buffer implementation (vertex + index buffers for mesh rendering).
 pub mod geometry_buffer;
+/// Timing the frame's sections on the GPU.
+pub mod gpu_timer;
 /// Shader compilation and program management.
 pub mod program;
 /// GPU query stub implementation.

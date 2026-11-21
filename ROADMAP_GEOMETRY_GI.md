@@ -1,4 +1,4 @@
-# Yoctite (virtual geometry) and dynamic global illumination
+# Yoctite (virtual geometry) and Candelite (dynamic global illumination)
 
 A Rust reimplementation, for Hydroxus's wgpu (Vulkan) renderer, of the techniques behind Unreal's
 Nanite (virtualized, cluster-based geometry) and Lumen (dynamic global illumination), from their
@@ -77,7 +77,10 @@ What each one buys:
 Ray-traced shadows keep tracing the full-detail meshes. Skinned and moving meshes stay on the
 existing path.
 
-## Dynamic global illumination (Lumen-style, hardware ray tracing)
+## Candelite: dynamic global illumination (hardware ray tracing)
+
+Named for the candela, the unit of luminous intensity, as Yoctite is for the smallest of
+prefixes. The method follows the published description of Lumen cited above.
 
 1. **Surface cache**: each mesh is given a few "cards" (oriented boxes over its surface); its
    albedo, normal and emissive are captured into an atlas once.
@@ -94,3 +97,11 @@ existing path.
 
 Virtual geometry 1 to 4 first: that is where the frame time goes. GI follows once the visibility
 buffer exists, since its card capture reuses it.
+
+Measured since, on the GPU (`GraphicsServer::gpu_timings`, timestamps between the renderer's
+sections; Wilderness logs them with WILDERNESS_STATS=1), Wilderness with Yoctite, RX 7600,
+800x600: the whole G-buffer - every tree, by Yoctite - takes 1.5-3 ms, and the sun's shadows
+the rest: 12 ms traced soft, 7.7 ms traced hard, 8.9 ms from shadow maps, against well under
+1 ms for everything else. Occlusion culling, the visibility buffer and the software rasterizer
+can only win back part of the first; the shadows are where the frame goes, and Candelite will
+trace the same alpha-tested foliage.

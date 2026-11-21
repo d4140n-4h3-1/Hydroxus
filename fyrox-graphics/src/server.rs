@@ -199,6 +199,20 @@ pub trait GraphicsServer: GraphicsServerAsAny {
     /// Returns GPU pipeline statistics. See [`PipelineStatistics`] for more info.
     fn pipeline_statistics(&self) -> PipelineStatistics;
 
+    /// Marks the end of a section of the frame named `label`, for timing on the GPU: the time
+    /// from the mark before it to this one counts as `label`'s (see [`Self::gpu_timings`]). A
+    /// frame's first mark only starts the clock. Does nothing where the GPU cannot time itself.
+    fn gpu_mark(&self, _label: &'static str) {}
+
+    /// How long the GPU spent on each section of a frame marked with [`Self::gpu_mark`], in
+    /// milliseconds, in the order first marked: averaged over the frames timed since the last
+    /// call, summed where a section is marked more than once a frame (for each camera, say). A
+    /// frame or two behind, as the GPU's times are read back without waiting for them. Empty
+    /// where the GPU cannot time itself.
+    fn gpu_timings(&self) -> Vec<(&'static str, f32)> {
+        Vec::new()
+    }
+
     /// Swaps the front and back buffers and thus presenting the final image on screen. There could
     /// be more than two buffers, and it is up to the graphics server implementation to choose the
     /// right amount, but it can't be less than two.

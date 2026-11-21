@@ -382,6 +382,7 @@ impl DeferredLightRenderer {
                 renderer_resources,
             )?;
         }
+        server.gpu_mark("Lighting: SSAO");
 
         // Render skybox (if any).
         if let Some(skybox) = scene.skybox_ref().and_then(|s| s.cubemap_ref()) {
@@ -572,6 +573,7 @@ impl DeferredLightRenderer {
             None,
         )?;
 
+        server.gpu_mark("Lighting: sky and ambient");
         for light in render_data_bundle.light_sources.iter() {
             let distance_to_camera = (light.position - observer.position.translation).norm();
 
@@ -780,6 +782,7 @@ impl DeferredLightRenderer {
                     LightSourceKind::Directional { .. } => settings.csm_settings.enabled,
                     LightSourceKind::Unknown => false,
                 };
+            server.gpu_mark("Lighting: light volumes");
             let traced_shadow = match light_shadow_tracer.as_deref_mut() {
                 Some(tracer) if needs_lighting && wants_shadows => {
                     tracer.trace(LightShadowTraceContext {
@@ -797,6 +800,7 @@ impl DeferredLightRenderer {
                 _ => None,
             };
             let traced_shadows = traced_shadow.is_some();
+            server.gpu_mark("Lighting: ray-traced shadows");
             if traced_shadows {
                 light_stats.traced_shadows_rendered += 1;
             }

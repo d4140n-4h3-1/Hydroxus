@@ -255,6 +255,7 @@ impl GBuffer {
             },
         )?;
 
+        server.gpu_mark("G-buffer: meshes");
         // Custom passes' own geometry, after the meshes, so that the decals and the occlusion
         // test see it too.
         for render_pass in scene_render_passes {
@@ -270,6 +271,7 @@ impl GBuffer {
                 observer,
             })?;
         }
+        server.gpu_mark("G-buffer: custom passes (Yoctite)");
 
         if quality_settings.use_occlusion_culling {
             let mut objects = FxHashSet::default();

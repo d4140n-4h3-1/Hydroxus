@@ -211,6 +211,8 @@ pub struct WgpuGraphicsServer {
     pub backbuffer_needs_clear: Cell<bool>,
     /// Cached depth-stencil texture for the backbuffer, with its (width, height).
     backbuffer_depth_stencil: RefCell<Option<(u32, u32, GpuTexture)>>,
+    /// Times the frame's sections on the GPU, where the device can.
+    gpu_timer: Option<crate::gpu_timer::GpuTimer>,
     /// Per-frame command encoder. Lazily created on first draw, submitted in swap_buffers.
     /// Storing it on the server (not per-framebuffer) because multiple framebuffers
     /// (G-Buffer, HDR, backbuffer) share the same frame and benefit from a single submit.
@@ -330,6 +332,11 @@ impl WgpuGraphicsServer {
         if ray_tracing {
             required_features |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
         }
+        // Timestamps between passes, to time the frame's sections on the GPU (`gpu_timer`).
+        let timestamps = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        if adapter_features.contains(timestamps) {
+            required_features |= timestamps;
+        }
 
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
@@ -422,6 +429,7 @@ impl WgpuGraphicsServer {
                 ],
             });
 
+        let gpu_timer = crate::gpu_timer::GpuTimer::new(&device, &queue);
         let dummy_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("DummyVB"),
             size: crate::framebuffer::DUMMY_VERTEX_STRIDE,
@@ -453,6 +461,7 @@ impl WgpuGraphicsServer {
             current_frame: RefCell::new(None),
             backbuffer_needs_clear: Cell::new(true),
             backbuffer_depth_stencil: RefCell::new(None),
+            gpu_timer,
             frame_encoder: RefCell::new(None),
             submissions: Cell::new(0),
             active_pass: RefCell::new(None),
@@ -811,11 +820,41 @@ impl GraphicsServer for WgpuGraphicsServer {
     fn pipeline_statistics(&self) -> PipelineStatistics {
         *self.pipeline_statistics.borrow()
     }
+    fn gpu_mark(&self, label: &'static str) {
+        let Some(timer) = &self.gpu_timer else {
+            return;
+        };
+        self.flush_active_pass();
+        let mut encoder = self.frame_encoder.borrow_mut().take().unwrap_or_else(|| {
+            self.state
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("GpuMark") })
+        });
+        timer.mark(&mut encoder, label);
+        *self.frame_encoder.borrow_mut() = Some(encoder);
+    }
+    fn gpu_timings(&self) -> Vec<(&'static str, f32)> {
+        self.gpu_timer.as_ref().map(|t| t.timings()).unwrap_or_default()
+    }
     fn swap_buffers(&self) -> Result<(), FrameworkError> {
         // Submit all batched draw commands from this frame
         self.flush_active_pass();
-        if let Some(encoder) = self.frame_encoder.borrow_mut().take() {
+        let mut encoder = self.frame_encoder.borrow_mut().take();
+        // The frame's timestamps copied out with its last commands, and read back once they run.
+        let timed = self.gpu_timer.as_ref().and_then(|timer| {
+            let encoder = encoder.get_or_insert_with(|| {
+                self.state
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("GpuTimer") })
+            });
+            timer.end_frame(encoder)
+        });
+        if let Some(encoder) = encoder {
             self.submit_frame_encoder(encoder);
+        }
+        if let (Some(timer), Some(slot)) = (&self.gpu_timer, timed) {
+            timer.read_back(slot);
+            timer.collect();
         }
 
         let frame = self.current_frame.borrow_mut().take();

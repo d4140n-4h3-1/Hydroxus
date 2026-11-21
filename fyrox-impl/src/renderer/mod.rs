@@ -811,6 +811,13 @@ impl Renderer {
         self.taken_over_meshes = meshes;
     }
 
+    /// How long the GPU spent on each section of the frame, in milliseconds, averaged over the
+    /// frames timed since last asked: see [`GraphicsServer::gpu_timings`]. Empty where the GPU
+    /// cannot time itself.
+    pub fn gpu_timings(&self) -> Vec<(&'static str, f32)> {
+        self.server.gpu_timings()
+    }
+
     /// Adds a custom render pass.
     pub fn add_render_pass(&mut self, pass: Rc<RefCell<dyn SceneRenderPass>>) {
         self.scene_render_passes.push(pass);
@@ -1178,6 +1185,7 @@ impl Renderer {
             scene_handle,
             elapsed_time,
         })?;
+        server.gpu_mark("G-buffer: decals and the rest");
 
         server.set_polygon_fill_mode(PolygonFace::FrontAndBack, PolygonFillMode::Fill);
 
@@ -1238,6 +1246,7 @@ impl Renderer {
 
         render_data.statistics += light_stats;
         render_data.statistics += pass_stats;
+        server.gpu_mark("Lighting: shadow maps and light passes");
 
         let depth = render_data.gbuffer.depth();
 
@@ -1255,6 +1264,7 @@ impl Renderer {
             )?;
         }
 
+        server.gpu_mark("Fog");
         {
             let _debug_scope = server.begin_scope("ForwardRendering");
 
@@ -1314,6 +1324,8 @@ impl Renderer {
                         resource_manager,
                     })?;
         }
+
+        server.gpu_mark("Forward and effects");
 
         // Convert high dynamic range frame to low dynamic range (sRGB) with tone mapping and gamma correction.
         let mut dest_buf = 0;
@@ -1419,6 +1431,7 @@ impl Renderer {
                         resource_manager,
                     })?;
         }
+        server.gpu_mark("Tone mapping and after");
 
         Ok(render_data)
     }
@@ -1615,6 +1628,8 @@ impl Renderer {
         let backbuffer_width = self.frame_size.0 as f32;
         let backbuffer_height = self.frame_size.1 as f32;
 
+        // The clock starts.
+        self.server.gpu_mark("Start");
         for (scene_handle, scene) in scenes.pair_iter().filter(|(_, s)| *s.enabled) {
             self.render_scene(scene_handle, scene, elapsed_time, dt, resource_manager)?;
         }
@@ -1637,6 +1652,8 @@ impl Renderer {
             screen_matrix,
             &self.renderer_resources,
         )?;
+
+        self.server.gpu_mark("UI");
 
         self.statistics.geometry_cache_size = self.geometry_cache.alive_count();
         self.statistics.texture_cache_size = self.texture_cache.alive_count();
