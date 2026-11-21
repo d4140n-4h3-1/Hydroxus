@@ -849,9 +849,183 @@ pub struct CullStats {
     pub triangles: u32,
     /// Whether the list ran out of room; it is made bigger for the frames after.
     pub overflowed: bool,
+    /// Of the clusters chosen, how many - and how many triangles - were hidden behind the depth
+    /// pyramid of the frame before, seen as it was (see [`DepthPyramid`]).
+    pub hidden_clusters: u32,
+    /// Their triangles.
+    pub hidden_triangles: u32,
 }
 
 const CULL_SHADER: &str = include_str!("shaders/yoctite_cull.wgsl");
+const PYRAMID_SHADER: &str = include_str!("shaders/yoctite_hzb.wgsl");
+const PYRAMID_DOWN_SHADER: &str = include_str!("shaders/yoctite_hzb_down.wgsl");
+
+/// A depth pyramid (hierarchical Z) of a depth buffer: level by level, each texel the farthest
+/// depth of the 2x2 below it, level 0 half the screen across - see `shaders/yoctite_hzb.wgsl`.
+/// Something whose nearest point is farther than the pyramid's depths everywhere over its
+/// rectangle on screen is hidden. Kept with the view and projection it was seen through.
+pub struct DepthPyramid {
+    from_depth: wgpu::ComputePipeline,
+    down: wgpu::ComputePipeline,
+    from_depth_layout: wgpu::BindGroupLayout,
+    down_layout: wgpu::BindGroupLayout,
+    /// The pyramid, the screen it was made for, and how many levels it has.
+    texture: Option<(wgpu::Texture, [u32; 2], u32)>,
+    view_projection: [[f32; 4]; 4],
+    /// Whether it holds a depth buffer yet.
+    built: bool,
+}
+
+impl DepthPyramid {
+    /// The pyramid's pipelines, made once; the pyramid itself at its first build.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format: wgpu::TextureFormat::R32Float,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        };
+        let source = |sample_type| wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let from_depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctitePyramidFromDepth"),
+            entries: &[source(wgpu::TextureSampleType::Depth), storage(1)],
+        });
+        let down_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctitePyramidDown"),
+            entries: &[source(wgpu::TextureSampleType::Float { filterable: false }), storage(1)],
+        });
+        let pipeline = |label: &str, source: &str, entry: &str, layout: &wgpu::BindGroupLayout| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        Self {
+            from_depth: pipeline("YoctitePyramidFromDepth", PYRAMID_SHADER, "from_depth", &from_depth_layout),
+            down: pipeline("YoctitePyramidDown", PYRAMID_DOWN_SHADER, "down", &down_layout),
+            from_depth_layout,
+            down_layout,
+            texture: None,
+            view_projection: [[0.0; 4]; 4],
+            built: false,
+        }
+    }
+
+    /// Builds the pyramid of `depth` (a depth or depth-stencil texture, the whole screen) as
+    /// `view_projection` sees it, recorded into `encoder`. A depth buffer shaders cannot read
+    /// leaves it without one.
+    pub fn build(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        depth: &wgpu::Texture,
+        view_projection: [[f32; 4]; 4],
+    ) {
+        if !depth.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING) {
+            self.built = false;
+            return;
+        }
+        let screen = [depth.width(), depth.height()];
+        if self.texture.as_ref().is_none_or(|(_, made_for, _)| *made_for != screen) {
+            let size = [screen[0].div_ceil(2).max(1), screen[1].div_ceil(2).max(1)];
+            let levels = 32 - size[0].max(size[1]).leading_zeros();
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("YoctitePyramid"),
+                size: wgpu::Extent3d {
+                    width: size[0],
+                    height: size[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: levels,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.texture = Some((texture, screen, levels));
+            self.built = false;
+        }
+        let (texture, _, levels) = self.texture.as_ref().expect("made above");
+        let level = |n: u32| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: n,
+                mip_level_count: Some(1),
+                ..Default::default()
+            })
+        };
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("YoctitePyramid"),
+            timestamp_writes: None,
+        });
+        for n in 0..*levels {
+            let target = level(n);
+            let (pipeline, layout, source) = if n == 0 {
+                (&self.from_depth, &self.from_depth_layout, depth_view.clone())
+            } else {
+                (&self.down, &self.down_layout, level(n - 1))
+            };
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("YoctitePyramid"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&source),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&target),
+                    },
+                ],
+            });
+            let width = (texture.width() >> n).max(1);
+            let height = (texture.height() >> n).max(1);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        self.view_projection = view_projection;
+        self.built = true;
+    }
+
+    /// The whole pyramid, every level, with the view it was seen through, the screen's size and
+    /// how many levels it has - once it has been built.
+    pub fn view(&self) -> Option<(wgpu::TextureView, [[f32; 4]; 4], [u32; 2], u32)> {
+        let (texture, screen, levels) = self.texture.as_ref().filter(|_| self.built)?;
+        Some((texture.create_view(&Default::default()), self.view_projection, *screen, *levels))
+    }
+}
 
 /// Where in [`Culler::args`] the draw of every cluster listed is, in bytes.
 pub const ALL_DRAW_OFFSET: u64 = 16;
@@ -872,6 +1046,13 @@ struct CullUniforms {
     capacity: u32,
     cluster_vertices: u32,
     material_slots: u32,
+    pyramid_view_projection: [[f32; 4]; 4],
+    screen_size: [f32; 2],
+    pyramid_levels: u32,
+    pyramid_valid: u32,
+    phase: u32,
+    material_stride: u32,
+    _padding: [u32; 2],
 }
 
 /// The six planes of the view of `view_projection` (column by column, OpenGL's clip space),
@@ -922,6 +1103,7 @@ pub struct Culler {
     instances: wgpu::ComputePipeline,
     prepare: wgpu::ComputePipeline,
     clusters: wgpu::ComputePipeline,
+    occluded: wgpu::ComputePipeline,
     offsets: wgpu::ComputePipeline,
     scatter: wgpu::ComputePipeline,
     counts: wgpu::Buffer,
@@ -943,10 +1125,17 @@ pub struct Culler {
     state: Readback,
     mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stats: Option<CullStats>,
+    /// The depth pyramid of the frame before, which the culling tests clusters against; and a
+    /// texel of one standing in before there is one.
+    pub pyramid: DepthPyramid,
+    no_pyramid: wgpu::TextureView,
 }
 
 /// How many clusters a draw list holds to begin with.
 const FIRST_CAPACITY: u32 = 1 << 16;
+/// The lists' bytes for each cluster they can hold: five lists - the first phase's as listed and
+/// sorted, those put aside, the second phase's as listed and sorted - of two words each.
+const LIST_BYTES: u64 = 5 * 8;
 
 fn storage_buffer(device: &wgpu::Device, label: &str, size: u64, more: wgpu::BufferUsages) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -991,6 +1180,16 @@ impl Culler {
                 buffer(5, false),
                 buffer(6, false),
                 buffer(7, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let args_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1028,32 +1227,55 @@ impl Culler {
             instances: pipeline("cull_instances", &without_args),
             prepare: pipeline("prepare", &with_args),
             clusters: pipeline("cull_clusters", &without_args),
+            occluded: pipeline("cull_occluded", &without_args),
             offsets: pipeline("offsets", &with_args),
             scatter: pipeline("scatter", &without_args),
             layout,
             args_layout,
-            counts: storage_buffer(device, "YoctiteCounts", 16, wgpu::BufferUsages::empty()),
+            counts: storage_buffer(device, "YoctiteCounts", 32, wgpu::BufferUsages::empty()),
             args: storage_buffer(
                 device,
                 "YoctiteArgs",
-                material_draw_offset(material_capacity),
+                material_draw_offset(2 * material_capacity),
                 wgpu::BufferUsages::INDIRECT,
             ),
-            lists: storage_buffer(device, "YoctiteLists", FIRST_CAPACITY as u64 * 16, wgpu::BufferUsages::empty()),
-            materials: storage_buffer(device, "YoctiteMaterialRanges", material_capacity as u64 * 16, wgpu::BufferUsages::empty()),
+            lists: storage_buffer(device, "YoctiteLists", FIRST_CAPACITY as u64 * LIST_BYTES, wgpu::BufferUsages::empty()),
+            materials: storage_buffer(
+                device,
+                "YoctiteMaterialRanges",
+                2 * material_capacity as u64 * 16,
+                wgpu::BufferUsages::empty(),
+            ),
             capacity: FIRST_CAPACITY,
             material_capacity,
             visible: storage_buffer(device, "YoctiteVisible", 1024 * 4, wgpu::BufferUsages::empty()),
             visible_capacity: 1024,
             readback: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("YoctiteCountsRead"),
-                size: 16,
+                size: 32,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             state: Readback::Idle,
             mapped: Default::default(),
             stats: None,
+            pyramid: DepthPyramid::new(device),
+            no_pyramid: device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("YoctiteNoPyramid"),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default()),
         }
     }
 
@@ -1071,7 +1293,7 @@ impl Culler {
     /// Makes the lists hold `capacity` clusters, for the next culling.
     pub fn set_capacity(&mut self, device: &wgpu::Device, capacity: u32) {
         self.capacity = capacity.max(1);
-        self.lists = storage_buffer(device, "YoctiteLists", self.capacity as u64 * 16, wgpu::BufferUsages::empty());
+        self.lists = storage_buffer(device, "YoctiteLists", self.capacity as u64 * LIST_BYTES, wgpu::BufferUsages::empty());
     }
 
     /// Takes in the counts read back, if they have arrived, and starts reading back the last
@@ -1090,20 +1312,24 @@ impl Culler {
                 self.state = Readback::Mapping;
             }
             Readback::Mapping if self.mapped.load(Ordering::Acquire) => {
-                let counts: [u32; 4] = {
+                let counts: [u32; 8] = {
                     let data = self.readback.slice(..).get_mapped_range().expect("mapped");
-                    bytemuck::pod_read_unaligned(&data[..16])
+                    bytemuck::pod_read_unaligned(&data[..32])
                 };
                 self.readback.unmap();
                 let stats = CullStats {
                     instances: counts[0],
-                    clusters: counts[1],
-                    triangles: counts[2],
+                    clusters: counts[1] + counts[6],
+                    triangles: counts[2] + counts[7],
                     overflowed: counts[3] != 0,
+                    hidden_clusters: counts[4].saturating_sub(counts[6]),
+                    hidden_triangles: counts[5].saturating_sub(counts[7]),
                 };
-                // Room for what it chose, and some to spare, from the next culling on.
-                if stats.clusters > self.capacity {
-                    let wanted = (stats.clusters as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64 / 2) as u32;
+                // Room for what it chose, and some to spare, from the next culling on: in the
+                // first phase's list, and in the clusters put aside.
+                let needed = counts[1].max(counts[4]);
+                if needed > self.capacity {
+                    let wanted = (needed as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64 / 2) as u32;
                     self.set_capacity(device, wanted);
                 }
                 self.stats = Some(stats);
@@ -1114,7 +1340,8 @@ impl Culler {
     }
 
     /// Records the culling of `pool`'s instances as `parameters` see them into `encoder`: its
-    /// lists and draw arguments are ready for draws recorded after it.
+    /// lists and draw arguments are ready for draws recorded after it. In one phase, with no
+    /// depths to hide anything.
     pub fn record(
         &mut self,
         device: &wgpu::Device,
@@ -1122,28 +1349,88 @@ impl Culler {
         pool: &GeometryPool,
         parameters: &CullParameters,
     ) {
-        self.poll(device);
+        self.record_phase(device, encoder, pool, parameters, 0, false);
+        self.copy_counts(encoder);
+    }
+
+    /// Records the first of the two phases of culling with the depths of the frame before (see
+    /// `shaders/yoctite_cull.wgsl`): what they hid put aside, the rest ready for the first set of
+    /// draws (at [`material_draw_offset`] of each slot, the list sorted from [`Self::capacity`]).
+    /// Then build [`Self::pyramid`] of what was drawn, and record [`Self::record_second`].
+    pub fn record_first(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        parameters: &CullParameters,
+    ) {
+        self.record_phase(device, encoder, pool, parameters, 0, true);
+    }
+
+    /// Records the second phase: what the first put aside, tried against [`Self::pyramid`] as
+    /// built since, and what it does not hide made ready for the second set of draws (at
+    /// [`material_draw_offset`] of [`Self::material_stride`] plus each slot, the list sorted from
+    /// four times [`Self::capacity`], its material ranges [`Self::material_stride`] on).
+    pub fn record_second(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        parameters: &CullParameters,
+    ) {
+        self.record_phase(device, encoder, pool, parameters, 1, true);
+        self.copy_counts(encoder);
+    }
+
+    /// How far on the second phase's material ranges and draws are, in slots.
+    pub fn material_stride(&self) -> u32 {
+        self.material_capacity
+    }
+
+    fn copy_counts(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.state == Readback::Idle {
+            encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, 32);
+            self.state = Readback::Copied;
+        }
+    }
+
+    fn record_phase(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        parameters: &CullParameters,
+        phase: u32,
+        occlusion: bool,
+    ) {
         let slots = pool.instance_slots();
-        if slots > self.visible_capacity {
-            self.visible_capacity = slots.next_power_of_two();
-            self.visible = storage_buffer(device, "YoctiteVisible", self.visible_capacity as u64 * 4, wgpu::BufferUsages::empty());
-        }
         let material_slots = parameters.material_slots.max(1);
-        if material_slots > self.material_capacity {
-            self.material_capacity = material_slots.next_power_of_two();
-            self.args = storage_buffer(
-                device,
-                "YoctiteArgs",
-                material_draw_offset(self.material_capacity),
-                wgpu::BufferUsages::INDIRECT,
-            );
-            self.materials = storage_buffer(
-                device,
-                "YoctiteMaterialRanges",
-                self.material_capacity as u64 * 16,
-                wgpu::BufferUsages::empty(),
-            );
+        if phase == 0 {
+            self.poll(device);
+            if slots > self.visible_capacity {
+                self.visible_capacity = slots.next_power_of_two();
+                self.visible =
+                    storage_buffer(device, "YoctiteVisible", self.visible_capacity as u64 * 4, wgpu::BufferUsages::empty());
+            }
+            if material_slots > self.material_capacity {
+                self.material_capacity = material_slots.next_power_of_two();
+                self.args = storage_buffer(
+                    device,
+                    "YoctiteArgs",
+                    material_draw_offset(2 * self.material_capacity),
+                    wgpu::BufferUsages::INDIRECT,
+                );
+                self.materials = storage_buffer(
+                    device,
+                    "YoctiteMaterialRanges",
+                    2 * self.material_capacity as u64 * 16,
+                    wgpu::BufferUsages::empty(),
+                );
+            }
         }
+        // The first phase tests against the frame before's depths, the second against those
+        // drawn since.
+        let pyramid = self.pyramid.view().filter(|_| occlusion);
         let uniforms = CullUniforms {
             planes: frustum_planes(&parameters.view_projection),
             eye: parameters.eye,
@@ -1152,13 +1439,20 @@ impl Culler {
             capacity: self.capacity,
             cluster_vertices: CLUSTER_VERTICES,
             material_slots,
+            pyramid_view_projection: pyramid.as_ref().map_or([[0.0; 4]; 4], |p| p.1),
+            screen_size: pyramid.as_ref().map_or([1.0; 2], |p| [p.2[0] as f32, p.2[1] as f32]),
+            pyramid_levels: pyramid.as_ref().map_or(1, |p| p.3),
+            pyramid_valid: pyramid.is_some() as u32,
+            phase,
+            material_stride: self.material_capacity,
+            _padding: [0; 2],
         };
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("YoctiteCull"),
             contents: bytemuck::bytes_of(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let entries = [
+        let mut entries = [
             &uniforms,
             pool.clusters.buffer(),
             pool.meshes.buffer(),
@@ -1175,6 +1469,11 @@ impl Culler {
             resource: buffer.as_entire_binding(),
         })
         .collect::<Vec<_>>();
+        let pyramid_view = pyramid.as_ref().map_or(&self.no_pyramid, |p| &p.0);
+        entries.push(wgpu::BindGroupEntry {
+            binding: 8,
+            resource: wgpu::BindingResource::TextureView(pyramid_view),
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("YoctiteCull"),
             layout: &self.layout,
@@ -1188,12 +1487,12 @@ impl Culler {
                 resource: self.args.as_entire_binding(),
             }],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("YoctiteCull"),
-                timestamp_writes: None,
-            });
-            pass.set_bind_group(0, &bind_group, &[]);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("YoctiteCull"),
+            timestamp_writes: None,
+        });
+        pass.set_bind_group(0, &bind_group, &[]);
+        if phase == 0 {
             pass.set_pipeline(&self.reset);
             pass.set_bind_group(1, &args, &[]);
             pass.dispatch_workgroups(material_slots.div_ceil(64), 1, 1);
@@ -1204,16 +1503,15 @@ impl Culler {
             pass.dispatch_workgroups(1, 1, 1);
             pass.set_pipeline(&self.clusters);
             pass.dispatch_workgroups_indirect(&self.args, 0);
-            pass.set_pipeline(&self.offsets);
-            pass.set_bind_group(1, &args, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-            pass.set_pipeline(&self.scatter);
+        } else {
+            pass.set_pipeline(&self.occluded);
             pass.dispatch_workgroups(self.capacity.div_ceil(64).min(65535), 1, 1);
         }
-        if self.state == Readback::Idle {
-            encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, 16);
-            self.state = Readback::Copied;
-        }
+        pass.set_pipeline(&self.offsets);
+        pass.set_bind_group(1, &args, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&self.scatter);
+        pass.dispatch_workgroups(self.capacity.div_ceil(64).min(65535), 1, 1);
     }
 }
 
@@ -1532,45 +1830,53 @@ impl GBufferDrawer {
             colour: colour.iter().map(|t| t.format()).collect(),
             depth: depth.format(),
         };
-        culler.record(device, encoder, pool, parameters);
+        let pipeline = self.pipeline(device, &formats).clone();
+        // The first phase of culling, against the frame before's depths.
+        culler.record_first(device, encoder, pool, parameters);
 
         #[repr(C)]
         #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         struct Frame {
             view_projection: [[f32; 4]; 4],
             sorted_start: u32,
-            _padding: [u32; 3],
+            range_start: u32,
+            _padding: [u32; 2],
         }
-        let frame = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("YoctiteGBufferFrame"),
-            contents: bytemuck::bytes_of(&Frame {
-                view_projection: parameters.view_projection,
-                sorted_start: culler.capacity(),
-                _padding: [0; 3],
-            }),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let frame_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("YoctiteGBufferFrame"),
-            layout: &self.frame_layout,
-            entries: &[
-                &frame,
-                pool.vertices.buffer(),
-                pool.cluster_vertices.buffer(),
-                pool.triangles.buffer(),
-                pool.clusters.buffer(),
-                pool.instances.buffer(),
-                &culler.lists,
-                &culler.materials,
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(binding, buffer)| wgpu::BindGroupEntry {
-                binding: binding as u32,
-                resource: buffer.as_entire_binding(),
+        // A phase's draws read its sorted list and its material ranges.
+        let frame_group = |culler: &Culler, sorted_start: u32, range_start: u32| {
+            let frame = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("YoctiteGBufferFrame"),
+                contents: bytemuck::bytes_of(&Frame {
+                    view_projection: parameters.view_projection,
+                    sorted_start,
+                    range_start,
+                    _padding: [0; 2],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("YoctiteGBufferFrame"),
+                layout: &self.frame_layout,
+                entries: &[
+                    &frame,
+                    pool.vertices.buffer(),
+                    pool.cluster_vertices.buffer(),
+                    pool.triangles.buffer(),
+                    pool.clusters.buffer(),
+                    pool.instances.buffer(),
+                    &culler.lists,
+                    &culler.materials,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect::<Vec<_>>(),
             })
-            .collect::<Vec<_>>(),
-        });
+        };
+        let first_group = frame_group(culler, culler.capacity(), 0);
 
         // Each material's own bind group: what it reads, and its textures.
         let mut groups = Vec::with_capacity(materials.len());
@@ -1608,55 +1914,70 @@ impl GBufferDrawer {
             groups.push((material.slot, group));
         }
 
-        let pipeline = self.pipeline(device, &formats).clone();
         let colour_views: Vec<wgpu::TextureView> = colour
             .iter()
             .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
             .collect();
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-        let (colour_load, depth_load, stencil_load) = clear.load_ops();
-        let keep = wgpu::Operations {
-            load: colour_load,
-            store: wgpu::StoreOp::Store,
-        };
-        let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colour_views
-            .iter()
-            .map(|view| {
-                Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: keep,
-                })
-            })
-            .collect();
         let has_stencil = formats.depth.has_stencil_aspect();
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("YoctiteGBuffer"),
-            color_attachments: &attachments,
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: depth_load,
-                    store: wgpu::StoreOp::Store,
+        // Each material's draw of a phase's clusters: the first applying `clear`, the second
+        // drawing on what the first drew.
+        let draw = |encoder: &mut wgpu::CommandEncoder,
+                    clear: PendingClear,
+                    frame_group: &wgpu::BindGroup,
+                    args: &wgpu::Buffer,
+                    first_slot: u32| {
+            let (colour_load, depth_load, stencil_load) = clear.load_ops();
+            let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colour_views
+                .iter()
+                .map(|view| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: colour_load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })
+                })
+                .collect();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("YoctiteGBuffer"),
+                color_attachments: &attachments,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: depth_load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: has_stencil.then_some(wgpu::Operations {
+                        load: stencil_load,
+                        store: wgpu::StoreOp::Store,
+                    }),
                 }),
-                stencil_ops: has_stencil.then_some(wgpu::Operations {
-                    load: stencil_load,
-                    store: wgpu::StoreOp::Store,
-                }),
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &frame_group, &[]);
-        for (slot, group) in &groups {
-            pass.set_bind_group(1, group, &[]);
-            pass.draw_indirect(&culler.args, material_draw_offset(*slot));
-        }
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, frame_group, &[]);
+            for (slot, group) in &groups {
+                pass.set_bind_group(1, group, &[]);
+                pass.draw_indirect(args, material_draw_offset(first_slot + *slot));
+            }
+        };
+        draw(encoder, clear, &first_group, &culler.args, 0);
+
+        // The depths drawn so far as a pyramid; what the first phase put aside tried against it,
+        // and what it does not hide drawn too. The pyramid stays for the next frame's first phase.
+        culler.pyramid.build(device, encoder, depth, parameters.view_projection);
+        culler.record_second(device, encoder, pool, parameters);
+        let stride = culler.material_stride();
+        let second_group = frame_group(culler, 4 * culler.capacity(), stride);
+        draw(encoder, PendingClear::default(), &second_group, &culler.args, stride);
         Ok(GBufferDraws {
-            draw_calls: groups.len() as u32,
+            draw_calls: 2 * groups.len() as u32,
         })
     }
 }
@@ -1674,10 +1995,11 @@ pub struct ResolvedMaterial {
     pub samplers: [wgpu::Sampler; 6],
 }
 
-/// The view's and the culling's shaders, for validation.
+/// The view's, the culling's, the G-Buffer draw's and the depth pyramid's shaders, for
+/// validation.
 #[cfg(test)]
-pub(crate) fn shaders() -> [&'static str; 3] {
-    [VIEW_SHADER, CULL_SHADER, GBUFFER_SHADER]
+pub(crate) fn shaders() -> [&'static str; 5] {
+    [VIEW_SHADER, CULL_SHADER, GBUFFER_SHADER, PYRAMID_SHADER, PYRAMID_DOWN_SHADER]
 }
 
 #[cfg(test)]
@@ -2079,7 +2401,9 @@ mod test {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
         };
@@ -2177,7 +2501,8 @@ mod test {
             )
             .expect("drawn");
         queue.submit([encoder.finish()]);
-        assert_eq!(drawn.draw_calls, 2);
+        // A draw for each material in each of the culling's two phases.
+        assert_eq!(drawn.draw_calls, 4);
 
         let diffuse = pixels(&device, &queue, &colour[0], SIZE, false);
         let normal = pixels(&device, &queue, &colour[1], SIZE, false);
@@ -2218,6 +2543,107 @@ mod test {
     }
 
     /// A device of this machine's, if it has one: the tests that need a GPU skip without.
+    #[test]
+    fn what_was_hidden_is_put_aside_and_drawn_once_uncovered() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        const SIZE: u32 = 64;
+        let target = |format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let colour = vec![
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::R8Uint),
+        ];
+        let depth = target(wgpu::TextureFormat::Depth24PlusStencil8);
+
+        // A floor, seen from 40 m up, and a far bigger square 20 m above it covering the whole
+        // view - the floor in a colour of its own.
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (vertices, dag) = hill(16, 0.0);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+        let floor = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-8.0, 0.0, -8.0]), 0);
+        let roof = pool.add_instance(&device, &queue, mesh, placed(0.0, 4.0, [-32.0, 20.0, -32.0]), 1);
+        let white = swatch(&device, &queue, [255; 4]);
+        let red = swatch(&device, &queue, [255, 0, 0, 255]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let material = |slot, diffuse: &(wgpu::TextureView, wgpu::Sampler)| ResolvedMaterial {
+            slot,
+            params: MaterialParams::default(),
+            views: [diffuse.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [diffuse.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, &red), material(1, &white)];
+        let eye = [0.0, 40.0, 0.5];
+        let parameters = CullParameters {
+            view_projection: camera(eye, [0.0, 0.0, 0.0], 1.2, 1.0),
+            eye,
+            threshold: 0.001,
+            material_slots: 2,
+        };
+        let mut culler = Culler::new(&device);
+        let mut drawer = GBufferDrawer::new(&device);
+        // A frame: the G-Buffer cleared as the renderer clears it, and drawn. With the counts:
+        // first phase listed, put aside, second phase listed.
+        let mut frame = |culler: &mut Culler, pool: &GeometryPool| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            drawer
+                .record(
+                    &device,
+                    &mut encoder,
+                    pool,
+                    culler,
+                    &parameters,
+                    &colour,
+                    &depth,
+                    PendingClear {
+                        color: Some(wgpu::Color::TRANSPARENT),
+                        depth: Some(1.0),
+                        stencil: Some(0),
+                    },
+                    &materials,
+                )
+                .expect("drawn");
+            queue.submit([encoder.finish()]);
+            let counts: Vec<u32> = read(&device, &queue, &culler.counts, 8);
+            (counts[1], counts[4], counts[6])
+        };
+        let middle = (SIZE / 2 * SIZE + SIZE / 2) as usize;
+        let red_in_the_middle = || pixels(&device, &queue, &colour[0], SIZE, false)[middle] == u32::from_le_bytes([255, 0, 0, 255]);
+
+        // The first frame has no depths before it: everything is drawn.
+        let (listed, aside, _) = frame(&mut culler, &pool);
+        assert!(listed >= 2 && aside == 0, "first frame: {listed} listed, {aside} put aside");
+        assert!(!red_in_the_middle(), "the floor is under the roof");
+        // The second, the floor is put aside, and stays hidden.
+        let (listed, aside, uncovered) = frame(&mut culler, &pool);
+        assert!(aside >= 1 && uncovered == 0, "second frame: {listed} listed, {aside} put aside, {uncovered} uncovered");
+        assert!(!red_in_the_middle());
+        // The roof taken away: the frame before's depths still hide the floor, but this frame's
+        // do not, and it is drawn after all.
+        pool.move_instance(&queue, roof, placed(0.0, 4.0, [1000.0, 20.0, 1000.0]));
+        let (_, aside, uncovered) = frame(&mut culler, &pool);
+        assert!(aside >= 1 && uncovered == aside, "uncovered: {aside} put aside, {uncovered} uncovered");
+        assert!(red_in_the_middle(), "the floor drawn once uncovered");
+        let _ = floor;
+    }
+
     fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;

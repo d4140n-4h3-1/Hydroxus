@@ -66,8 +66,13 @@ What each one buys:
 4. **Visibility buffer**: hardware-rasterize visible clusters in one indirect draw into a
    depth plus (instance, cluster, triangle) buffer; a material pass resolves it into the existing
    G-buffer, so lights, traced shadows, fog and the rest work unchanged.
-5. **Two-pass occlusion culling** against a hierarchical depth buffer: last frame's visible
-   clusters first, then everything newly uncovered.
+5. **Two-pass occlusion culling** - done (`DepthPyramid`, `shaders/yoctite_hzb*.wgsl`,
+   `Culler::record_first` / `record_second`): clusters hidden behind the frame before's depth
+   pyramid, seen as it was, are put aside rather than drawn; a pyramid is made of what was drawn,
+   and what was put aside is tried again against it and drawn if it is not hidden after all. A
+   GPU test hides a floor under a roof, then takes the roof away. In Wilderness the forest hides
+   little - needles leave gaps, and a tile with sky in it holds the sky's depth - about 15% of
+   the triangles, 0.3-0.46 ms of a 3 ms G-buffer.
 6. **Alpha-masked clusters** (foliage): the visibility pass tests the texture's alpha. This
    matters most for forests.
 7. **Software rasterizer** for clusters whose triangles are smaller than a pixel (compute, 64-bit

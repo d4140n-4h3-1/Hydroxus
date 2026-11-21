@@ -43,9 +43,10 @@ struct MaterialRange {
 
 struct Frame {
     viewProjection: mat4x4f,
-    // Where the sorted list starts in the lists.
+    // Where the sorted list starts in the lists, and its material ranges in theirs: the culling's
+    // first phase's, or its second's.
     sortedStart: u32,
-    pad0: u32,
+    rangeStart: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -105,7 +106,7 @@ fn place(instance: Instance, p: vec3f, w: f32) -> vec3f {
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32, @builtin(instance_index) item: u32) -> VertexOutput {
     var output: VertexOutput;
-    let drawn = lists[frame.sortedStart + ranges[material.slot].offset + item];
+    let drawn = lists[frame.sortedStart + ranges[frame.rangeStart + material.slot].offset + item];
     let instance = instances[drawn.x];
     let cluster = clusters[drawn.y];
     let triangle = index / 3u;
