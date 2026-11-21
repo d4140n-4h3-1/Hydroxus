@@ -422,7 +422,32 @@ pub struct ShadowTracer {
     blur_layout: wgpu::BindGroupLayout,
     mask: Option<GpuTexture>,
     blurred: Option<GpuTexture>,
+    history_pipeline: wgpu::RenderPipeline,
+    history_layout: wgpu::BindGroupLayout,
+    history_sampler: wgpu::Sampler,
+    /// Each light's shadows over the frames before, by the order the lights are traced in a
+    /// frame; the frame those were counted in, and how many traced so far in it.
+    histories: Vec<ShadowHistory>,
+    frame: Option<u32>,
+    traced: usize,
 }
+
+/// A light's shadows averaged over the frames before (see `shaders/shadow_history.wgsl`): two
+/// textures, one read while the other is written, and the view the latest was seen through.
+#[derive(Default)]
+struct ShadowHistory {
+    textures: [Option<GpuTexture>; 2],
+    latest: usize,
+    view_projection: [[f32; 4]; 4],
+    inverse_view_projection: [[f32; 4]; 4],
+    /// Whether the latest holds a frame's shadows yet.
+    valid: bool,
+}
+
+/// How much of each frame's shadows goes into their average over frames: about the last ten
+/// frames count.
+const HISTORY_BLEND: f32 = 0.1;
+const HISTORY_SHADER: &str = include_str!("shaders/shadow_history.wgsl");
 
 const SHADER: &str = include_str!("shaders/shadow_rays.wgsl");
 /// Where the shadow rays' shader binds the scene's cutouts from (see [`cutout_wgsl`]).
@@ -473,6 +498,17 @@ fn mask_pipeline(
     source: &str,
     layout: &wgpu::BindGroupLayout,
 ) -> wgpu::RenderPipeline {
+    target_pipeline(device, label, source, layout, wgpu::TextureFormat::Rgba8Unorm)
+}
+
+/// A pipeline that draws one full-screen triangle into a colour target of `format`.
+fn target_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+    layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -495,7 +531,7 @@ fn mask_pipeline(
             module: &module,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -554,6 +590,18 @@ fn mask_texture(
     width: usize,
     height: usize,
 ) -> Result<GpuTexture, FrameworkError> {
+    texture_of(slot, server, name, width, height, PixelKind::RGBA8)
+}
+
+/// The texture of `pixel_kind` in `slot`, made again if it is not `width` by `height`.
+fn texture_of(
+    slot: &mut Option<GpuTexture>,
+    server: &WgpuGraphicsServer,
+    name: &'static str,
+    width: usize,
+    height: usize,
+    pixel_kind: PixelKind,
+) -> Result<GpuTexture, FrameworkError> {
     let matches = slot.as_ref().is_some_and(|texture| {
         matches!(texture.kind(), GpuTextureKind::Rectangle { width: w, height: h } if w == width && h == height)
     });
@@ -561,7 +609,7 @@ fn mask_texture(
         *slot = Some(server.create_texture(GpuTextureDescriptor {
             name,
             kind: GpuTextureKind::Rectangle { width, height },
-            pixel_kind: PixelKind::RGBA8,
+            pixel_kind,
             ..Default::default()
         })?);
     }
@@ -920,6 +968,34 @@ impl WgpuGraphicsServer {
             label: Some("ShadowRays"),
             ..Default::default()
         });
+        let history_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ShadowHistory"),
+            entries: &[
+                texture_entry(0, non_filtering),
+                texture_entry(1, wgpu::TextureSampleType::Float { filterable: true }),
+                texture_entry(2, wgpu::TextureSampleType::Depth),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                uniform_entry(4),
+            ],
+        });
+        let history_pipeline = target_pipeline(
+            device,
+            "ShadowHistory",
+            HISTORY_SHADER,
+            &history_layout,
+            wgpu::TextureFormat::Rgba16Float,
+        );
+        let history_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ShadowHistory"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         Some(ShadowTracer {
             pipeline,
             layout,
@@ -928,11 +1004,126 @@ impl WgpuGraphicsServer {
             blur_layout,
             mask: None,
             blurred: None,
+            history_pipeline,
+            history_layout,
+            history_sampler,
+            histories: Vec::new(),
+            frame: None,
+            traced: 0,
         })
     }
 }
 
 impl ShadowTracer {
+    /// Blends `result`, this frame's shadows, into its light's shadows of the frames before,
+    /// recorded into `encoder`; the light is told by the order it is traced in `frame`.
+    #[allow(clippy::too_many_arguments)]
+    fn average(
+        &mut self,
+        server: &WgpuGraphicsServer,
+        encoder: &mut wgpu::CommandEncoder,
+        parameters: &ShadowRayParameters,
+        frame: u32,
+        result: &GpuTexture,
+        depth: &WgpuTexture,
+        width: usize,
+        height: usize,
+    ) -> Result<GpuTexture, FrameworkError> {
+        if self.frame != Some(frame) {
+            self.frame = Some(frame);
+            self.traced = 0;
+        }
+        let index = self.traced;
+        self.traced += 1;
+        if self.histories.len() <= index {
+            self.histories.resize_with(index + 1, Default::default);
+        }
+        let history = &mut self.histories[index];
+        let write = 1 - history.latest;
+        let sized = |texture: &Option<GpuTexture>| {
+            texture.as_ref().is_some_and(|t| {
+                matches!(t.kind(), GpuTextureKind::Rectangle { width: w, height: h } if w == width && h == height)
+            })
+        };
+        if !sized(&history.textures[history.latest]) {
+            history.valid = false;
+        }
+        let target = texture_of(&mut history.textures[write], server, "RayTracedShadowHistory", width, height, PixelKind::RGBA16F)?;
+        let before = history.textures[history.latest].clone().filter(|_| history.valid).unwrap_or_else(|| result.clone());
+
+        let inverse = parameters.inverse_view_projection;
+        let view_projection = fyrox_core::algebra::Matrix4::from(inverse)
+            .try_inverse()
+            .map_or([[0.0; 4]; 4], |m| m.into());
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Uniforms {
+            inverse_view_projection: [[f32; 4]; 4],
+            previous_view_projection: [[f32; 4]; 4],
+            previous_inverse_view_projection: [[f32; 4]; 4],
+            screen_size: [f32; 2],
+            flip_v: u32,
+            blend: f32,
+        }
+        let uniforms = Uniforms {
+            inverse_view_projection: inverse,
+            previous_view_projection: history.view_projection,
+            previous_inverse_view_projection: history.inverse_view_projection,
+            screen_size: [width as f32, height as f32],
+            flip_v: parameters.flip_v as u32,
+            blend: if history.valid { HISTORY_BLEND } else { 1.0 },
+        };
+        let device = &server.state.device;
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ShadowHistory"),
+            contents: bytemuck::bytes_of(&uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let (Some(current), Some(before), Some(target_texture)) = (
+            result.as_any().downcast_ref::<WgpuTexture>(),
+            before.as_any().downcast_ref::<WgpuTexture>(),
+            target.as_any().downcast_ref::<WgpuTexture>(),
+        ) else {
+            return Ok(result.clone());
+        };
+        let depth_view = depth.wgpu_texture().create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ShadowHistory"),
+            layout: &self.history_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(current.wgpu_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(before.wgpu_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.history_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        draw_mask(encoder, "ShadowHistory", target_texture, &self.history_pipeline, &bind_group, None);
+        history.latest = write;
+        history.view_projection = view_projection;
+        history.inverse_view_projection = inverse;
+        history.valid = true;
+        Ok(target)
+    }
+
     /// Traces shadow rays for each pixel and returns a mask: how much of the light's red, green
     /// and blue reaches it - 1 where all of it does, 0 where the geometry blocks it, in between
     /// where it blocks part of the light, and coloured where it came through glass. The mask is a
@@ -941,6 +1132,10 @@ impl ShadowTracer {
     /// The same texture is returned every time, so each call overwrites the previous mask. That
     /// is fine for reading it right after, as the renderer does for one light at a time: the GPU
     /// runs the work in the order it was recorded.
+    ///
+    /// With [`ShadowRayParameters::frame`], the mask is each light's shadows averaged over the
+    /// frames (see `shaders/shadow_history.wgsl`), the lights told apart by the order they are
+    /// traced in a frame.
     pub fn trace(
         &mut self,
         server: &WgpuGraphicsServer,
@@ -1201,6 +1396,12 @@ impl ShadowTracer {
                 scissor,
             );
         }
+        // Where the frames are averaged, the shadows are averaged over them too, so they hold
+        // still.
+        let result = match parameters.frame {
+            Some(frame) => self.average(server, &mut encoder, &parameters, frame, &result, depth, width, height)?,
+            None => result,
+        };
         *server.frame_encoder.borrow_mut() = Some(encoder);
 
         Ok(Some(result))
@@ -1230,6 +1431,11 @@ mod test {
     #[test]
     fn the_shadow_blur_shader_is_valid() {
         validate(BLUR_SHADER);
+    }
+
+    #[test]
+    fn the_shadow_history_shader_is_valid() {
+        validate(HISTORY_SHADER);
     }
 
     #[test]
