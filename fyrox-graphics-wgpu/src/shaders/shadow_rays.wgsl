@@ -21,11 +21,14 @@ enable wgpu_ray_query;
 // shader): a hit on one stops the ray only where its texture is solid there, and elsewhere the ray
 // goes on, as the renderer leaves those texels undrawn.
 //
-// A real light has a size, and a shadow's edge is soft where only part of it is hidden. With more
-// than one sample, the rays spread over a disk the size of the light - or, for the sun, over the
-// cone its disk fills in the sky - and the pixel gets the share of them that got through. The
-// spread is turned a little from pixel to pixel in a 4x4 pattern, so that neighboring pixels test
-// different parts of the light and a small blur afterwards averages them into a smooth edge.
+// A real light has a size, and a shadow's edge is soft where only part of it is hidden. The rays
+// spread over a disk the size of the light - or, for the sun, over the cone its disk fills in the
+// sky - and the pixel gets the share of them that got through. The spread is turned a little from
+// pixel to pixel in a 4x4 pattern, and with one ray reaches out a different way too, so that
+// neighboring pixels test different parts of the light and a small blur afterwards averages them
+// into a smooth edge. Where the frames are averaged after (temporal anti-aliasing), the pattern
+// turns from frame to frame as well, so one ray a pixel covers the whole light over a few frames:
+// soft shadows for the price of hard ones.
 
 struct Uniforms {
     inverseViewProjection: mat4x4f,
@@ -40,7 +43,13 @@ struct Uniforms {
     sampleCount: u32,
     // The radius of a lamp in meters, or the tangent of the sun's angular radius.
     lightSize: f32,
+    // How far this frame turns the pattern of rays over the light, and how far it moves them
+    // out from its middle, as fractions of the whole: zero where frames are not averaged.
+    turn: f32,
+    reachOut: f32,
     pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(0) var sceneGeometry: acceleration_structure;
@@ -117,11 +126,12 @@ fn pattern_rotation(pixel: vec2i) -> f32 {
     return bayer[(pixel.y & 3) * 4 + (pixel.x & 3)] / 16.0;
 }
 
-// Sample `i` of `count` on a unit disk spanned by `t` and `b`, spread evenly by the golden angle.
-fn disk_sample(i: u32, count: u32, rotation: f32, t: vec3f, b: vec3f) -> vec3f {
+// Sample `i` of `count` on a unit disk spanned by `t` and `b`, spread evenly by the golden angle,
+// `out` of the way through its ring of the disk (a half for the middle of it).
+fn disk_sample(i: u32, count: u32, rotation: f32, out: f32, t: vec3f, b: vec3f) -> vec3f {
     const GOLDEN_ANGLE = 2.39996323;
     const TAU = 6.28318531;
-    let r = sqrt((f32(i) + 0.5) / f32(count));
+    let r = sqrt((f32(i) + out) / f32(count));
     let theta = f32(i) * GOLDEN_ANGLE + rotation * TAU;
     return (t * cos(theta) + b * sin(theta)) * r;
 }
@@ -195,12 +205,18 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let count = max(uniforms.sampleCount, 1u);
     let t = tangent(toLight);
     let b = cross(toLight, t);
-    let rotation = pattern_rotation(pixel);
+    let rotation = fract(pattern_rotation(pixel) + uniforms.turn);
+    // With one ray, how far out it goes varies too - over the 4x4 block, in another order than
+    // the turn, and from frame to frame - or every ray would keep to one ring round the middle.
+    var out = 0.5;
+    if (count == 1u) {
+        out = fract(pattern_rotation(vec2i(pixel.y + 2, pixel.x + 1)) + 1.0 / 32.0 + uniforms.reachOut);
+    }
     var lit = vec3f(0.0);
     for (var i = 0u; i < count; i++) {
         var spread = vec3f(0.0);
-        if (count > 1u) {
-            spread = disk_sample(i, count, rotation, t, b) * uniforms.lightSize;
+        if (uniforms.lightSize > 0.0) {
+            spread = disk_sample(i, count, rotation, out, t, b) * uniforms.lightSize;
         }
         if (uniforms.positional != 0u) {
             // A point on the lamp. The ray stops there: anything beyond it is not between the

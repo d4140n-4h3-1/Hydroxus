@@ -398,10 +398,14 @@ pub struct ShadowRayParameters {
     /// Pixels outside it are left lit. A lamp lights a small part of the screen, and this keeps
     /// it from paying for rays everywhere else.
     pub scissor: Option<[u32; 4]>,
-    /// Rays per pixel, spread over the light's size. One gives hard shadows. More give soft
-    /// edges, and the mask is then blurred to smooth out the differences between neighboring
-    /// pixels.
+    /// Rays per pixel, spread over the light's size: a light with a size casts soft-edged
+    /// shadows, and the mask is then blurred to smooth out the differences between neighboring
+    /// pixels. More rays, smoother edges; with [`Self::frame`], one is enough.
     pub samples: u32,
+    /// Which frame this is, where the frames are averaged afterwards (temporal anti-aliasing):
+    /// the pattern of rays over the light then turns from frame to frame, and one ray a pixel
+    /// covers the whole light over a few of them. [`None`] keeps the pattern still.
+    pub frame: Option<u32>,
 }
 
 /// The passes that trace the rays and smooth the result, kept between frames so their pipelines
@@ -945,7 +949,11 @@ impl ShadowTracer {
             return Ok(None);
         };
         let mask = mask_texture(&mut self.mask, server, "RayTracedShadowMask", width, height)?;
-        let soft = parameters.samples > 1;
+        // A light with a size casts soft edges, which the blur smooths.
+        let soft = match parameters.light {
+            ShadowRayLight::Directional { angular_size, .. } => angular_size > 0.0,
+            ShadowRayLight::Positional { size, .. } => size > 0.0,
+        };
         let blurred = if soft {
             Some(mask_texture(
                 &mut self.blurred,
@@ -998,7 +1006,9 @@ impl ShadowTracer {
             positional: u32,
             sample_count: u32,
             light_size: f32,
-            _padding: u32,
+            turn: f32,
+            reach_out: f32,
+            _padding: [u32; 3],
         }
         let (light_direction, reach, light_position, light_radius, positional, light_size) =
             match parameters.light {
@@ -1026,7 +1036,12 @@ impl ShadowTracer {
             positional,
             sample_count: parameters.samples.max(1),
             light_size,
-            _padding: 0,
+            // Roberts' R2 sequence, the two-dimensional golden ratio: steps that never repeat and
+            // never line up with each other, so each frame tries parts of the light the last few
+            // did not.
+            turn: parameters.frame.map_or(0.0, |f| (f as f64 * 0.754_877_666_2).fract() as f32),
+            reach_out: parameters.frame.map_or(0.0, |f| (f as f64 * 0.569_840_291_0).fract() as f32),
+            _padding: [0; 3],
         };
 
         let device = &server.state.device;
@@ -1092,6 +1107,7 @@ impl ShadowTracer {
             &bind_group,
             scissor,
         );
+        server.gpu_mark_in(&mut encoder, "Lighting: shadow rays");
 
         if let Some(blurred) = blurred.as_ref() {
             let Some(blur_target) = blurred.as_any().downcast_ref::<WgpuTexture>() else {

@@ -673,6 +673,15 @@ impl WgpuGraphicsServer {
         }
     }
 
+    /// Marks the end of a section of the frame named `label` in `encoder`, for timing on the
+    /// GPU, as [`GraphicsServer::gpu_mark`] does in the frame's own encoder: for code holding the
+    /// frame encoder while it records.
+    pub fn gpu_mark_in(&self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+        if let Some(timer) = &self.gpu_timer {
+            timer.mark(encoder, label);
+        }
+    }
+
     /// Submits the frame encoder, taken from [`Self::frame_encoder`].
     pub fn submit_frame_encoder(&self, encoder: wgpu::CommandEncoder) {
         self.state.queue.submit(std::iter::once(encoder.finish()));

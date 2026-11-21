@@ -800,7 +800,7 @@ impl DeferredLightRenderer {
                 _ => None,
             };
             let traced_shadows = traced_shadow.is_some();
-            server.gpu_mark("Lighting: ray-traced shadows");
+            server.gpu_mark("Lighting: shadow blur");
             if traced_shadows {
                 light_stats.traced_shadows_rendered += 1;
             }

@@ -105,3 +105,7 @@ the rest: 12 ms traced soft, 7.7 ms traced hard, 8.9 ms from shadow maps, agains
 1 ms for everything else. Occlusion culling, the visibility buffer and the software rasterizer
 can only win back part of the first; the shadows are where the frame goes, and Candelite will
 trace the same alpha-tested foliage.
+Since: a doubled foliage card is traced once (fyrox-gfx), and soft shadows take one ray a pixel,
+the pattern over the sun turning from frame to frame for temporal anti-aliasing to average -
+shadow rays 9.2 ms to 3.7 ms, the GPU's frame 12 ms to 7.7. Measured with WILDERNESS_BENCH=1,
+which holds the view still: with the view moving, the times swing by half.
