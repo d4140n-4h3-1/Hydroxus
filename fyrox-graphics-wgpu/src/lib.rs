@@ -72,6 +72,7 @@
 pub mod area_lights;
 /// Generic GPU buffer implementation (uniform, vertex, index, pixel read/write).
 pub mod buffer;
+pub mod candelite;
 
 mod depth_copy;
 /// Texture format helpers and binding offset constants.

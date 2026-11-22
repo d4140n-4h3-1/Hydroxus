@@ -102,8 +102,15 @@ of detail (`GeometryPool::add_morphing_mesh`).
 Named for the candela, the unit of luminous intensity, as Yoctite is for the smallest of
 prefixes. The method follows the published description of Lumen cited above.
 
-1. **Surface cache**: each mesh is given a few "cards" (oriented boxes over its surface); its
-   albedo, normal and emissive are captured into an atlas once.
+1. **Surface cache** - captured (`fyrox_graphics_wgpu::candelite::SurfaceCache`): each mesh of
+   Yoctite's pool is given six cards, the faces of its bounds looking in, each a tile of a shared
+   atlas at 8 texels a meter (4 to 256 a side, packed in shelves); what each card sees - the
+   G-buffer's diffuse colour, normal, emission, material and decal layer, and how far in the
+   surface is - is captured once by drawing the mesh's full-detail clusters through the card's
+   orthographic view as the G-buffer pass draws them (`GBufferDrawer::record_capture`). The cards
+   are on the GPU for the hit lookup (`GpuCard`, a mesh slot's first card). A GPU test captures a
+   box - every card its face, colour, normal and depth, edge to edge - and a sheet seen only from
+   above. Not yet captured in the renderer: that comes with the hit lookup, which uses it.
 2. **Hit lookup**: a ray-query hit (instance, triangle, barycentrics) finds its card texel, so
    a ray learns the colour and light at what it hit without shading it.
 3. **Lighting the surface cache**: sun and lamps with traced shadows, plus last frame's indirect

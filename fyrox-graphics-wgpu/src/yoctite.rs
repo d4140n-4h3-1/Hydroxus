@@ -1831,6 +1831,8 @@ pub struct GBufferDrawer {
     material_layout: wgpu::BindGroupLayout,
     module: wgpu::ShaderModule,
     pipeline: Option<(TargetFormats, wgpu::RenderPipeline)>,
+    /// The pipeline clearing a capture's rectangle (see [`Self::record_capture`]).
+    capture_clear: Option<(TargetFormats, wgpu::RenderPipeline)>,
     /// The software rasterizer, where the device can run it.
     software: Option<SoftwareRaster>,
     /// How small a cluster's radius on the screen, in pixels, the software rasterizer draws it
@@ -1918,9 +1920,252 @@ impl GBufferDrawer {
             material_layout,
             module,
             pipeline: None,
+            capture_clear: None,
             software: SoftwareRaster::new(device),
             software_pixels: SOFTWARE_PIXELS,
         }
+    }
+
+    /// Records `captures` into `colour` (diffuse, normal, ambient, material, decal mask) and
+    /// `depth`: each capture's rectangle cleared, then its mesh's clusters drawn into it as the
+    /// G-Buffer pass draws them, unbent, with the material of its slot from `materials`. What is
+    /// outside the rectangles is left as it is. For capturing meshes as seen from given views:
+    /// Candelite's surface cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_capture(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        captures: &[Capture],
+        colour: &[wgpu::Texture],
+        depth: &wgpu::Texture,
+        materials: &[ResolvedMaterial],
+    ) -> Result<(), FrameworkError> {
+        if colour.len() != 5 {
+            return Err(FrameworkError::Custom(format!(
+                "Yoctite: capturing into {} colour targets, not 5",
+                colour.len()
+            )));
+        }
+        if captures.is_empty() {
+            return Ok(());
+        }
+        let formats = TargetFormats {
+            colour: colour.iter().map(|t| t.format()).collect(),
+            depth: depth.format(),
+        };
+        let pipeline = self.pipeline(device, &formats).clone();
+        let clear = self.capture_clear(device, &formats).clone();
+
+        // Each capture's mesh as an instance of its own, where its mesh's space is the world's,
+        // drawn unbent; its clusters listed one after another; and a material range for each
+        // capture at its slot: a draw each, the range's offset where its clusters start.
+        let instances: Vec<GpuInstance> = captures
+            .iter()
+            .map(|capture| GpuInstance {
+                transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                mesh: capture.mesh.0,
+                flags: INSTANCE_ALIVE,
+                material: capture.slot,
+                morph: NO_MORPH,
+            })
+            .collect();
+        let mut list: Vec<[u32; 2]> = Vec::new();
+        let mut firsts = Vec::with_capacity(captures.len());
+        for (i, capture) in captures.iter().enumerate() {
+            firsts.push(list.len() as u32);
+            list.extend(capture.clusters.iter().map(|&c| [i as u32, c]));
+        }
+        if list.is_empty() {
+            return Ok(());
+        }
+        let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteCaptureInstances"),
+            contents: bytemuck::cast_slice(&instances),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let list_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteCaptureList"),
+            contents: bytemuck::cast_slice(&list),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Frame {
+            view_projection: [[f32; 4]; 4],
+            sorted_start: u32,
+            range_start: u32,
+            _padding: [u32; 2],
+        }
+        let max_slot = captures.iter().map(|c| c.slot).max().unwrap_or(0) as usize;
+        let colour_views: Vec<wgpu::TextureView> = colour.iter().map(|t| t.create_view(&Default::default())).collect();
+        let depth_view = depth.create_view(&Default::default());
+        let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colour_views
+            .iter()
+            .map(|view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            })
+            .collect();
+        // Each capture's bind groups made before the pass.
+        let mut drawn = Vec::with_capacity(captures.len());
+        for (i, capture) in captures.iter().enumerate() {
+            let Some(material) = materials.iter().find(|m| m.slot == capture.slot) else {
+                continue;
+            };
+            let frame = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("YoctiteCaptureFrame"),
+                contents: bytemuck::bytes_of(&Frame {
+                    view_projection: capture.view_projection,
+                    sorted_start: 0,
+                    range_start: 0,
+                    _padding: [0; 2],
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            // The capture's range at its slot: its clusters, from where they start in the list.
+            let mut ranges = vec![[0u32; 4]; max_slot + 1];
+            ranges[capture.slot as usize] = [capture.clusters.len() as u32, firsts[i], 0, 0];
+            let ranges = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("YoctiteCaptureRanges"),
+                contents: bytemuck::cast_slice(&ranges),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let frame_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("YoctiteCaptureFrame"),
+                layout: &self.frame_layout,
+                entries: &[
+                    entry(0, &frame),
+                    entry(1, pool.vertices.buffer()),
+                    entry(2, pool.cluster_vertices.buffer()),
+                    entry(3, pool.triangles.buffer()),
+                    entry(4, pool.clusters.buffer()),
+                    entry(5, &instances),
+                    entry(6, &list_buffer),
+                    entry(7, &ranges),
+                ],
+            });
+            let material_group = self.material_group(device, material);
+            drawn.push((capture, frame_group, material_group));
+        }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("YoctiteCapture"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: formats.depth.has_stencil_aspect().then_some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        for (capture, frame_group, material_group) in &drawn {
+            let [x, y, w, h] = capture.viewport;
+            pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, w, h);
+            pass.set_pipeline(&clear);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, frame_group, &[]);
+            pass.set_bind_group(1, material_group, &[]);
+            pass.draw(0..CLUSTER_VERTICES, 0..capture.clusters.len() as u32);
+        }
+        Ok(())
+    }
+
+    /// The bind group a material is drawn with: what it reads, and its textures.
+    fn material_group(&self, device: &wgpu::Device, material: &ResolvedMaterial) -> wgpu::BindGroup {
+        let params = MaterialParams {
+            slot: material.slot,
+            ..material.params
+        };
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteMaterial"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform.as_entire_binding(),
+        }];
+        for (i, view) in material.views.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1 + i as u32,
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+        }
+        for (i, sampler) in material.samplers.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 7 + i as u32,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteMaterial"),
+            layout: &self.material_layout,
+            entries: &entries,
+        })
+    }
+
+    /// The pipeline that clears a capture's rectangle, for `formats`.
+    fn capture_clear(&mut self, device: &wgpu::Device, formats: &TargetFormats) -> &wgpu::RenderPipeline {
+        if self.capture_clear.as_ref().is_none_or(|(made, _)| made != formats) {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("YoctiteCaptureClear"),
+                source: wgpu::ShaderSource::Wgsl(CAPTURE_CLEAR_SHADER.into()),
+            });
+            let targets: Vec<Option<wgpu::ColorTargetState>> = formats
+                .colour
+                .iter()
+                .map(|&format| Some(wgpu::ColorTargetState::from(format)))
+                .collect();
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("YoctiteCaptureClear"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    targets: &targets,
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: formats.depth,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.capture_clear = Some((formats.clone(), pipeline));
+        }
+        &self.capture_clear.as_ref().expect("made above").1
     }
 
     /// Whether the device can run the software rasterizer (see [`SOFTWARE_FEATURES`]).
@@ -2141,40 +2386,11 @@ impl GBufferDrawer {
         let first_group = frame_group(culler, culler.capacity(), 0);
 
         // Each material's own bind group: what it reads, and its textures.
-        let mut groups = Vec::with_capacity(materials.len());
-        for material in materials.iter().filter(|m| m.slot < parameters.material_slots) {
-            let params = MaterialParams {
-                slot: material.slot,
-                ..material.params
-            };
-            let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("YoctiteMaterial"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let mut entries = vec![wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }];
-            for (i, view) in material.views.iter().enumerate() {
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 1 + i as u32,
-                    resource: wgpu::BindingResource::TextureView(view),
-                });
-            }
-            for (i, sampler) in material.samplers.iter().enumerate() {
-                entries.push(wgpu::BindGroupEntry {
-                    binding: 7 + i as u32,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                });
-            }
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("YoctiteMaterial"),
-                layout: &self.material_layout,
-                entries: &entries,
-            });
-            groups.push((material.slot, group));
-        }
+        let groups: Vec<(u32, wgpu::BindGroup)> = materials
+            .iter()
+            .filter(|m| m.slot < parameters.material_slots)
+            .map(|material| (material.slot, self.material_group(device, material)))
+            .collect();
 
         let colour_views: Vec<wgpu::TextureView> = colour
             .iter()
@@ -2264,6 +2480,44 @@ impl GBufferDrawer {
         })
     }
 }
+
+/// One mesh drawn into a rectangle of a set of targets by [`GBufferDrawer::record_capture`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capture {
+    /// The mesh.
+    pub mesh: MeshId,
+    /// Which of its clusters, as the pool numbers them: those of the full mesh, say.
+    pub clusters: Vec<u32>,
+    /// The slot of the material it is drawn with.
+    pub slot: u32,
+    /// From the mesh's space to clip space (column by column, OpenGL's).
+    pub view_projection: [[f32; 4]; 4],
+    /// Where it is drawn: x, y, width and height in pixels, from the top left.
+    pub viewport: [u32; 4],
+}
+
+/// Clears a rectangle of the G-Buffer's targets: nothing drawn, at the farthest depth.
+const CAPTURE_CLEAR_SHADER: &str = r"
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+    let x = f32(i32(index) / 2) * 4.0 - 1.0;
+    let y = f32(i32(index) & 1) * 4.0 - 1.0;
+    return vec4f(x, y, 1.0, 1.0);
+}
+
+struct Cleared {
+    @location(0) colour: vec4f,
+    @location(1) normal: vec4f,
+    @location(2) ambient: vec4f,
+    @location(3) material: vec4f,
+    @location(4) decal: u32,
+};
+
+@fragment
+fn fs_main() -> Cleared {
+    return Cleared(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0), 0u);
+}
+";
 
 /// A bind group entry of a whole buffer.
 fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
