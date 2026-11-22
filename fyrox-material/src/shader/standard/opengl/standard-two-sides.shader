@@ -165,8 +165,13 @@
                     vec3 inputTangent = vertexTangent.xyz;
 
                     for (int i = 0; i < fyrox_instanceData.blendShapesCount; ++i) {
-                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         float weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
                         inputPosition.xyz += offsets.position * weight;
                         inputNormal += offsets.normal * weight;
                         inputTangent += offsets.tangent * weight;
@@ -324,8 +329,13 @@
                     vec4 inputPosition = vec4(vertexPosition, 1.0);
 
                     for (int i = 0; i < fyrox_instanceData.blendShapesCount; ++i) {
-                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         float weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
                         inputPosition.xyz += offsets.position * weight;
                     }
 
@@ -407,8 +417,13 @@
                     vec4 inputPosition = vec4(vertexPosition, 1.0);
 
                     for (int i = 0; i < fyrox_instanceData.blendShapesCount; ++i) {
-                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         float weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
                         inputPosition.xyz += offsets.position * weight;
                     }
 
@@ -486,8 +501,13 @@
                     vec4 inputPosition = vec4(vertexPosition, 1.0);
 
                     for (int i = 0; i < fyrox_instanceData.blendShapesCount; ++i) {
-                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         float weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
                         inputPosition.xyz += offsets.position * weight;
                     }
 
@@ -566,8 +586,13 @@
                     vec4 inputPosition = vec4(vertexPosition, 1.0);
 
                     for (int i = 0; i < fyrox_instanceData.blendShapesCount; ++i) {
-                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         float weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        TBlendShapeOffsets offsets = S_FetchBlendShapeOffsets(blendShapesStorage, gl_VertexID, i);
                         inputPosition.xyz += offsets.position * weight;
                     }
 

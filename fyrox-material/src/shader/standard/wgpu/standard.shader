@@ -171,8 +171,13 @@
                     var inputTangent = input.vertexTangent.xyz;
 
                     for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) {
-                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
                         inputPosition += vec4f(offsets.position * weight, 0.0);
                         inputNormal += offsets.normal * weight;
                         inputTangent += offsets.tangent * weight;
@@ -334,8 +339,13 @@
                     var inputPosition = vec4f(input.vertexPosition, 1.0);
 
                     for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) {
-                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
                         inputPosition += vec4f(offsets.position * weight, 0.0);
                     }
 
@@ -415,8 +425,13 @@
                     var inputPosition = vec4f(input.vertexPosition, 1.0);
 
                     for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) {
-                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
                         inputPosition += vec4f(offsets.position * weight, 0.0);
                     }
 
@@ -492,8 +507,13 @@
                     var inputPosition = vec4f(input.vertexPosition, 1.0);
 
                     for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) {
-                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
                         inputPosition += vec4f(offsets.position * weight, 0.0);
                     }
 
@@ -570,8 +590,13 @@
                     var inputPosition = vec4f(input.vertexPosition, 1.0);
 
                     for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) {
-                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
                         inputPosition += vec4f(offsets.position * weight, 0.0);
                     }
 

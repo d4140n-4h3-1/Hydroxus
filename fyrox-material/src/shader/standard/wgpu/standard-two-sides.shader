@@ -86,8 +86,13 @@
                     var localPosition = vec4f(0.0); var localNormal = vec3f(0.0); var localTangent = vec3f(0.0);
                     var inputPosition = vec4f(input.vertexPosition, 1.0); var inputNormal = input.vertexNormal; var inputTangent = input.vertexTangent.xyz;
                     for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) {
-                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
+                        // A shape at no weight moves nothing: its offsets are not fetched. The weights are the
+                        // instance's, the same over a draw's vertices, so the branch is taken alike by all.
                         let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4];
+                        if (weight == 0.0) {
+                            continue;
+                        }
+                        let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i);
                         inputPosition += vec4f(offsets.position * weight, 0.0); inputNormal += offsets.normal * weight; inputTangent += offsets.tangent * weight;
                     }
                     if (fyrox_instanceData.useSkeletalAnimation != 0u) {
@@ -135,7 +140,7 @@
                 struct VertexOutput { @builtin(position) position: vec4f, @location(0) outPosition: vec3f, @location(1) texCoord: vec2f };
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput; var localPosition = vec4f(0.0); var inputPosition = vec4f(input.vertexPosition, 1.0);
-                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; inputPosition += vec4f(offsets.position * weight, 0.0); }
+                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; if (weight == 0.0) { continue; } let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); inputPosition += vec4f(offsets.position * weight, 0.0); }
                     if (fyrox_instanceData.useSkeletalAnimation != 0u) { let m0 = fyrox_boneMatrices.matrices[i32(input.boneIndices.x)]; let m1 = fyrox_boneMatrices.matrices[i32(input.boneIndices.y)]; let m2 = fyrox_boneMatrices.matrices[i32(input.boneIndices.z)]; let m3 = fyrox_boneMatrices.matrices[i32(input.boneIndices.w)]; localPosition += m0 * inputPosition * input.boneWeights.x + m1 * inputPosition * input.boneWeights.y + m2 * inputPosition * input.boneWeights.z + m3 * inputPosition * input.boneWeights.w; } else { localPosition = inputPosition; }
                     output.position = fyrox_instanceData.worldViewProjection * localPosition; output.texCoord = input.vertexTexCoord; return output;
                 }
@@ -151,7 +156,7 @@
                 struct VertexOutput { @builtin(position) position: vec4f, @location(0) texCoord: vec2f };
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput; var localPosition = vec4f(0.0); var inputPosition = vec4f(input.vertexPosition, 1.0);
-                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; inputPosition += vec4f(offsets.position * weight, 0.0); }
+                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; if (weight == 0.0) { continue; } let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); inputPosition += vec4f(offsets.position * weight, 0.0); }
                     if (fyrox_instanceData.useSkeletalAnimation != 0u) { let m0 = fyrox_boneMatrices.matrices[i32(input.boneIndices.x)]; let m1 = fyrox_boneMatrices.matrices[i32(input.boneIndices.y)]; let m2 = fyrox_boneMatrices.matrices[i32(input.boneIndices.z)]; let m3 = fyrox_boneMatrices.matrices[i32(input.boneIndices.w)]; localPosition += m0 * inputPosition * input.boneWeights.x + m1 * inputPosition * input.boneWeights.y + m2 * inputPosition * input.boneWeights.z + m3 * inputPosition * input.boneWeights.w; } else { localPosition = inputPosition; }
                     output.position = fyrox_instanceData.worldViewProjection * localPosition; output.texCoord = input.vertexTexCoord; return output;
                 }
@@ -167,7 +172,7 @@
                 struct VertexOutput { @builtin(position) position: vec4f, @location(0) texCoord: vec2f };
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput; var localPosition = vec4f(0.0); var inputPosition = vec4f(input.vertexPosition, 1.0);
-                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; inputPosition += vec4f(offsets.position * weight, 0.0); }
+                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; if (weight == 0.0) { continue; } let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); inputPosition += vec4f(offsets.position * weight, 0.0); }
                     if (fyrox_instanceData.useSkeletalAnimation != 0u) { let m0 = fyrox_boneMatrices.matrices[i32(input.boneIndices.x)]; let m1 = fyrox_boneMatrices.matrices[i32(input.boneIndices.y)]; let m2 = fyrox_boneMatrices.matrices[i32(input.boneIndices.z)]; let m3 = fyrox_boneMatrices.matrices[i32(input.boneIndices.w)]; localPosition += m0 * inputPosition * input.boneWeights.x + m1 * inputPosition * input.boneWeights.y + m2 * inputPosition * input.boneWeights.z + m3 * inputPosition * input.boneWeights.w; } else { localPosition = inputPosition; }
                     output.position = fyrox_instanceData.worldViewProjection * localPosition; output.texCoord = input.vertexTexCoord; return output;
                 }
@@ -183,7 +188,7 @@
                 struct VertexOutput { @builtin(position) position: vec4f, @location(0) texCoord: vec2f, @location(1) worldPosition: vec3f };
                 @vertex fn vs_main(input: VertexInput) -> VertexOutput {
                     var output: VertexOutput; var localPosition = vec4f(0.0); var inputPosition = vec4f(input.vertexPosition, 1.0);
-                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; inputPosition += vec4f(offsets.position * weight, 0.0); }
+                    for (var i: i32 = 0; i < i32(fyrox_instanceData.blendShapesCount); i++) { let weight = fyrox_instanceData.blendShapesWeights[i / 4][i % 4]; if (weight == 0.0) { continue; } let offsets = S_FetchBlendShapeOffsets(blendShapesStorage_tex, blendShapesStorage_samp, i32(input.vertex_index), i); inputPosition += vec4f(offsets.position * weight, 0.0); }
                     if (fyrox_instanceData.useSkeletalAnimation != 0u) { let m0 = fyrox_boneMatrices.matrices[i32(input.boneIndices.x)]; let m1 = fyrox_boneMatrices.matrices[i32(input.boneIndices.y)]; let m2 = fyrox_boneMatrices.matrices[i32(input.boneIndices.z)]; let m3 = fyrox_boneMatrices.matrices[i32(input.boneIndices.w)]; localPosition += m0 * inputPosition * input.boneWeights.x + m1 * inputPosition * input.boneWeights.y + m2 * inputPosition * input.boneWeights.z + m3 * inputPosition * input.boneWeights.w; } else { localPosition = inputPosition; }
                     output.position = fyrox_instanceData.worldViewProjection * localPosition; output.worldPosition = (fyrox_instanceData.worldMatrix * localPosition).xyz; output.texCoord = input.vertexTexCoord; return output;
                 }

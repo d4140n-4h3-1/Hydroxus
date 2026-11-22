@@ -73,6 +73,60 @@ use std::{
 use strum_macros::{AsRefStr, EnumString, VariantNames};
 
 pub mod buffer;
+
+/// The materials meshes with blend shapes are drawn with: a copy of each surface's material
+/// with the surface's blend shapes bound to it, by the material, the blend shapes' texture, and
+/// the property bound; and the material as it was when copied.
+///
+/// One copy is shared by every mesh drawing the same surface with the same material, so they
+/// are drawn together, instanced, each with its own weights. (Each used to get a fresh copy every
+/// frame: a crowd, or a forest swaying in the wind, was a draw call a mesh.) A material changed
+/// since it was copied is copied afresh.
+static WITH_BLEND_SHAPES: std::sync::LazyLock<
+    Mutex<FxHashMap<(u64, u64, u64), (Material, MaterialResource)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// How many copies [`WITH_BLEND_SHAPES`] keeps at most: past this it starts again, letting go
+/// of copies for materials and blend shapes no longer used.
+const MOST_WITH_BLEND_SHAPES: usize = 4096;
+
+/// `material` with `blend_shapes` bound to its `property`, shared (see [`WITH_BLEND_SHAPES`]).
+fn material_with_blend_shapes(
+    material: &MaterialResource,
+    blend_shapes: &crate::resource::texture::TextureResource,
+    property: &str,
+) -> MaterialResource {
+    let bind = |copy: &MaterialResource| {
+        copy.data_ref().bind(
+            property,
+            MaterialResourceBinding::Texture(MaterialTextureBinding {
+                value: Some(blend_shapes.clone()),
+            }),
+        );
+    };
+    if !material.is_ok() {
+        let copy = material.deep_copy();
+        bind(&copy);
+        return copy;
+    }
+    let mut hasher = FxHasher::default();
+    property.hash(&mut hasher);
+    let key = (material.key(), blend_shapes.key(), hasher.finish());
+    let mut copies = WITH_BLEND_SHAPES.safe_lock();
+    if let Some((was, copy)) = copies.get(&key) {
+        if *material.data_ref() == *was {
+            return copy.clone();
+        }
+    }
+    let was = material.data_ref().clone();
+    let copy = material.deep_copy();
+    bind(&copy);
+    if copies.len() >= MOST_WITH_BLEND_SHAPES {
+        copies.clear();
+    }
+    copies.insert(key, (was, copy.clone()));
+    copy
+}
 pub mod surface;
 pub mod vertex;
 
@@ -776,14 +830,11 @@ impl NodeTrait for Mesh {
                             .as_ref()
                             .and_then(|c| c.blend_shape_storage.as_ref())
                             .map(|texture| {
-                                let material_copy = surface.material().deep_copy();
-                                material_copy.data_ref().bind(
+                                material_with_blend_shapes(
+                                    surface.material(),
+                                    texture,
                                     &self.blend_shapes_property_name,
-                                    MaterialResourceBinding::Texture(MaterialTextureBinding {
-                                        value: Some(texture.clone()),
-                                    }),
-                                );
-                                material_copy
+                                )
                             });
 
                         ctx.storage.push(

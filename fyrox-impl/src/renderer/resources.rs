@@ -400,12 +400,18 @@ mod tests {
     use fyrox_graphics_wgpu::{program::assemble_wgsl, vertex_depth::remap_vertex_depth};
 
     /// Every built-in shader, assembled as the wgpu backend assembles it, is valid WGSL: one that
-    /// is not fails only when the renderer is made, with the window.
+    /// is not fails only when the renderer is made, with the window. The renderer's own, the
+    /// materials' standard shaders and the glTF importer's.
     #[test]
     fn every_wgpu_shader_is_valid_wgsl() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/renderer/shaders/wgpu");
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dirs = [
+            here.join("src/renderer/shaders/wgpu"),
+            here.join("../fyrox-material/src/shader/standard/wgpu"),
+            here.join("src/resource/gltf/wgpu"),
+        ];
         let mut checked = 0;
-        for entry in std::fs::read_dir(&dir).unwrap() {
+        for entry in dirs.iter().flat_map(|dir| std::fs::read_dir(dir).unwrap()) {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|e| e != "shader") {
                 continue;
