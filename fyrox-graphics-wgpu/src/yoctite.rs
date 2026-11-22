@@ -1064,11 +1064,18 @@ pub struct CullStats {
     pub hidden_clusters: u32,
     /// Their triangles.
     pub hidden_triangles: u32,
+    /// Of the clusters chosen, how many - and how many triangles - were small enough on the
+    /// screen to be drawn by the software rasterizer (see [`GBufferDrawer`]).
+    pub software_clusters: u32,
+    /// Their triangles.
+    pub software_triangles: u32,
 }
 
 const CULL_SHADER: &str = include_str!("shaders/yoctite_cull.wgsl");
 const PYRAMID_SHADER: &str = include_str!("shaders/yoctite_hzb.wgsl");
 const PYRAMID_DOWN_SHADER: &str = include_str!("shaders/yoctite_hzb_down.wgsl");
+const RASTER_SHADER: &str = include_str!("shaders/yoctite_raster.wgsl");
+const RESOLVE_SHADER: &str = include_str!("shaders/yoctite_resolve.wgsl");
 
 /// A depth pyramid (hierarchical Z) of a depth buffer: level by level, each texel the farthest
 /// depth of the 2x2 below it, level 0 half the screen across - see `shaders/yoctite_hzb.wgsl`.
@@ -1262,7 +1269,8 @@ struct CullUniforms {
     pyramid_valid: u32,
     phase: u32,
     material_stride: u32,
-    _padding: [u32; 2],
+    software_pixels: f32,
+    _padding: u32,
 }
 
 /// The six planes of the view of `view_projection` (column by column, OpenGL's clip space),
@@ -1339,13 +1347,19 @@ pub struct Culler {
     /// texel of one standing in before there is one.
     pub pyramid: DepthPyramid,
     no_pyramid: wgpu::TextureView,
+    /// How small a cluster's radius on the screen, in pixels, it lists for the software
+    /// rasterizer; nothing for none (see [`Self::set_software_pixels`]).
+    software_pixels: f32,
 }
 
 /// How many clusters a draw list holds to begin with.
 const FIRST_CAPACITY: u32 = 1 << 16;
 /// The lists' bytes for each cluster they can hold: five lists - the first phase's as listed and
 /// sorted, those put aside, the second phase's as listed and sorted - of two words each.
-const LIST_BYTES: u64 = 5 * 8;
+const LIST_BYTES: u64 = 7 * 8;
+/// How many counters the culling keeps (`counts` in the shader), and their bytes.
+const COUNTS: usize = 12;
+const COUNTS_BYTES: u64 = COUNTS as u64 * 4;
 
 fn storage_buffer(device: &wgpu::Device, label: &str, size: u64, more: wgpu::BufferUsages) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -1442,7 +1456,7 @@ impl Culler {
             scatter: pipeline("scatter", &without_args),
             layout,
             args_layout,
-            counts: storage_buffer(device, "YoctiteCounts", 32, wgpu::BufferUsages::empty()),
+            counts: storage_buffer(device, "YoctiteCounts", COUNTS_BYTES, wgpu::BufferUsages::empty()),
             args: storage_buffer(
                 device,
                 "YoctiteArgs",
@@ -1462,7 +1476,7 @@ impl Culler {
             visible_capacity: 1024,
             readback: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("YoctiteCountsRead"),
-                size: 32,
+                size: COUNTS_BYTES,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -1486,7 +1500,20 @@ impl Culler {
                     view_formats: &[],
                 })
                 .create_view(&Default::default()),
+            software_pixels: 0.0,
         }
+    }
+
+    /// Lists clusters whose radius on the screen is `pixels` or less for the software rasterizer
+    /// (in their own lists: from 5 and 6 times [`Self::capacity`], for the two phases), in the
+    /// two-phase culling from now on; 0 for none, as at first.
+    pub fn set_software_pixels(&mut self, pixels: f32) {
+        self.software_pixels = pixels.max(0.0);
+    }
+
+    /// The counters, for the software rasterizer to read how many clusters it was given.
+    pub(crate) fn counts(&self) -> &wgpu::Buffer {
+        &self.counts
     }
 
     /// What it chose, as last read back: a frame or two behind.
@@ -1522,22 +1549,25 @@ impl Culler {
                 self.state = Readback::Mapping;
             }
             Readback::Mapping if self.mapped.load(Ordering::Acquire) => {
-                let counts: [u32; 8] = {
+                let counts: [u32; COUNTS] = {
                     let data = self.readback.slice(..).get_mapped_range().expect("mapped");
-                    bytemuck::pod_read_unaligned(&data[..32])
+                    bytemuck::pod_read_unaligned(&data[..COUNTS_BYTES as usize])
                 };
                 self.readback.unmap();
+                let software = (counts[8] + counts[10], counts[9] + counts[11]);
                 let stats = CullStats {
                     instances: counts[0],
-                    clusters: counts[1] + counts[6],
-                    triangles: counts[2] + counts[7],
+                    clusters: counts[1] + counts[6] + software.0,
+                    triangles: counts[2] + counts[7] + software.1,
                     overflowed: counts[3] != 0,
-                    hidden_clusters: counts[4].saturating_sub(counts[6]),
-                    hidden_triangles: counts[5].saturating_sub(counts[7]),
+                    hidden_clusters: counts[4].saturating_sub(counts[6] + counts[10]),
+                    hidden_triangles: counts[5].saturating_sub(counts[7] + counts[11]),
+                    software_clusters: software.0,
+                    software_triangles: software.1,
                 };
                 // Room for what it chose, and some to spare, from the next culling on: in the
-                // first phase's list, and in the clusters put aside.
-                let needed = counts[1].max(counts[4]);
+                // first phase's lists, and in the clusters put aside.
+                let needed = counts[1].max(counts[4]).max(counts[8]);
                 if needed > self.capacity {
                     let wanted = (needed as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64 / 2) as u32;
                     self.set_capacity(device, wanted);
@@ -1599,7 +1629,7 @@ impl Culler {
 
     fn copy_counts(&mut self, encoder: &mut wgpu::CommandEncoder) {
         if self.state == Readback::Idle {
-            encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, 32);
+            encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, COUNTS_BYTES);
             self.state = Readback::Copied;
         }
     }
@@ -1655,7 +1685,9 @@ impl Culler {
             pyramid_valid: pyramid.is_some() as u32,
             phase,
             material_stride: self.material_capacity,
-            _padding: [0; 2],
+            // Only drawing into the G-Buffer, in two phases, is there a software rasterizer.
+            software_pixels: if occlusion { self.software_pixels } else { 0.0 },
+            _padding: 0,
         };
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("YoctiteCull"),
@@ -1799,13 +1831,20 @@ pub struct GBufferDrawer {
     material_layout: wgpu::BindGroupLayout,
     module: wgpu::ShaderModule,
     pipeline: Option<(TargetFormats, wgpu::RenderPipeline)>,
+    /// The software rasterizer, where the device can run it.
+    software: Option<SoftwareRaster>,
+    /// How small a cluster's radius on the screen, in pixels, the software rasterizer draws it
+    /// (where there is one): [`SOFTWARE_PIXELS`] at first; 0 draws everything by the hardware.
+    pub software_pixels: f32,
 }
 
 /// What [`GBufferDrawer::draw`] drew.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GBufferDraws {
-    /// How many draws: one for each material.
+    /// How many draws: one for each material, in each of the two phases.
     pub draw_calls: u32,
+    /// Whether the software rasterizer drew the smallest clusters.
+    pub software: bool,
 }
 
 impl GBufferDrawer {
@@ -1879,7 +1918,14 @@ impl GBufferDrawer {
             material_layout,
             module,
             pipeline: None,
+            software: SoftwareRaster::new(device),
+            software_pixels: SOFTWARE_PIXELS,
         }
+    }
+
+    /// Whether the device can run the software rasterizer (see [`SOFTWARE_FEATURES`]).
+    pub fn has_software_raster(&self) -> bool {
+        self.software.is_some()
     }
 
     fn pipeline(&mut self, device: &wgpu::Device, formats: &TargetFormats) -> &wgpu::RenderPipeline {
@@ -2041,6 +2087,12 @@ impl GBufferDrawer {
             depth: depth.format(),
         };
         let pipeline = self.pipeline(device, &formats).clone();
+        // The smallest clusters drawn by the software rasterizer, where there is one and its
+        // arrays of textures hold every material slot.
+        let software = self.software.is_some()
+            && self.software_pixels > 0.0
+            && parameters.material_slots <= SOFTWARE_MATERIALS;
+        culler.set_software_pixels(if software { self.software_pixels } else { 0.0 });
         // The first phase of culling, against the frame before's depths.
         culler.record_first(device, encoder, pool, parameters);
 
@@ -2178,6 +2230,25 @@ impl GBufferDrawer {
             }
         };
         draw(encoder, clear, &first_group, &culler.args, 0);
+        let mut raster = |encoder: &mut wgpu::CommandEncoder, culler: &Culler, phase: u32| {
+            if let (true, Some(raster)) = (software, self.software.as_mut()) {
+                raster.record(
+                    device,
+                    encoder,
+                    pool,
+                    culler,
+                    parameters.view_projection,
+                    (5 + phase) * culler.capacity(),
+                    8 + 2 * phase,
+                    &colour_views,
+                    depth,
+                    &depth_view,
+                    &formats,
+                    materials,
+                );
+            }
+        };
+        raster(encoder, culler, 0);
 
         // The depths drawn so far as a pyramid; what the first phase put aside tried against it,
         // and what it does not hide drawn too. The pyramid stays for the next frame's first phase.
@@ -2186,9 +2257,465 @@ impl GBufferDrawer {
         let stride = culler.material_stride();
         let second_group = frame_group(culler, 4 * culler.capacity(), stride);
         draw(encoder, PendingClear::default(), &second_group, &culler.args, stride);
+        raster(encoder, culler, 1);
         Ok(GBufferDraws {
             draw_calls: 2 * groups.len() as u32,
+            software,
         })
+    }
+}
+
+/// A bind group entry of a whole buffer.
+fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
+/// The most material slots the software rasterizer draws with: its arrays of textures are this
+/// long (six to a slot for the resolve). With more slots in use, everything is drawn by the
+/// hardware.
+pub const SOFTWARE_MATERIALS: u32 = 256;
+
+/// How small a cluster's radius on the screen, in pixels, is drawn by the software rasterizer, as
+/// [`GBufferDrawer`] has it at first. In Wilderness's forest the G-Buffer took 7.7 ms with none,
+/// 6.8 at 12, 5.3 at 32 and 48, and 5.6 with every cluster that could be: the hardware is still
+/// the faster for triangles some pixels across. At 32, no triangle of a cluster can reach past
+/// the rasterizer's limit of 4,096 pixels in its box.
+pub const SOFTWARE_PIXELS: f32 = 32.0;
+
+/// The GPU features the software rasterizer needs: 64-bit atomics for the visibility buffer, and
+/// arrays of textures indexed per pixel.
+pub const SOFTWARE_FEATURES: wgpu::Features = wgpu::Features::SHADER_INT64
+    .union(wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX)
+    .union(wgpu::Features::TEXTURE_BINDING_ARRAY)
+    .union(wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+
+/// How many workgroups the software rasterizer is dispatched with; each takes every so many
+/// clusters of its list.
+const RASTER_GROUPS: u32 = 8192;
+
+/// Yoctite's software rasterizer and its visibility buffer: clusters too small on the screen for
+/// the hardware - their triangles a pixel or two - drawn by a compute pass, a thread a triangle,
+/// each pixel keeping the nearest triangle over it (`shaders/yoctite_raster.wgsl`); then shaded
+/// into the G-Buffer from the triangle each pixel kept, with its depth, so the depth test against
+/// what the hardware drew keeps whichever is nearer (`shaders/yoctite_resolve.wgsl`).
+pub struct SoftwareRaster {
+    raster_layout: wgpu::BindGroupLayout,
+    raster_textures_layout: wgpu::BindGroupLayout,
+    raster: wgpu::ComputePipeline,
+    resolve_layout: wgpu::BindGroupLayout,
+    resolve_textures_layout: wgpu::BindGroupLayout,
+    resolve_module: wgpu::ShaderModule,
+    resolve: Option<(TargetFormats, wgpu::RenderPipeline)>,
+    /// A pixel each, 64 bits: see the shaders.
+    visibility: Option<(wgpu::Buffer, [u32; 2])>,
+    sampler: wgpu::Sampler,
+    /// A white texel, for the slots of the arrays no material fills.
+    blank: wgpu::TextureView,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RasterUniforms {
+    view_projection: [[f32; 4]; 4],
+    screen_size: [u32; 2],
+    list_start: u32,
+    counted: u32,
+    flip_v: u32,
+    capacity: u32,
+    _padding: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ResolveUniforms {
+    view_projection: [[f32; 4]; 4],
+    screen_size: [u32; 2],
+    flip_v: u32,
+    _padding: u32,
+}
+
+impl SoftwareRaster {
+    /// The rasterizer, if `device` can run it: see [`SOFTWARE_FEATURES`]; and with room in its
+    /// limits for the arrays of textures and the buffers bound.
+    pub fn new(device: &wgpu::Device) -> Option<Self> {
+        let limits = device.limits();
+        if !device.features().contains(SOFTWARE_FEATURES)
+            || limits.max_binding_array_elements_per_shader_stage < SOFTWARE_MATERIALS * 6
+            || limits.max_storage_buffers_per_shader_stage < 9
+        {
+            return None;
+        }
+        let buffer = |binding, visibility, read_only| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let uniform = |visibility| wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let textures = |binding, visibility, count: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: std::num::NonZeroU32::new(count),
+        };
+        let sampler = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        let compute = wgpu::ShaderStages::COMPUTE;
+        let raster_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteRaster"),
+            entries: &[
+                uniform(compute),
+                buffer(1, compute, true),
+                buffer(2, compute, true),
+                buffer(3, compute, true),
+                buffer(4, compute, true),
+                buffer(5, compute, true),
+                buffer(6, compute, true),
+                buffer(7, compute, true),
+                buffer(8, compute, false),
+                buffer(9, compute, true),
+            ],
+        });
+        // Arrays of textures may not share a bind group with a uniform buffer.
+        let raster_textures_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteRasterTextures"),
+            entries: &[textures(0, compute, SOFTWARE_MATERIALS), sampler(1, compute)],
+        });
+        let fragment = wgpu::ShaderStages::FRAGMENT;
+        let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteResolve"),
+            entries: &[
+                uniform(fragment),
+                buffer(1, fragment, true),
+                buffer(2, fragment, true),
+                buffer(3, fragment, true),
+                buffer(4, fragment, true),
+                buffer(5, fragment, true),
+                buffer(6, fragment, true),
+                buffer(7, fragment, true),
+                buffer(8, fragment, true),
+            ],
+        });
+        let resolve_textures_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("YoctiteResolveTextures"),
+            entries: &[textures(0, fragment, SOFTWARE_MATERIALS * 6), sampler(1, fragment)],
+        });
+        let raster_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YoctiteRaster"),
+            source: wgpu::ShaderSource::Wgsl(RASTER_SHADER.into()),
+        });
+        let raster = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("YoctiteRaster"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("YoctiteRaster"),
+                bind_group_layouts: &[Some(&raster_layout), Some(&raster_textures_layout)],
+                immediate_size: 0,
+            })),
+            module: &raster_module,
+            entry_point: Some("rasterize"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let resolve_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YoctiteResolve"),
+            source: wgpu::ShaderSource::Wgsl(RESOLVE_SHADER.into()),
+        });
+        let blank = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("YoctiteBlank"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        Some(Self {
+            raster_layout,
+            raster_textures_layout,
+            raster,
+            resolve_layout,
+            resolve_textures_layout,
+            resolve_module,
+            resolve: None,
+            visibility: None,
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("YoctiteSoftware"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                ..Default::default()
+            }),
+            blank: blank.create_view(&Default::default()),
+        })
+    }
+
+    fn resolve_pipeline(&mut self, device: &wgpu::Device, formats: &TargetFormats) -> &wgpu::RenderPipeline {
+        if self.resolve.as_ref().is_none_or(|(made, _)| made != formats) {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("YoctiteResolve"),
+                bind_group_layouts: &[Some(&self.resolve_layout), Some(&self.resolve_textures_layout)],
+                immediate_size: 0,
+            });
+            let targets: Vec<Option<wgpu::ColorTargetState>> = formats
+                .colour
+                .iter()
+                .map(|&format| {
+                    Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                })
+                .collect();
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("YoctiteResolve"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &self.resolve_module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: formats.depth,
+                    depth_write_enabled: Some(true),
+                    // As the G-Buffer pass tests: the nearer of what the hardware drew and what
+                    // the rasterizer did is kept.
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.resolve_module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &targets,
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.resolve = Some((formats.clone(), pipeline));
+        }
+        &self.resolve.as_ref().expect("made above").1
+    }
+
+    /// Records the software rasterizing of one phase's list - from `list_start` in `culler`'s
+    /// lists, counted in counter `counted` - into the visibility buffer, cleared first, and its
+    /// resolve into `colour` and `depth`: drawn on what is there.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pool: &GeometryPool,
+        culler: &Culler,
+        view_projection: [[f32; 4]; 4],
+        list_start: u32,
+        counted: u32,
+        colour_views: &[wgpu::TextureView],
+        depth: &wgpu::Texture,
+        depth_view: &wgpu::TextureView,
+        formats: &TargetFormats,
+        materials: &[ResolvedMaterial],
+    ) {
+        let size = [depth.width(), depth.height()];
+        if self.visibility.as_ref().is_none_or(|(_, made)| *made != size) {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("YoctiteVisibility"),
+                size: (size[0] as u64 * size[1] as u64 * 8).max(8),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.visibility = Some((buffer, size));
+        }
+        let visibility = &self.visibility.as_ref().expect("made above").0;
+        encoder.clear_buffer(visibility, 0, None);
+
+        // Each slot's parameters and textures, in arrays by slot.
+        let mut params = vec![MaterialParams::default(); SOFTWARE_MATERIALS as usize];
+        let mut diffuse: Vec<&wgpu::TextureView> = vec![&self.blank; SOFTWARE_MATERIALS as usize];
+        let mut textures: Vec<&wgpu::TextureView> = vec![&self.blank; SOFTWARE_MATERIALS as usize * 6];
+        for material in materials.iter().filter(|m| m.slot < SOFTWARE_MATERIALS) {
+            let slot = material.slot as usize;
+            params[slot] = MaterialParams {
+                slot: material.slot,
+                ..material.params
+            };
+            diffuse[slot] = &material.views[0];
+            for (i, view) in material.views.iter().enumerate() {
+                textures[slot * 6 + i] = view;
+            }
+        }
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteSoftwareMaterials"),
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let raster_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteRaster"),
+            contents: bytemuck::bytes_of(&RasterUniforms {
+                view_projection,
+                screen_size: size,
+                list_start,
+                counted,
+                // wgpu's framebuffers are stored top row first.
+                flip_v: 1,
+                capacity: culler.capacity(),
+                _padding: [0; 2],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let raster_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteRaster"),
+            layout: &self.raster_layout,
+            entries: &[
+                entry(0, &raster_uniforms),
+                entry(1, pool.vertices.buffer()),
+                entry(2, pool.cluster_vertices.buffer()),
+                entry(3, pool.triangles.buffer()),
+                entry(4, pool.clusters.buffer()),
+                entry(5, pool.instances.buffer()),
+                entry(6, &culler.lists),
+                entry(7, culler.counts()),
+                entry(8, visibility),
+                entry(9, &params),
+            ],
+        });
+        let raster_textures = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteRasterTextures"),
+            layout: &self.raster_textures_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureViewArray(&diffuse),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("YoctiteRaster"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.raster);
+            pass.set_bind_group(0, &raster_group, &[]);
+            pass.set_bind_group(1, &raster_textures, &[]);
+            pass.dispatch_workgroups(RASTER_GROUPS.min(culler.capacity()).max(1), 1, 1);
+        }
+
+        let resolve_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("YoctiteResolve"),
+            contents: bytemuck::bytes_of(&ResolveUniforms {
+                view_projection,
+                screen_size: size,
+                flip_v: 1,
+                _padding: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let resolve_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteResolve"),
+            layout: &self.resolve_layout,
+            entries: &[
+                entry(0, &resolve_uniforms),
+                entry(1, pool.vertices.buffer()),
+                entry(2, pool.cluster_vertices.buffer()),
+                entry(3, pool.triangles.buffer()),
+                entry(4, pool.clusters.buffer()),
+                entry(5, pool.instances.buffer()),
+                entry(6, &culler.lists),
+                entry(7, visibility),
+                entry(8, &params),
+            ],
+        });
+        let resolve_textures = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YoctiteResolveTextures"),
+            layout: &self.resolve_textures_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureViewArray(&textures),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let pipeline = self.resolve_pipeline(device, formats).clone();
+        let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = colour_views
+            .iter()
+            .map(|view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            })
+            .collect();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("YoctiteResolve"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: formats.depth.has_stencil_aspect().then_some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &resolve_group, &[]);
+        pass.set_bind_group(1, &resolve_textures, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -2205,11 +2732,11 @@ pub struct ResolvedMaterial {
     pub samplers: [wgpu::Sampler; 6],
 }
 
-/// The view's, the culling's, the G-Buffer draw's and the depth pyramid's shaders, for
-/// validation.
+/// The view's, the culling's, the G-Buffer draw's, the depth pyramid's and the software
+/// rasterizer's shaders, for validation.
 #[cfg(test)]
-pub(crate) fn shaders() -> [&'static str; 5] {
-    [VIEW_SHADER, CULL_SHADER, GBUFFER_SHADER, PYRAMID_SHADER, PYRAMID_DOWN_SHADER]
+pub(crate) fn shaders() -> [&'static str; 7] {
+    [VIEW_SHADER, CULL_SHADER, GBUFFER_SHADER, PYRAMID_SHADER, PYRAMID_DOWN_SHADER, RASTER_SHADER, RESOLVE_SHADER]
 }
 
 #[cfg(test)]
@@ -2561,7 +3088,8 @@ mod test {
     /// The pixels of a `size` by `size` texture of 4-byte texels (or 1-byte with `narrow`),
     /// read back, a texel a word.
     fn pixels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, size: u32, narrow: bool) -> Vec<u32> {
-        let row = 256u32;
+        // A row's bytes, to the multiple of 256 a copy's rows are laid out in.
+        let row = (size * if narrow { 1 } else { 4 }).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (row * size) as u64,
@@ -3116,6 +3644,149 @@ mod test {
         pool.flush(&queue);
         let (left, right) = draw(&pool);
         assert!(right > 100 && left < 20, "bent, on the right: {left} and {right} pixels");
+    }
+
+    /// A device with the software rasterizer's features, where the GPU has them.
+    fn software_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        if !adapter.features().contains(SOFTWARE_FEATURES) {
+            return None;
+        }
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: SOFTWARE_FEATURES,
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    #[test]
+    fn small_clusters_are_rasterized_in_software_as_the_hardware_draws_them() {
+        let Some((device, queue)) = software_device() else {
+            eprintln!("no GPU with the software rasterizer's features: skipped");
+            return;
+        };
+        const SIZE: u32 = 128;
+        let target = |format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let colour = vec![
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::R8Uint),
+        ];
+        let depth = target(wgpu::TextureFormat::Depth24PlusStencil8);
+        // A flat square on the left, which its one target slides 16 m right.
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (vertices, dag) = hill(16, 0.0);
+        let offsets = vec![[16.0, 0.0, 0.0, 0.0, 0.0, 0.0]; vertices.len()];
+        let mesh = pool.add_morphing_mesh(
+            &device,
+            &queue,
+            &dag,
+            &vertices,
+            Some(Morphs { targets: 1, offsets: &offsets, most_weight: 1.0 }),
+        );
+        let instance = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0);
+        // And one below the middle whose diffuse texture is see-through all over: left out by the
+        // alpha test, in software as in hardware.
+        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-8.0, 0.0, 16.0]), 1);
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let clear = swatch(&device, &queue, [255, 255, 255, 0]);
+        let material = |slot, diffuse: &(wgpu::TextureView, wgpu::Sampler)| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: [1.0, 0.5, 0.25, 1.0],
+                layer_index: 3,
+                ..Default::default()
+            },
+            views: [diffuse.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [diffuse.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, &white), material(1, &clear)];
+        let both_solid = [material(0, &white), material(1, &white)];
+        let eye = [0.0, 40.0, 8.0];
+        let parameters = CullParameters {
+            view_projection: camera(eye, [0.0, 0.0, 7.0], 1.2, 1.0),
+            eye,
+            threshold: 0.001,
+            material_slots: 2,
+        };
+        // Drawn with every cluster software-rasterized, or none.
+        let draw = |pool: &GeometryPool, software: bool, materials: &[ResolvedMaterial]| {
+            let mut culler = Culler::new(&device);
+            let mut drawer = GBufferDrawer::new(&device);
+            assert!(drawer.has_software_raster());
+            drawer.software_pixels = if software { 1.0e6 } else { 0.0 };
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let drawn = drawer
+                .record(
+                    &device,
+                    &mut encoder,
+                    pool,
+                    &mut culler,
+                    &parameters,
+                    &colour,
+                    &depth,
+                    PendingClear {
+                        color: Some(wgpu::Color::TRANSPARENT),
+                        depth: Some(1.0),
+                        stencil: Some(0),
+                    },
+                    materials,
+                )
+                .expect("drawn");
+            queue.submit([encoder.finish()]);
+            assert_eq!(drawn.software, software);
+            [0, 1, 4].map(|i| pixels(&device, &queue, &colour[i], SIZE, i == 4))
+        };
+        let at = |x: u32, y: u32| (y * SIZE + x) as usize;
+        let covered = |diffuse: &[u32], range: std::ops::Range<u32>| {
+            range.map(|x| (0..SIZE).filter(|&y| diffuse[at(x, y)] != 0).count()).sum::<usize>()
+        };
+
+        let [hardware, hardware_normal, hardware_decal] = draw(&pool, false, &materials);
+        let [software, software_normal, software_decal] = draw(&pool, true, &materials);
+        let drawn = covered(&hardware, 0..SIZE);
+        assert!(drawn > 500, "the square drawn: {drawn} pixels");
+        // Only the solid square: the see-through one, below it, nowhere.
+        let below = |diffuse: &[u32]| (0..SIZE).map(|x| (SIZE * 3 / 4..SIZE).filter(|&y| diffuse[at(x, y)] != 0).count()).sum::<usize>();
+        assert_eq!((below(&hardware), below(&software)), (0, 0), "the see-through square left out");
+        // Where it would be drawn, solid.
+        let [solid, ..] = draw(&pool, true, &both_solid);
+        assert!(below(&solid) > 200, "the second square in view: {} pixels", below(&solid));
+        // Each pixel's middle covered alike: the edges may differ by a pixel where a middle
+        // lies on one.
+        let differ = (0..(SIZE * SIZE) as usize).filter(|&i| (hardware[i] != 0) != (software[i] != 0)).count();
+        assert!(differ * 50 < drawn, "{differ} of {drawn} pixels covered differently");
+        let middle = at(SIZE / 4, SIZE / 2);
+        assert_eq!(software[middle].to_le_bytes(), [255, 128, 64, 255], "diffuse colour times texture");
+        assert_eq!(software[middle], hardware[middle]);
+        assert_eq!(software_normal[middle], hardware_normal[middle], "the normal");
+        assert_eq!(software_decal[middle], 3, "the decal layer");
+        assert_eq!(hardware_decal[middle], 3);
+
+        // Bent as the hardware bends it.
+        pool.set_weights(instance, &[1.0]);
+        pool.flush(&queue);
+        let [bent, ..] = draw(&pool, true, &materials);
+        let (left, right) = (covered(&bent, 0..SIZE / 2), covered(&bent, SIZE / 2 + 1..SIZE));
+        assert!(right > 500 && left < 50, "bent, on the right: {left} and {right} pixels");
     }
 
     #[test]

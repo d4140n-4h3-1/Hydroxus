@@ -73,14 +73,29 @@ What each one buys:
    GPU test hides a floor under a roof, then takes the roof away. In Wilderness the forest hides
    little - needles leave gaps, and a tile with sky in it holds the sky's depth - about 15% of
    the triangles, 0.3-0.46 ms of a 3 ms G-buffer.
-6. **Alpha-masked clusters** (foliage): the visibility pass tests the texture's alpha. This
-   matters most for forests.
-7. **Software rasterizer** for clusters whose triangles are smaller than a pixel (compute, 64-bit
-   atomics into the visibility buffer).
+6. **Alpha-masked clusters** (foliage) - done with 7: the software rasterizer tests each pixel's
+   texel of the diffuse texture's alpha, as the G-buffer pass does.
+7. **Software rasterizer and visibility buffer** - done (`SoftwareRaster`,
+   `shaders/yoctite_raster.wgsl`, `yoctite_resolve.wgsl`): the culling lists clusters whose
+   radius on the screen is `SOFTWARE_PIXELS` (32) or less, and clear of the near plane, for a
+   compute pass instead - a workgroup a cluster, a thread a triangle - which keeps each pixel's
+   nearest triangle in a 64-bit visibility buffer (`atomicMax` of depth and triangle); a
+   fullscreen pass then shades each pixel from its triangle into the G-buffer with its depth,
+   tested against what the hardware drew. Both run after each culling phase's hardware draws, so
+   the depth pyramid sees what they drew. Bending meshes bend in both. Needs 64-bit atomics and
+   arrays of textures (`SOFTWARE_FEATURES`); without them everything is drawn by the hardware.
+   A GPU test draws the same squares in software and in hardware - coverage, colour, normal,
+   decal layer and the alpha test alike - and bent. In Wilderness's swaying forest the G-buffer
+   went from 7.7 ms to 5.3 ms (a GPU frame of 10.6 ms to 8.2): the hardware is slow at the
+   pixel-sized triangles of distant crowns, and slower still at their bending, which it does a
+   corner at a time. The hardware stays faster for triangles some pixels across: everything that
+   could be in software took 5.6 ms. Phase 4's single hardware visibility pass was not needed:
+   the hardware draws straight into the G-buffer, a draw a material.
 8. **Streaming**: cluster pages loaded and evicted by demand. Only when scenes outgrow memory.
 
-Ray-traced shadows keep tracing the full-detail meshes. Skinned and moving meshes stay on the
-existing path.
+Ray-traced shadows keep tracing the full-detail meshes. Skinned meshes stay on the existing
+path; meshes that bend by blend shapes (morph targets) are drawn by Yoctite, bent at every level
+of detail (`GeometryPool::add_morphing_mesh`).
 
 ## Candelite: dynamic global illumination (hardware ray tracing)
 

@@ -24,6 +24,13 @@
 // `offsets` and `scatter` sort into lists of their own for a second set of draws. What the first
 // phase drew is never tested against depths it did not see, so nothing is lost, whatever moved.
 //
+// With `softwarePixels` above nothing, a cluster listed that is that small on the screen or
+// smaller - its bounds' radius, in pixels - is listed for the software rasterizer instead
+// (yoctite_raster.wgsl), whose triangles a pixel or two across the hardware draws poorly: in the
+// first phase from 5 * `capacity`, in the second from 6 * `capacity`, counted in `counts[8]` and
+// `counts[10]`, their triangles in `counts[9]` and `counts[11]`. Not one near enough to cross
+// the near plane, which only the hardware clips.
+//
 // Errors and bounds are judged in the world: placed by the instance's transform, and grown by
 // its largest scale. A sphere round another still is, so the parent's error never looks smaller
 // than its child's, and the cut is whole, as `yoctite::select` makes it in the mesh's own space.
@@ -89,7 +96,9 @@ struct Cull {
     // and draws are.
     phase: u32,
     materialStride: u32,
-    pad0: u32,
+    // How small a cluster's radius on the screen, in pixels, the software rasterizer draws it;
+    // nothing for none.
+    softwarePixels: f32,
     pad1: u32,
 };
 
@@ -118,8 +127,9 @@ const MATERIAL_DRAWS: u32 = 8u;
 @group(0) @binding(4) var<storage, read_write> visible: array<u32>;
 // Visible instances; clusters the first phase listed (however many the list holds), their
 // triangles; 1 if a list ran out of room; clusters put aside as hidden behind the frame before's
-// depths, their triangles; clusters the second phase listed, their triangles.
-@group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>, 8>;
+// depths, their triangles; clusters the second phase listed, their triangles; and the clusters
+// each phase listed for the software rasterizer, and their triangles.
+@group(0) @binding(5) var<storage, read_write> counts: array<atomic<u32>, 12>;
 @group(0) @binding(6) var<storage, read_write> lists: array<vec2u>;
 @group(0) @binding(7) var<storage, read_write> materials: array<MaterialRange>;
 @group(0) @binding(8) var pyramid: texture_2d<f32>;
@@ -215,6 +225,31 @@ fn hidden(center: vec3f, radius: f32) -> bool {
     return nearest > farthest;
 }
 
+// Whether the cluster at `center` of `radius`, in the world, is for the software rasterizer:
+// small on the screen, and well clear of the near plane.
+fn for_software(center: vec3f, radius: f32) -> bool {
+    if (cull.softwarePixels <= 0.0) {
+        return false;
+    }
+    let distance = length(center - cull.eye) - radius;
+    if (distance <= max(radius, 0.5)) {
+        return false;
+    }
+    return radius / distance / cull.threshold <= cull.softwarePixels;
+}
+
+// Lists a cluster for the software rasterizer, in this phase's list; one past its room counts as
+// overflow, as for the other lists.
+fn list_for_software(item: vec2u, triangles: u32) {
+    let at = atomicAdd(&counts[8u + 2u * cull.phase], 1u);
+    atomicAdd(&counts[9u + 2u * cull.phase], triangles);
+    if (at < cull.capacity) {
+        lists[(5u + cull.phase) * cull.capacity + at] = item;
+    } else {
+        atomicStore(&counts[3], 1u);
+    }
+}
+
 // Where the phase's listing is counted, and where its lists and material ranges start.
 fn listed_count() -> u32 {
     return select(1u, 6u, cull.phase == 1u);
@@ -233,7 +268,7 @@ fn range_start() -> u32 {
 @compute @workgroup_size(64)
 fn reset(@builtin(global_invocation_id) id: vec3u) {
     if (id.x == 0u) {
-        for (var i = 0u; i < 8u; i++) {
+        for (var i = 0u; i < 12u; i++) {
             atomicStore(&counts[i], 0u);
         }
         args[0] = 0u;
@@ -328,6 +363,10 @@ fn cull_clusters(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_
             }
             continue;
         }
+        if (for_software(place(instance, cluster.bounds.xyz), cluster.bounds.w * scale)) {
+            list_for_software(vec2u(slot, c), cluster.triangleCount);
+            continue;
+        }
         let at = atomicAdd(&counts[1], 1u);
         atomicAdd(&counts[2], cluster.triangleCount);
         if (at < cull.capacity) {
@@ -346,7 +385,12 @@ fn cull_occluded(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgrou
         let item = lists[2u * cull.capacity + i];
         let instance = instances[item.x];
         let cluster = clusters[item.y];
-        if (hidden(place(instance, cluster.bounds.xyz), cluster.bounds.w * largest_scale(instance))) {
+        let scale = largest_scale(instance);
+        if (hidden(place(instance, cluster.bounds.xyz), cluster.bounds.w * scale)) {
+            continue;
+        }
+        if (for_software(place(instance, cluster.bounds.xyz), cluster.bounds.w * scale)) {
+            list_for_software(item, cluster.triangleCount);
             continue;
         }
         // No more than were put aside, so there is always room.
