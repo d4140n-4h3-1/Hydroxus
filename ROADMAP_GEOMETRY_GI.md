@@ -110,9 +110,20 @@ prefixes. The method follows the published description of Lumen cited above.
    orthographic view as the G-buffer pass draws them (`GBufferDrawer::record_capture`). The cards
    are on the GPU for the hit lookup (`GpuCard`, a mesh slot's first card). A GPU test captures a
    box - every card its face, colour, normal and depth, edge to edge - and a sheet seen only from
-   above. Not yet captured in the renderer: that comes with the hit lookup, which uses it.
-2. **Hit lookup**: a ray-query hit (instance, triangle, barycentrics) finds its card texel, so
-   a ray learns the colour and light at what it hit without shading it.
+   above. fyrox-gfx captures each mesh as Yoctite uploads it.
+2. **Hit lookup** - done (`TraceScene`, `LOOKUP_WGSL`, `SurfaceView`): Candelite traces against
+   a scene of its own - each pool mesh's full-detail triangles, each placed instance naming its
+   slot - so a hit knows its mesh and its cards. The hit is taken into the mesh's space and found
+   on each card facing the ray; cards that captured it there (depth within 0.3 m) are averaged by
+   how squarely they face the ray (`covered`). Foliage is traced as a cutout with the material's
+   mask (rays pass its see-through texels); a needle inside a crown, which every card sees only
+   behind the outer needles, takes the look of what the cards saw there, or of the nearest texel
+   round a gap in what they saw (`seen`, not `covered`: such a hit is to be lit where it is, as
+   Lumen's hit lighting does, not from the cache). A GPU test traces a turned box, a sheet seen
+   from below, and a half see-through card in front of the box. fyrox-gfx's
+   `GraphicsEffects::with_candelite_view` lays over the frame what a ray from the eye finds
+   (Wilderness: WILDERNESS_CANDELITE_VIEW=1): trunks, ground and crowns, with 1.7% of what is not
+   sky found on no card, mostly at thin treetops - from 46% with foliage traced solid.
 3. **Lighting the surface cache**: sun and lamps with traced shadows, plus last frame's indirect
    light (multiple bounces over time), updated a budget of texels per frame.
 4. **Screen probes**: diffuse GI gathered at probes every 16 pixels, rays importance-sampled,

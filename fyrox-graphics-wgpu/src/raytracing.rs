@@ -83,6 +83,11 @@ impl CutoutMask {
     pub fn height(&self) -> u32 {
         self.height
     }
+
+    /// Its bits, 32 to a word, row by row.
+    pub fn words(&self) -> &[u32] {
+        &self.bits
+    }
 }
 
 /// What a cutout keeps for the shader: the texture coordinates of each of its triangles'

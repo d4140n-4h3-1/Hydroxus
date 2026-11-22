@@ -702,6 +702,14 @@ impl GeometryPool {
         self.placed.get(id.0 as usize).copied().flatten()
     }
 
+    /// Every instance placed, by slot.
+    pub fn placed(&self) -> impl Iterator<Item = (u32, GpuInstance)> + '_ {
+        self.placed
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, record)| record.map(|record| (slot as u32, record)))
+    }
+
     /// How many instance slots there are, in use or not: what a pass over every instance covers.
     pub fn instance_slots(&self) -> u32 {
         self.instances.ranges.high_water()
@@ -2261,29 +2269,7 @@ impl GBufferDrawer {
                 .ok_or_else(|| FrameworkError::Custom("Yoctite: a G-Buffer with no depth".into()))?
                 .texture,
         )?;
-        let resolved = materials
-            .iter()
-            .map(|material| {
-                let mut views = Vec::with_capacity(6);
-                let mut samplers = Vec::with_capacity(6);
-                for (texture, sampler) in &material.textures {
-                    let (Some(texture), Some(sampler)) = (
-                        texture.as_any().downcast_ref::<WgpuTexture>(),
-                        sampler.as_any().downcast_ref::<WgpuSampler>(),
-                    ) else {
-                        return Err(FrameworkError::Custom("Yoctite: a material texture not of wgpu".into()));
-                    };
-                    views.push(texture.wgpu_view().clone());
-                    samplers.push(sampler.wgpu_sampler().clone());
-                }
-                Ok(ResolvedMaterial {
-                    slot: material.slot,
-                    params: material.params,
-                    views: views.try_into().expect("six"),
-                    samplers: samplers.try_into().expect("six"),
-                })
-            })
-            .collect::<Result<Vec<_>, FrameworkError>>()?;
+        let resolved = resolve_materials(materials)?;
 
         let device = &server.state.device;
         server.flush_active_pass();
@@ -2971,6 +2957,33 @@ impl SoftwareRaster {
         pass.set_bind_group(1, &resolve_textures, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+/// `materials` with their textures as wgpu's own.
+pub fn resolve_materials(materials: &[YoctiteMaterial]) -> Result<Vec<ResolvedMaterial>, FrameworkError> {
+    materials
+        .iter()
+        .map(|material| {
+            let mut views = Vec::with_capacity(6);
+            let mut samplers = Vec::with_capacity(6);
+            for (texture, sampler) in &material.textures {
+                let (Some(texture), Some(sampler)) = (
+                    texture.as_any().downcast_ref::<WgpuTexture>(),
+                    sampler.as_any().downcast_ref::<WgpuSampler>(),
+                ) else {
+                    return Err(FrameworkError::Custom("Yoctite: a material texture not of wgpu".into()));
+                };
+                views.push(texture.wgpu_view().clone());
+                samplers.push(sampler.wgpu_sampler().clone());
+            }
+            Ok(ResolvedMaterial {
+                slot: material.slot,
+                params: material.params,
+                views: views.try_into().expect("six"),
+                samplers: samplers.try_into().expect("six"),
+            })
+        })
+        .collect()
 }
 
 /// A material with its textures as wgpu's own: see [`GBufferDrawer::record`].

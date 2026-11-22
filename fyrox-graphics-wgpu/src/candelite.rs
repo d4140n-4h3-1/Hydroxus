@@ -18,8 +18,23 @@
 //!
 //! On the GPU each card is a [`GpuCard`], six a mesh one after another, and each mesh slot of the
 //! pool says where its first card is ([`SurfaceCache::mesh_cards`]), or [`NO_CARDS`].
+//!
+//! The second part is the **hit lookup**. Candelite traces rays against a scene of its own
+//! ([`TraceScene`]): each mesh of the pool as an acceleration structure of its full-detail
+//! triangles, and each instance placed in the pool a copy of it, which names the instance's slot
+//! - so a hit knows its instance, so its mesh, so its cards. The hit is taken into the mesh's own
+//! space, and each card facing the ray finds it on its tile; a card that captured something else
+//! there (a branch in front, say) is not believed, and those that agree are averaged, each by how
+//! squarely it faces the ray ([`LOOKUP_WGSL`]). [`SurfaceView`] shows it: a ray from the eye
+//! through every pixel, and what the lookup says it hit. A mesh drawn with a cutout - foliage, its
+//! leaves cards whose texture is see-through between them - is traced as one: a ray passes where
+//! the texture is see-through, as the renderer's alpha test leaves it undrawn.
 
-use crate::yoctite::{Capture, GBufferDrawer, GeometryPool, MeshId, ResolvedMaterial};
+use crate::{
+    raytracing::CutoutMask,
+    yoctite::{Capture, GBufferDrawer, GeometryPool, MeshId, ResolvedMaterial},
+};
+use std::sync::Arc;
 use fyrox_graphics::error::FrameworkError;
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -439,6 +454,770 @@ impl SurfaceCache {
     }
 }
 
+/// Whether `device` can trace rays: it needs wgpu's ray queries.
+pub fn can_trace(device: &wgpu::Device) -> bool {
+    device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+}
+
+/// A mesh's triangles, as an acceleration structure to trace against; and, for a cutout, the
+/// texture coordinates of each triangle's corners and where its texture is solid.
+struct Traced {
+    blas: wgpu::Blas,
+    // Kept alive while the structure is.
+    _vertices: wgpu::Buffer,
+    _indices: wgpu::Buffer,
+    cutout: Option<(Vec<[f32; 2]>, Arc<CutoutMask>)>,
+}
+
+/// Where a mesh's cutout is, as the lookup reads it: by mesh slot, none wide for a solid mesh.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct CutoutRecord {
+    /// Where its triangles' corners start, counted in triangles.
+    first_triangle: u32,
+    /// Where its mask starts, in words.
+    first_word: u32,
+    width: u32,
+    height: u32,
+}
+
+/// What Candelite traces rays against: every mesh of the pool given its triangles, and every
+/// instance placed in the pool, naming its slot (see the module's description).
+pub struct TraceScene {
+    meshes: HashMap<u32, Traced>,
+    tlas: Option<wgpu::Tlas>,
+    capacity: u32,
+    /// What it was last built with, to build it again only when that changes: each instance's
+    /// slot, mesh and transform.
+    built: Vec<(u32, u32, [f32; 12])>,
+    /// The meshes' cutouts on the GPU - records by mesh slot, corners, masks - made afresh when
+    /// a mesh comes or goes.
+    cutouts: Option<[wgpu::Buffer; 3]>,
+}
+
+impl Default for TraceScene {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TraceScene {
+    /// An empty scene.
+    pub fn new() -> Self {
+        Self {
+            meshes: HashMap::new(),
+            tlas: None,
+            capacity: 0,
+            built: Vec::new(),
+            cutouts: None,
+        }
+    }
+
+    /// Gives `mesh` its triangles: `positions` in its own space, every three `indices` a
+    /// triangle; and for a cutout, each vertex's texture coordinates (as the renderer samples the
+    /// texture with) and where the texture is solid. Built at once, on the queue.
+    pub fn add_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: MeshId,
+        positions: &[[f32; 3]],
+        indices: &[u32],
+        cutout: Option<(&[[f32; 2]], Arc<CutoutMask>)>,
+    ) {
+        let index_count = (indices.len() / 3 * 3) as u32;
+        if positions.is_empty() || index_count == 0 {
+            return;
+        }
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteVertices"),
+            contents: bytemuck::cast_slice(positions),
+            usage: wgpu::BufferUsages::BLAS_INPUT,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteIndices"),
+            contents: bytemuck::cast_slice(&indices[..index_count as usize]),
+            usage: wgpu::BufferUsages::BLAS_INPUT,
+        });
+        let size = wgpu::BlasTriangleGeometrySizeDescriptor {
+            vertex_format: wgpu::VertexFormat::Float32x3,
+            vertex_count: positions.len() as u32,
+            index_format: Some(wgpu::IndexFormat::Uint32),
+            index_count: Some(index_count),
+            // A cutout is not opaque, so that the lookup is asked about each hit on it.
+            flags: if cutout.is_some() {
+                wgpu::AccelerationStructureGeometryFlags::NO_DUPLICATE_ANY_HIT_INVOCATION
+            } else {
+                wgpu::AccelerationStructureGeometryFlags::OPAQUE
+            },
+        };
+        let blas = device.create_blas(
+            &wgpu::CreateBlasDescriptor {
+                label: Some("CandeliteMesh"),
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            },
+            wgpu::BlasGeometrySizeDescriptors::Triangles {
+                descriptors: vec![size.clone()],
+            },
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("CandeliteMesh"),
+        });
+        encoder.build_acceleration_structures(
+            [&wgpu::BlasBuildEntry {
+                blas: &blas,
+                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+                    size: &size,
+                    vertex_buffer: &vertices,
+                    first_vertex: 0,
+                    vertex_stride: 12,
+                    index_buffer: Some(&index_buffer),
+                    first_index: Some(0),
+                    transform_buffer: None,
+                    transform_buffer_offset: None,
+                }]),
+            }],
+            std::iter::empty(),
+        );
+        queue.submit([encoder.finish()]);
+        let cutout = cutout.map(|(uvs, mask)| {
+            let corners = indices[..index_count as usize]
+                .iter()
+                .map(|&i| uvs.get(i as usize).copied().unwrap_or_default())
+                .collect();
+            (corners, mask)
+        });
+        self.meshes.insert(
+            mesh.0,
+            Traced {
+                blas,
+                _vertices: vertices,
+                _indices: index_buffer,
+                cutout,
+            },
+        );
+        self.built.clear();
+        self.cutouts = None;
+    }
+
+    /// Takes `mesh` out.
+    pub fn remove_mesh(&mut self, mesh: MeshId) {
+        if self.meshes.remove(&mesh.0).is_some() {
+            self.built.clear();
+            self.cutouts = None;
+        }
+    }
+
+    /// The meshes' cutouts on the GPU: a record by mesh slot, each triangle's corners'
+    /// texture coordinates, and the masks' words (see [`LOOKUP_WGSL`]).
+    pub fn cutout_buffers(&mut self, device: &wgpu::Device) -> &[wgpu::Buffer; 3] {
+        if self.cutouts.is_none() {
+            let slots = self.meshes.keys().map(|&m| m as usize + 1).max().unwrap_or(1);
+            let mut records = vec![CutoutRecord::default(); slots];
+            let mut corners: Vec<[f32; 2]> = Vec::new();
+            let mut words: Vec<u32> = Vec::new();
+            // A mask shared by several meshes is put in once.
+            let mut placed_masks: Vec<(*const CutoutMask, u32)> = Vec::new();
+            for (&mesh, traced) in &self.meshes {
+                let Some((mesh_corners, mask)) = &traced.cutout else {
+                    continue;
+                };
+                let first_word = match placed_masks.iter().find(|(m, _)| *m == Arc::as_ptr(mask)) {
+                    Some(&(_, first)) => first,
+                    None => {
+                        let first = words.len() as u32;
+                        words.extend_from_slice(mask.words());
+                        placed_masks.push((Arc::as_ptr(mask), first));
+                        first
+                    }
+                };
+                records[mesh as usize] = CutoutRecord {
+                    first_triangle: (corners.len() / 3) as u32,
+                    first_word,
+                    width: mask.width(),
+                    height: mask.height(),
+                };
+                corners.extend_from_slice(mesh_corners);
+            }
+            if corners.is_empty() {
+                corners.push([0.0; 2]);
+            }
+            if words.is_empty() {
+                words.push(0);
+            }
+            let buffer = |label, contents: &[u8]| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            };
+            self.cutouts = Some([
+                buffer("CandeliteCutouts", bytemuck::cast_slice(&records)),
+                buffer("CandeliteCutoutCorners", bytemuck::cast_slice(&corners)),
+                buffer("CandeliteCutoutMasks", bytemuck::cast_slice(&words)),
+            ]);
+        }
+        self.cutouts.as_ref().expect("made above")
+    }
+
+    /// Places a copy of its mesh for every instance placed in `pool` whose mesh it has, built
+    /// into `encoder` if anything changed since last time. Whether there is anything to trace.
+    pub fn update(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, pool: &GeometryPool) -> bool {
+        let placed: Vec<(u32, u32, [f32; 12])> = pool
+            .placed()
+            .filter(|(_, record)| self.meshes.contains_key(&record.mesh))
+            .map(|(slot, record)| (slot, record.mesh, record.transform))
+            .collect();
+        if placed.is_empty() {
+            return false;
+        }
+        if placed == self.built && self.tlas.is_some() {
+            return true;
+        }
+        let count = placed.len() as u32;
+        if self.tlas.is_none() || count > self.capacity {
+            self.capacity = count.next_power_of_two().max(64);
+            self.tlas = Some(device.create_tlas(&wgpu::CreateTlasDescriptor {
+                label: Some("CandeliteScene"),
+                max_instances: self.capacity,
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+            }));
+        }
+        let tlas = self.tlas.as_mut().expect("made above");
+        for i in 0..self.capacity as usize {
+            tlas[i] = placed.get(i).map(|&(slot, mesh, transform)| {
+                // The custom data holds 24 bits: slots past them would name the wrong instance.
+                wgpu::TlasInstance::new(&self.meshes[&mesh].blas, transform, slot & 0x00FF_FFFF, 0xFF)
+            });
+        }
+        encoder.build_acceleration_structures(std::iter::empty(), [&*tlas]);
+        self.built = placed;
+        true
+    }
+
+    /// The scene as last built.
+    pub fn tlas(&self) -> Option<&wgpu::Tlas> {
+        self.tlas.as_ref()
+    }
+}
+
+/// The hit lookup in WGSL, for a shader to include (with `enable wgpu_ray_query;` at its top):
+/// `candelite_trace(origin, direction, reach) -> SurfaceHit`. It binds, in group 0 from
+/// binding 0: the scene ([`TraceScene::tlas`]), the pool's instances, each mesh slot's first card,
+/// the cards ([`SurfaceCache::buffers`]), the atlas's diffuse, normal and depth layers, and the
+/// meshes' cutouts ([`TraceScene::cutout_buffers`]): see [`lookup_layout`] and [`lookup_group`].
+pub const LOOKUP_WGSL: &str = r#"
+struct CandeliteInstance {
+    transform: array<vec4f, 3>,
+    mesh: u32,
+    flags: u32,
+    material: u32,
+    morph: u32,
+};
+
+struct CandeliteCard {
+    center: vec4f,
+    u: vec4f,
+    v: vec4f,
+    tile: vec4u,
+};
+
+@group(0) @binding(0) var candeliteScene: acceleration_structure;
+@group(0) @binding(1) var<storage, read> candeliteInstances: array<CandeliteInstance>;
+@group(0) @binding(2) var<storage, read> candeliteMeshCards: array<u32>;
+@group(0) @binding(3) var<storage, read> candeliteCards: array<CandeliteCard>;
+@group(0) @binding(4) var candeliteDiffuse: texture_2d<f32>;
+@group(0) @binding(5) var candeliteNormal: texture_2d<f32>;
+@group(0) @binding(6) var candeliteDepth: texture_depth_2d;
+
+// Each mesh slot's cutout, none wide for a solid mesh; each cutout triangle's corners' texture
+// coordinates; and the masks' bits.
+struct CandeliteCutout {
+    firstTriangle: u32,
+    firstWord: u32,
+    width: u32,
+    height: u32,
+};
+@group(0) @binding(7) var<storage, read> candeliteCutouts: array<CandeliteCutout>;
+@group(0) @binding(8) var<storage, read> candeliteCorners: array<vec2f>;
+@group(0) @binding(9) var<storage, read> candeliteMasks: array<u32>;
+
+// Whether a ray crossing triangle `primitive` of `mesh` at `barycentrics` is stopped there: on a
+// solid mesh, always; on a cutout, where its texture is solid. Texture coordinates repeat, as the
+// renderer samples them.
+fn candelite_stops(mesh: u32, primitive: u32, barycentrics: vec2f) -> bool {
+    let cutout = candeliteCutouts[mesh];
+    if (cutout.width == 0u) {
+        return true;
+    }
+    let corner = (cutout.firstTriangle + primitive) * 3u;
+    let uv = candeliteCorners[corner] * (1.0 - barycentrics.x - barycentrics.y)
+        + candeliteCorners[corner + 1u] * barycentrics.x
+        + candeliteCorners[corner + 2u] * barycentrics.y;
+    let wrapped = fract(uv);
+    let x = min(u32(wrapped.x * f32(cutout.width)), cutout.width - 1u);
+    let y = min(u32(wrapped.y * f32(cutout.height)), cutout.height - 1u);
+    let bit = y * cutout.width + x;
+    return ((candeliteMasks[cutout.firstWord + bit / 32u] >> (bit % 32u)) & 1u) != 0u;
+}
+
+// What a ray found: whether it hit anything; whether the cards saw what it hit (`covered`), or
+// at least something there - in front of it, as inside a crown, where every card sees the outer
+// needles - from which what it looks like is taken (`seen`); how far it went, and where to; and
+// what it hit looks like: its diffuse colour, and which way it faces. A hit the cards did not see
+// is to be lit where it is, not from the cache, which holds the light on what they saw.
+struct SurfaceHit {
+    hit: bool,
+    covered: bool,
+    seen: bool,
+    distance: f32,
+    position: vec3f,
+    diffuse: vec3f,
+    normal: vec3f,
+};
+
+// How far a card's captured surface may be from the hit, in meters, and still be taken as it:
+// a few of its texels, as a surface sloping across a texel is captured at one depth.
+const CANDELITE_DEPTH_SLACK: f32 = 0.3;
+
+// The texel of a card's `tile` nearest `within` it (its texel there, counted from the tile's
+// corner) that saw something, a ring of one texel round it, then of two; or all ones if none did.
+fn candelite_nearest_seen(tile: vec4u, within: vec2u) -> vec2u {
+    for (var ring = 1i; ring <= 2i; ring++) {
+        for (var dy = -ring; dy <= ring; dy++) {
+            for (var dx = -ring; dx <= ring; dx++) {
+                if (max(abs(dx), abs(dy)) != ring) {
+                    continue;
+                }
+                let at = vec2i(within) + vec2i(dx, dy);
+                if (any(at < vec2i(0)) || any(at >= vec2i(tile.zw))) {
+                    continue;
+                }
+                let texel = tile.xy + vec2u(at);
+                if (textureLoad(candeliteDepth, texel, 0) < 1.0) {
+                    return texel;
+                }
+            }
+        }
+    }
+    return vec2u(0xFFFFFFFFu);
+}
+
+fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
+    var hit = SurfaceHit(false, false, false, reach, origin + direction * reach, vec3f(0.0), -direction);
+    var query: ray_query;
+    rayQueryInitialize(&query, candeliteScene, RayDesc(0u, 0xFFu, 0.0, reach, origin, direction));
+    // Only cutouts are asked about: whether the ray is stopped where it crosses them.
+    while (rayQueryProceed(&query)) {
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        let mesh = candeliteInstances[candidate.instance_custom_data].mesh;
+        if (candelite_stops(mesh, candidate.primitive_index, candidate.barycentrics)) {
+            rayQueryConfirmIntersection(&query);
+        }
+    }
+    let found = rayQueryGetCommittedIntersection(&query);
+    if (found.kind == RAY_QUERY_INTERSECTION_NONE) {
+        return hit;
+    }
+    hit.hit = true;
+    hit.distance = found.t;
+    hit.position = origin + direction * found.t;
+    let instance = candeliteInstances[found.instance_custom_data];
+    let first = candeliteMeshCards[instance.mesh];
+    if (first == 0xFFFFFFFFu) {
+        return hit;
+    }
+    // In the mesh's own space, where its cards are.
+    let p = found.world_to_object * vec4f(hit.position, 1.0);
+    let d = normalize(found.world_to_object * vec4f(direction, 0.0));
+    var diffuse = vec3f(0.0);
+    var normal = vec3f(0.0);
+    var weight = 0.0;
+    // What the cards saw there, if not what was hit.
+    var near_diffuse = vec3f(0.0);
+    var near_normal = vec3f(0.0);
+    var near_weight = 0.0;
+    for (var c = 0u; c < 6u; c++) {
+        let card = candeliteCards[first + c];
+        let u = card.u.xyz;
+        let v = card.v.xyz;
+        let n = cross(u, v);
+        let facing = -dot(n, d);
+        if (facing <= 0.0) {
+            continue;
+        }
+        let local = p - card.center.xyz;
+        let s = dot(local, u) / card.u.w;
+        let t = dot(local, v) / card.v.w;
+        if (abs(s) > 1.0 || abs(t) > 1.0) {
+            continue;
+        }
+        // Its tile's texel there: across from the left, up from the bottom.
+        let size = card.tile.zw;
+        let within = min(vec2u(vec2f(s * 0.5 + 0.5, 0.5 - t * 0.5) * vec2f(size)), size - 1u);
+        let texel = card.tile.xy + within;
+        // Where the card saw nothing, its depth is the far side's: never what was hit, however
+        // thin the bounds.
+        let share = textureLoad(candeliteDepth, texel, 0);
+        if (share >= 1.0) {
+            // A gap in what the card saw - foliage, captured a few texels to a meter, is full of
+            // them: the nearest texel round it that saw something, if any, for what it looks like.
+            let near = candelite_nearest_seen(card.tile, within);
+            if (near.x == 0xFFFFFFFFu) {
+                continue;
+            }
+            near_diffuse += textureLoad(candeliteDiffuse, near, 0).rgb * facing;
+            near_normal += (textureLoad(candeliteNormal, near, 0).xyz * 2.0 - 1.0) * facing;
+            near_weight += facing;
+            continue;
+        }
+        let texel_diffuse = textureLoad(candeliteDiffuse, texel, 0).rgb * facing;
+        let texel_normal = (textureLoad(candeliteNormal, texel, 0).xyz * 2.0 - 1.0) * facing;
+        if (abs(share * card.center.w + dot(local, n)) > CANDELITE_DEPTH_SLACK) {
+            near_diffuse += texel_diffuse;
+            near_normal += texel_normal;
+            near_weight += facing;
+            continue;
+        }
+        diffuse += texel_diffuse;
+        normal += texel_normal;
+        weight += facing;
+    }
+    if (weight > 0.0) {
+        hit.covered = true;
+        hit.seen = true;
+    } else if (near_weight > 0.0) {
+        hit.seen = true;
+        diffuse = near_diffuse;
+        normal = near_normal;
+        weight = near_weight;
+    } else {
+        return hit;
+    }
+    hit.diffuse = diffuse / weight;
+    hit.normal = normalize(found.object_to_world * vec4f(normal / weight, 0.0));
+    return hit;
+}
+"#;
+
+/// What [`SurfaceView`] shows of what the rays hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewShows {
+    /// The diffuse colour, as captured.
+    Diffuse,
+    /// The diffuse colour, lit from above and a little to one side by the normal: to see shapes.
+    Shaded,
+    /// The normal, as the G-Buffer stores it (each axis from -1 to 1 brought to 0 to 1).
+    Normal,
+}
+
+const VIEW_SHADER: &str = r#"
+struct View {
+    inverseViewProjection: mat4x4f,
+    eye: vec3f,
+    shows: u32,
+    size: vec2f,
+    pad0: vec2f,
+};
+@group(1) @binding(0) var<uniform> view: View;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+    let x = f32(i32(index) / 2) * 4.0 - 1.0;
+    let y = f32(i32(index) & 1) * 4.0 - 1.0;
+    return vec4f(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    // Stored top row first: up the screen is down the rows.
+    let ndc = vec2f(at.x / view.size.x * 2.0 - 1.0, 1.0 - at.y / view.size.y * 2.0);
+    let far = view.inverseViewProjection * vec4f(ndc, 1.0, 1.0);
+    let direction = normalize(far.xyz / far.w - view.eye);
+    let hit = candelite_trace(view.eye, direction, 1.0e4);
+    if (!hit.hit) {
+        return vec4f(0.0);
+    }
+    if (!hit.seen) {
+        // Hit, but no card saw anything there: magenta, to stand out.
+        return vec4f(1.0, 0.0, 1.0, 1.0);
+    }
+    switch view.shows {
+        case 0u: {
+            return vec4f(hit.diffuse, 1.0);
+        }
+        case 2u: {
+            return vec4f(hit.normal * 0.5 + 0.5, 1.0);
+        }
+        default: {
+            let light = 0.35 + 0.65 * max(dot(hit.normal, normalize(vec3f(0.3, 1.0, 0.2))), 0.0);
+            return vec4f(hit.diffuse * light, 1.0);
+        }
+    }
+}
+"#;
+
+/// The format [`SurfaceView`] draws in.
+pub const VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Shows the hit lookup at work: a ray from the eye through every pixel, and what it found - see
+/// [`ViewShows`]. Where a ray hit nothing, the target is left clear; where it hit something no
+/// card saw anything at, magenta.
+pub struct SurfaceView {
+    lookup_layout: wgpu::BindGroupLayout,
+    view_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl SurfaceView {
+    /// The view's pipeline, made once; [`None`] if `device` cannot trace rays.
+    pub fn new(device: &wgpu::Device) -> Option<Self> {
+        if !can_trace(device) {
+            return None;
+        }
+        let lookup_layout = lookup_layout(device, wgpu::ShaderStages::FRAGMENT);
+        let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteView"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteView"),
+            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{VIEW_SHADER}").into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("CandeliteView"),
+            bind_group_layouts: &[Some(&lookup_layout), Some(&view_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CandeliteView"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(VIEW_FORMAT.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Some(Self {
+            lookup_layout,
+            view_layout,
+            pipeline,
+        })
+    }
+
+    /// Records the view from `eye`, through `inverse_view_projection` (column by column,
+    /// OpenGL's clip space), into `target` - of [`VIEW_FORMAT`] - cleared first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &mut TraceScene,
+        pool: &GeometryPool,
+        cache: &mut SurfaceCache,
+        inverse_view_projection: [[f32; 4]; 4],
+        eye: [f32; 3],
+        shows: ViewShows,
+        target: &wgpu::Texture,
+    ) {
+        let view = target.create_view(&Default::default());
+        let lookup = lookup_group(device, &self.lookup_layout, scene, pool, cache);
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Uniforms {
+            inverse_view_projection: [[f32; 4]; 4],
+            eye: [f32; 3],
+            shows: u32,
+            size: [f32; 2],
+            _padding: [f32; 2],
+        }
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteView"),
+            contents: bytemuck::bytes_of(&Uniforms {
+                inverse_view_projection,
+                eye,
+                shows: match shows {
+                    ViewShows::Diffuse => 0,
+                    ViewShows::Shaded => 1,
+                    ViewShows::Normal => 2,
+                },
+                size: [target.width() as f32, target.height() as f32],
+                _padding: [0.0; 2],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let view_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteView"),
+            layout: &self.view_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("CandeliteView"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        // Nothing to trace against: left clear.
+        let Some(lookup) = lookup else {
+            return;
+        };
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &lookup, &[]);
+        pass.set_bind_group(1, &view_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// The bind group layout of [`LOOKUP_WGSL`], for the shader stages `visibility`.
+pub fn lookup_layout(device: &wgpu::Device, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayout {
+    let storage = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let texture = |binding, sample_type| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let unfiltered = wgpu::TextureSampleType::Float { filterable: false };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("CandeliteLookup"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility,
+                ty: wgpu::BindingType::AccelerationStructure {
+                    vertex_return: false,
+                },
+                count: None,
+            },
+            storage(1),
+            storage(2),
+            storage(3),
+            texture(4, unfiltered),
+            texture(5, unfiltered),
+            texture(6, wgpu::TextureSampleType::Depth),
+            storage(7),
+            storage(8),
+            storage(9),
+        ],
+    })
+}
+
+/// The bind group of [`LOOKUP_WGSL`], for `layout` (see [`lookup_layout`]).
+pub fn lookup_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene: &mut TraceScene,
+    pool: &GeometryPool,
+    cache: &mut SurfaceCache,
+) -> Option<wgpu::BindGroup> {
+    scene.cutout_buffers(device);
+    let tlas = scene.tlas.as_ref()?;
+    let [cutouts, corners, masks] = scene.cutouts.as_ref().expect("made above");
+    let diffuse = cache.layers[0].create_view(&Default::default());
+    let normal = cache.layers[1].create_view(&Default::default());
+    let depth = cache.depth.create_view(&wgpu::TextureViewDescriptor {
+        aspect: wgpu::TextureAspect::DepthOnly,
+        ..Default::default()
+    });
+    let (cards, mesh_cards) = cache.buffers(device);
+    Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("CandeliteLookup"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::AccelerationStructure(tlas),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: pool.instances.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: mesh_cards.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: cards.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&diffuse),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&normal),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(&depth),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: cutouts.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: corners.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: masks.as_entire_binding(),
+            },
+        ],
+    }))
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -684,5 +1463,144 @@ mod test {
         // Taken out and in again, the room is used again.
         cache.remove_mesh(meshes[0]);
         assert!(cache.add_mesh(meshes[0], &Bounds { min: [-1.0, 0.0, -2.0], max: [1.0, 1.5, 2.0] }, &[], 0).is_some());
+    }
+
+    #[test]
+    fn a_ray_finds_what_it_hit_on_the_cards() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray tracing: skipped");
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            // As the renderer asks for ray queries: an experimental feature of wgpu's.
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .expect("device");
+
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        let mut captures = Vec::new();
+        // A box turned a quarter about up (its -x face towards +z) 10 m down -z; and a sheet
+        // facing up, 3 m overhead, seen from below.
+        let quarter = |t: [f32; 3]| [0.0, 0.0, 1.0, t[0], 0.0, 1.0, 0.0, t[1], -1.0, 0.0, 0.0, t[2]];
+        let shifted = |t: [f32; 3]| [1.0, 0.0, 0.0, t[0], 0.0, 1.0, 0.0, t[1], 0.0, 0.0, 1.0, t[2]];
+        for (min, max, top_only, transform) in [
+            ([-1.0, 0.0, -2.0], [1.0, 1.5, 2.0], false, quarter([0.0, 0.0, -10.0])),
+            ([-1.5, 0.0, -1.0], [1.5, 0.0, 1.0], true, shifted([0.0, 3.0, -3.0])),
+        ] {
+            let (vertices, indices) = boxed(min, max, top_only);
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let first = pool.mesh(mesh).unwrap().first_cluster;
+            let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+            captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, 0).expect("room"));
+            scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+            pool.add_instance(&device, &queue, mesh, transform, 0);
+        }
+        // A blue card 5 m out, in front of the box: drawn on its left half, see-through on its
+        // right (its texture's alpha), traced as a cutout.
+        let card: Vec<PoolVertex> = [(-0.5, 0.25), (0.5, 0.25), (0.5, 1.25), (-0.5, 1.25)]
+            .map(|(x, y)| PoolVertex {
+                position: [x, y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv: [x + 0.5, 0.5],
+                tangent: [1.0, 0.0, 0.0, 1.0],
+            })
+            .to_vec();
+        let card_indices = [0, 1, 2, 0, 2, 3];
+        let positions: Vec<[f32; 3]> = card.iter().map(|v| v.position).collect();
+        let uvs: Vec<[f32; 2]> = card.iter().map(|v| v.uv).collect();
+        let dag = yoctite::build(&yoctite::Mesh::new(&positions, &card_indices), Default::default());
+        let mesh = pool.add_mesh(&device, &queue, &dag, &card);
+        let first = pool.mesh(mesh).unwrap().first_cluster;
+        captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &[first], 1).expect("room"));
+        let mask = Arc::new(CutoutMask::new(2, 1, |x, _| x == 0));
+        scene.add_mesh(&device, &queue, mesh, &positions, &card_indices, Some((&uvs, mask)));
+        pool.add_instance(&device, &queue, mesh, shifted([0.0, 0.0, -5.0]), 1);
+
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let half = {
+            let texture = device.create_texture_with_data(
+                &queue,
+                &wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                Default::default(),
+                &[255, 255, 255, 255, 255, 255, 255, 0],
+            );
+            (texture.create_view(&Default::default()), device.create_sampler(&Default::default()))
+        };
+        let material = |slot, colour: [f32; 4], diffuse: &(wgpu::TextureView, wgpu::Sampler)| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: colour,
+                ..Default::default()
+            },
+            views: [diffuse.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [diffuse.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, [1.0, 0.5, 0.25, 1.0], &white), material(1, [0.25, 0.5, 1.0, 1.0], &half)];
+        let mut drawer = GBufferDrawer::new(&device);
+        let view = SurfaceView::new(&device).expect("can trace");
+
+        // From the origin at the box's middle height, looking down -z, 90 degrees across.
+        const SIZE: u32 = 64;
+        let eye = [0.0, 0.75, 0.0];
+        let reach = 1.0;
+        let inverse = [[reach, 0.0, 0.0, 0.0], [0.0, reach, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [eye[0], eye[1], eye[2] - reach, 1.0]];
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut look = |shows| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+            assert!(scene.update(&device, &mut encoder, &pool));
+            view.record(&device, &mut encoder, &mut scene, &pool, &mut cache, inverse, eye, shows, &target);
+            queue.submit([encoder.finish()]);
+            texels(&device, &queue, &target, wgpu::TextureAspect::All, 4)
+        };
+        let diffuse = look(ViewShows::Diffuse);
+        let normal = look(ViewShows::Normal);
+        let at = |x: u32, y: u32| (y * SIZE + x) as usize;
+        let middle = at(SIZE / 2, SIZE / 2);
+        assert_eq!(diffuse[middle].to_le_bytes(), [255, 128, 64, 255], "the box's face, as captured");
+        // Facing the eye, +z in the world: its -x face in its own space, turned.
+        let n = normal[middle].to_le_bytes();
+        assert!(n[0].abs_diff(128) <= 2 && n[1].abs_diff(128) <= 2 && n[2] >= 253, "normal {n:?}");
+        // Off to the side, past the box: nothing.
+        assert_eq!(diffuse[at(2, SIZE / 2)], 0, "missed");
+        // Overhead, the sheet's underside: hit, but no card saw it.
+        let magenta = (0..SIZE / 3).flat_map(|y| (0..SIZE).map(move |x| (x, y))).filter(|&(x, y)| diffuse[at(x, y)].to_le_bytes() == [255, 0, 255, 255]).count();
+        assert!(magenta > 20, "the sheet's underside, uncovered: {magenta} pixels");
+        let box_magenta = (SIZE / 2 - 3..SIZE / 2 + 3).filter(|&x| diffuse[at(x, SIZE / 2)].to_le_bytes() == [255, 0, 255, 255]).count();
+        assert_eq!(box_magenta, 0, "every hit on the box found on its cards");
+        // Through the card's drawn half, the card; through its see-through half, the box behind.
+        assert_eq!(diffuse[at(30, SIZE / 2)].to_le_bytes(), [64, 128, 255, 255], "the card's drawn half");
+        assert_eq!(diffuse[at(34, SIZE / 2)].to_le_bytes(), [255, 128, 64, 255], "the box, through the card");
     }
 }
