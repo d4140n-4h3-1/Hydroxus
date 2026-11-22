@@ -19,6 +19,7 @@ fyrox-core = { version = "2.0.0-rc.1", path = "../fyrox-core" }
 wgpu = { version = "30.0.0" }
 # Uniform and vertex data for the ray tracing pass is written as plain bytes.
 bytemuck = { version = "1", features = ["derive"] }
+half = "2.2.1"
 # Yoctite's clusters and levels of detail, built on the CPU, kept on the GPU by `yoctite`.
 yoctite = { version = "0.1.0", path = "../yoctite" }
 

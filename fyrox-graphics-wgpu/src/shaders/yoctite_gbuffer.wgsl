@@ -6,6 +6,12 @@
 // vertex `i` is corner `i % 3` of triangle `i / 3`, fetched through the cluster from the pool,
 // and past the cluster's last triangle every corner is put at one point, which draws nothing.
 //
+// A copy of a mesh that bends (morph targets: a tree swaying, say) has a block in the vertex
+// buffer (`Instance.morph`): where its mesh's vertices and their offsets start, how many targets,
+// and its weights. Each vertex is moved, and its normal turned, by every target with a weight,
+// its offsets read as half floats, two to a word. The vertex buffer is read as words for that,
+// and its floats as their bits.
+//
 // What is written matches the engine's standard and glTF shaders' G-Buffer pass: the diffuse
 // colour (texture times colour, alpha-tested at a half), the normal from the normal map in the
 // surface's tangent space, metallic, roughness and occlusion, emission, and the decal layer.
@@ -31,8 +37,11 @@ struct Instance {
     mesh: u32,
     flags: u32,
     material: u32,
-    pad0: u32,
+    // Where its morph block starts, in words, or NO_MORPH.
+    morph: u32,
 };
+
+const NO_MORPH: u32 = 0xFFFFFFFFu;
 
 struct MaterialRange {
     count: u32,
@@ -68,7 +77,7 @@ struct Material {
 const VERTEX_FLOATS: u32 = 12u;
 
 @group(0) @binding(0) var<uniform> frame: Frame;
-@group(0) @binding(1) var<storage, read> vertices: array<f32>;
+@group(0) @binding(1) var<storage, read> vertices: array<u32>;
 @group(0) @binding(2) var<storage, read> clusterVertices: array<u32>;
 @group(0) @binding(3) var<storage, read> triangles: array<u32>;
 @group(0) @binding(4) var<storage, read> clusters: array<Cluster>;
@@ -98,6 +107,11 @@ struct VertexOutput {
     @location(3) binormal: vec3f,
 };
 
+// A float the vertex buffer holds, from its bits.
+fn word(at: u32) -> f32 {
+    return bitcast<f32>(vertices[at]);
+}
+
 fn place(instance: Instance, p: vec3f, w: f32) -> vec3f {
     let q = vec4f(p, w);
     return vec3f(dot(instance.transform[0], q), dot(instance.transform[1], q), dot(instance.transform[2], q));
@@ -116,11 +130,30 @@ fn vs_main(@builtin(vertex_index) index: u32, @builtin(instance_index) item: u32
     }
     let packed = triangles[cluster.firstTriangle + triangle];
     let local = (packed >> (8u * (index % 3u))) & 0xFFu;
-    let v = clusterVertices[cluster.firstVertex + local] * VERTEX_FLOATS;
-    let position = vec3f(vertices[v], vertices[v + 1u], vertices[v + 2u]);
-    let normal = vec3f(vertices[v + 3u], vertices[v + 4u], vertices[v + 5u]);
-    let uv = vec2f(vertices[v + 6u], vertices[v + 7u]);
-    let tangent = vec4f(vertices[v + 8u], vertices[v + 9u], vertices[v + 10u], vertices[v + 11u]);
+    let poolVertex = clusterVertices[cluster.firstVertex + local];
+    let v = poolVertex * VERTEX_FLOATS;
+    var position = vec3f(word(v), word(v + 1u), word(v + 2u));
+    var normal = vec3f(word(v + 3u), word(v + 4u), word(v + 5u));
+    let uv = vec2f(word(v + 6u), word(v + 7u));
+    let tangent = vec4f(word(v + 8u), word(v + 9u), word(v + 10u), word(v + 11u));
+
+    if (instance.morph != NO_MORPH) {
+        let block = instance.morph;
+        let targets = vertices[block + 2u];
+        let offsets = vertices[block + 1u] + (poolVertex - vertices[block]) * targets * 3u;
+        for (var t = 0u; t < targets; t++) {
+            let weight = word(block + 3u + t);
+            // The weights are the instance's, the same over its cluster: alike for all.
+            if (weight == 0.0) {
+                continue;
+            }
+            let a = unpack2x16float(vertices[offsets + t * 3u]);
+            let b = unpack2x16float(vertices[offsets + t * 3u + 1u]);
+            let c = unpack2x16float(vertices[offsets + t * 3u + 2u]);
+            position += vec3f(a.x, a.y, b.x) * weight;
+            normal += vec3f(b.y, c.x, c.y) * weight;
+        }
+    }
 
     var clip = frame.viewProjection * vec4f(place(instance, position, 1.0), 1.0);
     // The renderer's matrices make OpenGL's clip depth, from -w to w; wgpu's is from 0 to w.

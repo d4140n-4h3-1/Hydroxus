@@ -12,7 +12,16 @@
 //! - and a record of the mesh ([`GpuMesh`]): where its clusters are.
 //!
 //! [`GeometryPool::add_instance`] places a copy of a mesh ([`GpuInstance`]): a transform and which
-//! mesh. Instances come and go and move as the scene does; meshes are uploaded once and stay until
+//! mesh.
+//!
+//! A mesh can bend: [`GeometryPool::add_morphing_mesh`] uploads, with its vertices, how far each
+//! of its morph targets (blend shapes) moves each of them, and each copy of it is given weights
+//! for them ([`GeometryPool::set_weights`]) - a tree swaying in the wind, every tree its own way.
+//! The offsets, as half floats, and each copy's weights live in the vertex buffer itself, past
+//! the vertices: a pass that draws the pool needs no buffer more for them (see [`GpuInstance`]).
+//! Every level of detail bends alike, since each of a coarser level's vertices is one of the
+//! mesh's own or a copy of one, with its offsets; and each cluster's bounds take in as far as its
+//! vertices can be moved, so culling never leaves out a bent branch. Instances come and go and move as the scene does; meshes are uploaded once and stay until
 //! removed. Freed room is used again, and a buffer that runs out of room is made twice as big,
 //! with what it held copied across, so nothing already in it moves.
 //!
@@ -54,6 +63,7 @@ pub struct PoolVertex {
 
 /// How many floats a [`PoolVertex`] is: what a shader steps through the vertex buffer by.
 pub const VERTEX_FLOATS: u32 = (std::mem::size_of::<PoolVertex>() / 4) as u32;
+const VERTEX_BYTES: u64 = std::mem::size_of::<PoolVertex>() as u64;
 
 /// A cluster as the GPU reads it.
 #[repr(C)]
@@ -114,9 +124,32 @@ pub struct GpuInstance {
     /// Which material it is drawn with: a slot the caller numbers, from 0 (see
     /// [`CullParameters::material_slots`]).
     pub material: u32,
-    /// To a multiple of sixteen bytes.
-    pub _padding: u32,
+    /// For a copy of a mesh that bends, where its block in the vertex buffer starts, counted in
+    /// words; else [`NO_MORPH`]. The block is the mesh's first vertex, where its offsets start
+    /// (again in words), and how many targets it has, then the copy's weight for each target.
+    /// The offsets are each vertex's, target after target, three words each: position x and y,
+    /// z and normal x, normal y and z, as two half floats a word, low half first.
+    pub morph: u32,
 }
+
+/// [`GpuInstance::morph`] for a copy of a mesh that does not bend.
+pub const NO_MORPH: u32 = u32::MAX;
+
+/// How a mesh bends: its morph targets' offsets, for [`GeometryPool::add_morphing_mesh`].
+#[derive(Debug, Clone, Copy)]
+pub struct Morphs<'a> {
+    /// How many targets it has.
+    pub targets: u32,
+    /// For each vertex, for each target, how far it moves the vertex's position and its normal,
+    /// at a weight of 1: vertex after vertex, the vertex's targets in order.
+    pub offsets: &'a [[f32; 6]],
+    /// The largest weight a target is given, either way: each cluster's bounds are grown by as
+    /// far as its vertices can move with every target at this.
+    pub most_weight: f32,
+}
+
+/// How many words of a block before the weights (see [`GpuInstance::morph`]).
+const MORPH_HEADER: u32 = 3;
 
 /// An instance slot in use.
 pub const INSTANCE_ALIVE: u32 = 1;
@@ -271,6 +304,13 @@ impl<T: bytemuck::Pod> PoolBuffer<T> {
         }
     }
 
+    /// Writes `bytes` at `offset` bytes into the buffer, which has to be in room handed out.
+    fn write_bytes(&self, queue: &wgpu::Queue, offset: u64, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            queue.write_buffer(&self.buffer, offset, bytes);
+        }
+    }
+
     fn free(&mut self, start: u32, count: u32) {
         self.ranges.free(start, count);
     }
@@ -297,6 +337,13 @@ struct MeshPlace {
     record: GpuMesh,
     cluster_vertices: (u32, u32),
     triangles: (u32, u32),
+    /// Its morph targets' offsets, in vertex slots, and how many targets, if it bends.
+    morphs: Option<(u32, u32, u32)>,
+}
+
+/// How many vertex slots `words` words take.
+fn slots_for(words: u32) -> u32 {
+    words.div_ceil(VERTEX_FLOATS)
 }
 
 /// What is in a pool, for statistics.
@@ -334,6 +381,19 @@ pub struct GeometryPool {
     places: Vec<Option<MeshPlace>>,
     /// Each instance slot's record, while it is in use.
     placed: Vec<Option<GpuInstance>>,
+    /// Each instance slot's morph block while it is in use and bends.
+    blocks: Vec<Option<Block>>,
+    /// Instance slots whose weights changed since the last [`GeometryPool::flush`].
+    changed: Vec<u32>,
+}
+
+/// An instance's morph block (see [`GpuInstance::morph`]): where it is, in vertex slots, how
+/// many, and its words as last set.
+#[derive(Debug, Clone, PartialEq)]
+struct Block {
+    at: u32,
+    slots: u32,
+    words: Vec<u32>,
 }
 
 impl GeometryPool {
@@ -350,6 +410,8 @@ impl GeometryPool {
             instances: PoolBuffer::new(device, "YoctiteInstances", 1024, none),
             places: Vec::new(),
             placed: Vec::new(),
+            blocks: Vec::new(),
+            changed: Vec::new(),
         }
     }
 
@@ -362,8 +424,69 @@ impl GeometryPool {
         dag: &ClusterDag,
         vertices: &[PoolVertex],
     ) -> MeshId {
+        self.add_morphing_mesh(device, queue, dag, vertices, None)
+    }
+
+    /// Uploads a mesh that bends: as [`Self::add_mesh`], with how its morph targets move its
+    /// `vertices` (one for each, so for the graph's extra vertices too: see
+    /// [`ClusterDag::extend_vertices`]). Without targets, or with offsets not one for each
+    /// vertex and target, it is uploaded as one that does not bend.
+    pub fn add_morphing_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dag: &ClusterDag,
+        vertices: &[PoolVertex],
+        morphs: Option<Morphs>,
+    ) -> MeshId {
+        let morphs = morphs.filter(|m| {
+            let fits = m.offsets.len() == vertices.len() * m.targets as usize;
+            if !fits {
+                fyrox_core::log::Log::warn(format!(
+                    "Yoctite: {} morph offsets for {} vertices and {} targets; the mesh is drawn unbent",
+                    m.offsets.len(),
+                    vertices.len(),
+                    m.targets
+                ));
+            }
+            m.targets > 0 && fits
+        });
         let first_vertex = self.vertices.allocate(device, queue, vertices.len() as u32);
         self.vertices.write(queue, first_vertex, vertices);
+
+        // How far each vertex can be moved, every target at its most.
+        let reach: Vec<f32> = match morphs {
+            Some(m) => m
+                .offsets
+                .chunks_exact(m.targets as usize)
+                .map(|targets| {
+                    m.most_weight.abs()
+                        * targets
+                            .iter()
+                            .map(|o| (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt())
+                            .sum::<f32>()
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let morph_place = morphs.map(|m| {
+            let words: Vec<u32> = m
+                .offsets
+                .iter()
+                .flat_map(|o| {
+                    let half = |v: f32| half::f16::from_f32(v).to_bits() as u32;
+                    [
+                        half(o[0]) | half(o[1]) << 16,
+                        half(o[2]) | half(o[3]) << 16,
+                        half(o[4]) | half(o[5]) << 16,
+                    ]
+                })
+                .collect();
+            let slots = slots_for(words.len() as u32);
+            let start = self.vertices.allocate(device, queue, slots);
+            self.vertices.write_bytes(queue, start as u64 * VERTEX_BYTES, bytemuck::cast_slice(&words));
+            (start, slots, m.targets)
+        });
 
         let vertex_total: u32 = dag.clusters.iter().map(|c| c.vertices.len() as u32).sum();
         let triangle_total: u32 = dag.clusters.iter().map(|c| c.triangles.len() as u32).sum();
@@ -377,13 +500,23 @@ impl GeometryPool {
         let mut records = Vec::with_capacity(dag.clusters.len());
         let sphere = |s: &yoctite::Sphere| [s.center[0], s.center[1], s.center[2], s.radius];
         let mut bounds: Option<yoctite::Sphere> = None;
+        let mut most_reach = 0.0f32;
         for cluster in &dag.clusters {
+            // Grown by as far as its vertices can be bent out of them.
+            let grown = cluster
+                .vertices
+                .iter()
+                .filter_map(|&v| reach.get(v as usize))
+                .fold(0.0f32, |a, &b| a.max(b));
+            most_reach = most_reach.max(grown);
+            let mut grown_bounds = sphere(&cluster.bounds);
+            grown_bounds[3] += grown;
             records.push(GpuCluster {
                 first_vertex: first_cluster_vertex + cluster_vertices.len() as u32,
                 first_triangle: first_triangle + triangles.len() as u32,
                 vertex_count: cluster.vertices.len() as u32,
                 triangle_count: cluster.triangles.len() as u32,
-                bounds: sphere(&cluster.bounds),
+                bounds: grown_bounds,
                 lod_bounds: sphere(&cluster.lod_bounds),
                 parent_bounds: sphere(&cluster.parent_bounds),
                 error: cluster.error,
@@ -402,12 +535,14 @@ impl GeometryPool {
         self.cluster_vertices.write(queue, first_cluster_vertex, &cluster_vertices);
         self.triangles.write(queue, first_triangle, &triangles);
         self.clusters.write(queue, first_cluster, &records);
+        let mut bounds = sphere(&bounds.unwrap_or_default());
+        bounds[3] += most_reach;
         let record = GpuMesh {
             first_cluster,
             cluster_count: dag.clusters.len() as u32,
             first_vertex,
             vertex_count: vertices.len() as u32,
-            bounds: sphere(&bounds.unwrap_or_default()),
+            bounds,
         };
         self.meshes.write(queue, mesh, &[record]);
 
@@ -419,6 +554,7 @@ impl GeometryPool {
             record,
             cluster_vertices: (first_cluster_vertex, vertex_total),
             triangles: (first_triangle, triangle_total),
+            morphs: morph_place,
         });
         MeshId(mesh)
     }
@@ -431,6 +567,9 @@ impl GeometryPool {
         };
         let r = place.record;
         self.vertices.free(r.first_vertex, r.vertex_count);
+        if let Some((start, slots, _)) = place.morphs {
+            self.vertices.free(start, slots);
+        }
         self.cluster_vertices.free(place.cluster_vertices.0, place.cluster_vertices.1);
         self.triangles.free(place.triangles.0, place.triangles.1);
         self.clusters.free(r.first_cluster, r.cluster_count);
@@ -454,19 +593,87 @@ impl GeometryPool {
         material: u32,
     ) -> InstanceId {
         let slot = self.instances.allocate(device, queue, 1);
+        // A copy of a mesh that bends gets a block of its own: the mesh's morphs, where to find
+        // them, and its weights, all at nothing to begin with.
+        let place = self.places.get(mesh.0 as usize).copied().flatten();
+        let block = place.and_then(|p| p.morphs.map(|m| (p.record.first_vertex, m))).map(|(first, (start, _, targets))| {
+            let slots = slots_for(MORPH_HEADER + targets);
+            let at = self.vertices.allocate(device, queue, slots);
+            let mut words = vec![0u32; (slots * VERTEX_FLOATS) as usize];
+            words[0] = first;
+            words[1] = start * VERTEX_FLOATS;
+            words[2] = targets;
+            self.vertices.write_bytes(queue, at as u64 * VERTEX_BYTES, bytemuck::cast_slice(&words));
+            Block { at, slots, words }
+        });
         let record = GpuInstance {
             transform,
             mesh: mesh.0,
             flags: INSTANCE_ALIVE,
             material,
-            _padding: 0,
+            morph: block.as_ref().map_or(NO_MORPH, |b| b.at * VERTEX_FLOATS),
         };
         self.instances.write(queue, slot, &[record]);
         if self.placed.len() <= slot as usize {
             self.placed.resize(slot as usize + 1, None);
+            self.blocks.resize(slot as usize + 1, None);
         }
         self.placed[slot as usize] = Some(record);
+        self.blocks[slot as usize] = block;
         InstanceId(slot)
+    }
+
+    /// Sets the weights an instance of a mesh that bends gives its morph targets, in order; past
+    /// the mesh's own targets they are left out. An instance of a mesh that does not bend is
+    /// left as it is. They reach the GPU at the next [`Self::flush`]: a forest sets thousands a
+    /// frame, and a write each would cost more than the drawing.
+    pub fn set_weights(&mut self, id: InstanceId, weights: &[f32]) {
+        let Some(Some(block)) = self.blocks.get_mut(id.0 as usize) else {
+            return;
+        };
+        let targets = block.words[2] as usize;
+        let weights = &weights[..weights.len().min(targets)];
+        let room = &mut block.words[MORPH_HEADER as usize..MORPH_HEADER as usize + weights.len()];
+        let words: &[u32] = bytemuck::cast_slice(weights);
+        if room != words {
+            room.copy_from_slice(words);
+            self.changed.push(id.0);
+        }
+    }
+
+    /// Writes the weights set since last time to the GPU: the blocks that changed, those next
+    /// to each other in the buffer written together.
+    pub fn flush(&mut self, queue: &wgpu::Queue) {
+        if self.changed.is_empty() {
+            return;
+        }
+        let mut changed = std::mem::take(&mut self.changed);
+        changed.sort_unstable_by_key(|&slot| self.blocks[slot as usize].as_ref().map_or(0, |b| b.at));
+        changed.dedup();
+        let mut run: Vec<u32> = Vec::new();
+        let mut run_start = 0;
+        let mut run_end = 0;
+        for slot in changed.drain(..) {
+            let Some(block) = self.blocks.get(slot as usize).and_then(Option::as_ref) else {
+                continue;
+            };
+            if run.is_empty() || block.at != run_end {
+                if !run.is_empty() {
+                    self.vertices.write_bytes(queue, run_start as u64 * VERTEX_BYTES, bytemuck::cast_slice(&run));
+                    run.clear();
+                }
+                run_start = block.at;
+            } else if block.at < run_end {
+                // The same block twice: already in the run.
+                continue;
+            }
+            run.extend_from_slice(&block.words);
+            run_end = block.at + block.slots;
+        }
+        if !run.is_empty() {
+            self.vertices.write_bytes(queue, run_start as u64 * VERTEX_BYTES, bytemuck::cast_slice(&run));
+        }
+        self.changed = changed;
     }
 
     /// Moves an instance.
@@ -483,6 +690,9 @@ impl GeometryPool {
             if slot.take().is_some() {
                 self.instances.write(queue, id.0, &[GpuInstance::default()]);
                 self.instances.free(id.0, 1);
+                if let Some(block) = self.blocks.get_mut(id.0 as usize).and_then(Option::take) {
+                    self.vertices.free(block.at, block.slots);
+                }
             }
         }
     }
@@ -2738,6 +2948,174 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bending_meshes_keep_their_offsets_and_weights_in_the_vertex_buffer() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut pool = GeometryPool::new(&device, 16);
+        // Something not bending first, so the bending mesh is not at the start of the buffer.
+        let (still, still_dag) = hill(10, 1.0);
+        pool.add_mesh(&device, &queue, &still_dag, &still);
+        let (vertices, dag) = hill(20, 3.0);
+        let targets = 2;
+        let offsets: Vec<[f32; 6]> = (0..vertices.len())
+            .flat_map(|v| [[0.0, 1.0, 0.0, 0.5, 0.0, -0.25], [v as f32 / 64.0, 0.0, -0.125, 0.0, 0.0, 0.0]])
+            .collect();
+        let mesh = pool.add_morphing_mesh(
+            &device,
+            &queue,
+            &dag,
+            &vertices,
+            Some(Morphs {
+                targets,
+                offsets: &offsets,
+                most_weight: 2.0,
+            }),
+        );
+        let instance = pool.add_instance(&device, &queue, mesh, [0.0; 12], 0);
+        let unbent = pool.add_instance(&device, &queue, MeshId(0), [0.0; 12], 0);
+        // Two more right after it, set out of order: written with it in one run.
+        let next: Vec<InstanceId> = (0..2).map(|_| pool.add_instance(&device, &queue, mesh, [0.0; 12], 0)).collect();
+        pool.set_weights(next[1], &[3.0, 4.0]);
+        pool.set_weights(instance, &[0.5, -0.25, 9.0]);
+        pool.set_weights(next[0], &[1.0, 2.0]);
+        pool.set_weights(unbent, &[7.0]);
+        pool.flush(&queue);
+
+        let gpu: Vec<GpuInstance> = read(&device, &queue, pool.instances.buffer(), pool.instance_slots());
+        assert_eq!(gpu[unbent.0 as usize].morph, NO_MORPH);
+        let block = gpu[instance.0 as usize].morph as usize;
+        let words: Vec<u32> = read(&device, &queue, pool.vertices.buffer(), pool.vertices.capacity() * VERTEX_FLOATS);
+        let record = pool.mesh(mesh).unwrap();
+        assert_eq!(words[block], record.first_vertex);
+        assert_eq!(words[block + 2], targets);
+        // Only as many weights as the mesh has targets.
+        assert_eq!([f32::from_bits(words[block + 3]), f32::from_bits(words[block + 4])], [0.5, -0.25]);
+        assert_eq!(words[block + 5], 0);
+        for (id, want) in [(next[0], [1.0, 2.0]), (next[1], [3.0, 4.0])] {
+            let at = gpu[id.0 as usize].morph as usize;
+            assert_eq!(words[at], record.first_vertex);
+            assert_eq!([f32::from_bits(words[at + 3]), f32::from_bits(words[at + 4])], want);
+        }
+        // Each vertex's offsets, where the shader looks for them, as two half floats a word.
+        let half = |w: u32, high: bool| half::f16::from_bits((if high { w >> 16 } else { w }) as u16).to_f32();
+        for v in [0usize, 7, vertices.len() - 1] {
+            for t in 0..targets as usize {
+                let at = words[block + 1] as usize + (v * targets as usize + t) * 3;
+                let read = [
+                    half(words[at], false),
+                    half(words[at], true),
+                    half(words[at + 1], false),
+                    half(words[at + 1], true),
+                    half(words[at + 2], false),
+                    half(words[at + 2], true),
+                ];
+                for (got, want) in read.iter().zip(offsets[v * targets as usize + t]) {
+                    assert!((got - want).abs() < 2e-3, "vertex {v} target {t}: {read:?}");
+                }
+            }
+        }
+        // The clusters' bounds take in the bending: at least a meter up, at weight 2 each way.
+        let clusters: Vec<GpuCluster> = read(&device, &queue, pool.clusters.buffer(), pool.clusters.capacity());
+        let first = &clusters[record.first_cluster as usize];
+        assert!(first.bounds[3] >= dag.clusters[0].bounds.radius + 2.0);
+    }
+
+    #[test]
+    fn a_bending_mesh_is_drawn_bent() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        const SIZE: u32 = 64;
+        let target = |format| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let colour = vec![
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgb10a2Unorm),
+            target(wgpu::TextureFormat::Rgba8Unorm),
+            target(wgpu::TextureFormat::R8Uint),
+        ];
+        let depth = target(wgpu::TextureFormat::Depth24PlusStencil8);
+        // A flat square on the left, whose one target slides it 16 m right, onto the right half.
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (vertices, dag) = hill(16, 0.0);
+        let offsets = vec![[16.0, 0.0, 0.0, 0.0, 0.0, 0.0]; vertices.len()];
+        let mesh = pool.add_morphing_mesh(
+            &device,
+            &queue,
+            &dag,
+            &vertices,
+            Some(Morphs { targets: 1, offsets: &offsets, most_weight: 1.0 }),
+        );
+        let instance = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0);
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let materials = [ResolvedMaterial {
+            slot: 0,
+            params: MaterialParams::default(),
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        }];
+        let eye = [0.0, 40.0, 8.0];
+        let parameters = CullParameters {
+            view_projection: camera(eye, [0.0, 0.0, 7.0], 1.2, 1.0),
+            eye,
+            threshold: 0.001,
+            material_slots: 1,
+        };
+        let mut culler = Culler::new(&device);
+        let mut drawer = GBufferDrawer::new(&device);
+        let at = |x: u32, y: u32| (y * SIZE + x) as usize;
+        let mut draw = |pool: &GeometryPool| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            drawer
+                .record(
+                    &device,
+                    &mut encoder,
+                    pool,
+                    &mut culler,
+                    &parameters,
+                    &colour,
+                    &depth,
+                    PendingClear {
+                        color: Some(wgpu::Color::TRANSPARENT),
+                        depth: Some(1.0),
+                        stencil: Some(0),
+                    },
+                    &materials,
+                )
+                .expect("drawn");
+            queue.submit([encoder.finish()]);
+            let diffuse = pixels(&device, &queue, &colour[0], SIZE, false);
+            let covered = |range: std::ops::Range<u32>| {
+                range.map(|x| (0..SIZE).filter(|&y| diffuse[at(x, y)] != 0).count()).sum::<usize>()
+            };
+            (covered(0..SIZE / 2), covered(SIZE / 2 + 1..SIZE))
+        };
+        let (left, right) = draw(&pool);
+        assert!(left > 100 && right == 0, "unbent, on the left: {left} and {right} pixels");
+        pool.set_weights(instance, &[1.0]);
+        pool.flush(&queue);
+        let (left, right) = draw(&pool);
+        assert!(right > 100 && left < 20, "bent, on the right: {left} and {right} pixels");
     }
 
     #[test]
