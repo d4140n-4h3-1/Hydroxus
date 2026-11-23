@@ -745,6 +745,45 @@ struct CandeliteCutout {
 @group(0) @binding(8) var<storage, read> candeliteCorners: array<vec2f>;
 @group(0) @binding(9) var<storage, read> candeliteMasks: array<u32>;
 
+// The light on the cards (see `SurfaceLight`): each instance slot's first lit card, or all ones;
+// each lit card's tile in the radiance atlas, and whose it is; and the atlas itself, a texel's
+// light as four half floats, row after row.
+struct CandeliteLitCard {
+    tile: vec4u,
+    slot: u32,
+    face: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(0) @binding(10) var<storage, read> candeliteInstanceLit: array<u32>;
+@group(0) @binding(11) var<storage, read> candeliteLitCards: array<CandeliteLitCard>;
+@group(0) @binding(12) var<storage, read> candeliteRadiance: array<vec2u>;
+const CANDELITE_RADIANCE_WIDTH: u32 = 2048u;
+
+fn candelite_unpack(packed: vec2u) -> vec4f {
+    return vec4f(unpack2x16float(packed.x), unpack2x16float(packed.y));
+}
+
+fn candelite_pack(value: vec4f) -> vec2u {
+    return vec2u(pack2x16float(value.xy), pack2x16float(value.zw));
+}
+
+// The light on face `face` of instance `slot` at `s` across and `t` up it (each -1 to 1), and 1;
+// or nothing, and 0, if it has no lit cards.
+fn candelite_lit_at(slot: u32, face: u32, s: f32, t: f32) -> vec4f {
+    if (slot >= arrayLength(&candeliteInstanceLit)) {
+        return vec4f(0.0);
+    }
+    let first = candeliteInstanceLit[slot];
+    if (first == 0xFFFFFFFFu) {
+        return vec4f(0.0);
+    }
+    let tile = candeliteLitCards[first + face].tile;
+    let within = min(vec2u(vec2f(s * 0.5 + 0.5, 0.5 - t * 0.5) * vec2f(tile.zw)), tile.zw - 1u);
+    let texel = tile.xy + within;
+    return vec4f(candelite_unpack(candeliteRadiance[texel.y * CANDELITE_RADIANCE_WIDTH + texel.x]).rgb, 1.0);
+}
+
 // Whether a ray crossing triangle `primitive` of `mesh` at `barycentrics` is stopped there: on a
 // solid mesh, always; on a cutout, where its texture is solid. Texture coordinates repeat, as the
 // renderer samples them.
@@ -777,6 +816,10 @@ struct SurfaceHit {
     position: vec3f,
     diffuse: vec3f,
     normal: vec3f,
+    // Whether the light on what was hit is known from its lit cards, and that light: what leaves
+    // it towards the ray.
+    lit: bool,
+    radiance: vec3f,
 };
 
 // How far a card's captured surface may be from the hit, in meters, and still be taken as it:
@@ -807,7 +850,7 @@ fn candelite_nearest_seen(tile: vec4u, within: vec2u) -> vec2u {
 }
 
 fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
-    var hit = SurfaceHit(false, false, false, reach, origin + direction * reach, vec3f(0.0), -direction);
+    var hit = SurfaceHit(false, false, false, reach, origin + direction * reach, vec3f(0.0), -direction, false, vec3f(0.0));
     var query: ray_query;
     rayQueryInitialize(&query, candeliteScene, RayDesc(0u, 0xFFu, 0.0, reach, origin, direction));
     // Only cutouts are asked about: whether the ray is stopped where it crosses them.
@@ -836,6 +879,8 @@ fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
     var diffuse = vec3f(0.0);
     var normal = vec3f(0.0);
     var weight = 0.0;
+    var radiance = vec3f(0.0);
+    var lit_weight = 0.0;
     // What the cards saw there, if not what was hit.
     var near_diffuse = vec3f(0.0);
     var near_normal = vec3f(0.0);
@@ -885,10 +930,17 @@ fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
         diffuse += texel_diffuse;
         normal += texel_normal;
         weight += facing;
+        let light = candelite_lit_at(found.instance_custom_data, c, s, t);
+        radiance += light.rgb * facing;
+        lit_weight += light.w * facing;
     }
     if (weight > 0.0) {
         hit.covered = true;
         hit.seen = true;
+        if (lit_weight > 0.0) {
+            hit.lit = true;
+            hit.radiance = radiance / lit_weight;
+        }
     } else if (near_weight > 0.0) {
         hit.seen = true;
         diffuse = near_diffuse;
@@ -901,7 +953,580 @@ fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
     hit.normal = normalize(found.object_to_world * vec4f(normal / weight, 0.0));
     return hit;
 }
+
+// Whether anything stops a ray from `origin` along `direction` within `reach`: a shadow ray.
+fn candelite_blocked(origin: vec3f, direction: vec3f, reach: f32) -> bool {
+    var query: ray_query;
+    // Ended at the first hit: which one does not matter.
+    rayQueryInitialize(&query, candeliteScene, RayDesc(0x4u, 0xFFu, 0.0, reach, origin, direction));
+    while (rayQueryProceed(&query)) {
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        let mesh = candeliteInstances[candidate.instance_custom_data].mesh;
+        if (candelite_stops(mesh, candidate.primitive_index, candidate.barycentrics)) {
+            rayQueryConfirmIntersection(&query);
+        }
+    }
+    return rayQueryGetCommittedIntersection(&query).kind != RAY_QUERY_INTERSECTION_NONE;
+}
+
+// The light leaving what a ray hit, back along it: from its lit cards if it has them; else lit
+// where it is (hit lighting) - the sun, if a shadow ray reaches it, and half the sky; nothing if
+// no card saw anything there. A ray that hit nothing sees the sky. `toward_sun` is a unit vector;
+// `sun` the light a white surface facing the sun gives off; `sky` the sky's radiance.
+fn candelite_hit_light(hit: SurfaceHit, toward_sun: vec3f, sun: vec3f, sky: vec3f) -> vec3f {
+    if (!hit.hit) {
+        return sky;
+    }
+    if (hit.lit) {
+        return hit.radiance;
+    }
+    if (!hit.seen) {
+        return vec3f(0.0);
+    }
+    var light = sky * 0.5;
+    let facing = dot(hit.normal, toward_sun);
+    if (facing > 0.0 && !candelite_blocked(hit.position + hit.normal * 0.05 + toward_sun * 0.15, toward_sun, 1.0e4)) {
+        light += sun * facing;
+    }
+    return hit.diffuse * light;
+}
 "#;
+
+/// How many texels square the radiance atlas is: as `CANDELITE_RADIANCE_WIDTH` in
+/// [`LOOKUP_WGSL`].
+pub const RADIANCE_SIZE: u32 = 2048;
+/// Within how far of the eye, in meters, an instance has lit cards of its own: measured to the
+/// nearest of its bounds, so a big mesh - the ground - underfoot is near however far its middle.
+pub const LIT_REACH: f32 = 60.0;
+/// Within how far of the eye an instance's lit cards are as fine as its mesh's captured ones;
+/// each doubling of the distance past it halves them, to [`LIT_COARSEST`] halvings.
+pub const LIT_FULL: f32 = 8.0;
+/// The most a lit card is halved.
+pub const LIT_COARSEST: u32 = 5;
+/// How many texels of the radiance atlas are lit a frame, at most: those of cards new to it
+/// first, then the rest in turn.
+pub const LIGHT_BUDGET: u32 = 1 << 17;
+/// How many frames apart the instances' lit cards are handed out again, at most; sooner when the
+/// eye has moved [`LIT_MOVE`] meters.
+pub const LIT_EVERY: u32 = 30;
+/// See [`LIT_EVERY`].
+pub const LIT_MOVE: f32 = 2.0;
+
+/// A lit card as the GPU reads it: its tile in the radiance atlas, the instance slot it lights,
+/// and which of its mesh's cards it is.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuLitCard {
+    /// x, y, width and height in texels, from the top left.
+    pub tile: [u32; 4],
+    /// The instance's slot in the pool.
+    pub slot: u32,
+    /// Which of its mesh's six cards.
+    pub face: u32,
+    /// Unused: keeps it a multiple of 16 bytes.
+    pub _padding: [u32; 2],
+}
+
+/// The light Candelite lights the cards with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sunlight {
+    /// Towards the sun, a unit vector.
+    pub toward_sun: [f32; 3],
+    /// The light a white surface squarely facing the sun gives off.
+    pub sun: [f32; 3],
+    /// The sky's radiance, the same all over.
+    pub sky: [f32; 3],
+}
+
+/// An instance's lit cards.
+#[derive(Debug, Clone, PartialEq)]
+struct Lit {
+    first: u32,
+    mesh: u32,
+    level: u32,
+    tiles: [[u32; 4]; 6],
+}
+
+const LIGHT_SHADER: &str = r#"
+struct Light {
+    towardSun: vec3f,
+    frame: u32,
+    sun: vec3f,
+    blockCount: u32,
+    sky: vec3f,
+    pad0: u32,
+};
+@group(1) @binding(0) var<uniform> light: Light;
+// Each block to light: its lit card, and which block of 8 by 8 texels of its tile, row by row.
+@group(1) @binding(1) var<storage, read> blocks: array<vec2u>;
+// The indirect light on each texel so far, and over how many updates it was averaged (alpha).
+@group(1) @binding(2) var<storage, read_write> indirect: array<vec2u>;
+
+fn pcg(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Over how many updates indirect light is averaged, at most: a new sample's weight is never less
+// than one over it.
+const MOST_SAMPLES: f32 = 16.0;
+
+@compute @workgroup_size(8, 8)
+fn light_cards(
+    @builtin(workgroup_id) group: vec3u,
+    @builtin(num_workgroups) groups: vec3u,
+    @builtin(local_invocation_id) local: vec3u,
+) {
+    let b = group.y * groups.x + group.x;
+    if (b >= light.blockCount) {
+        return;
+    }
+    let block = blocks[b];
+    let lit = candeliteLitCards[block.x];
+    let across = (lit.tile.z + 7u) / 8u;
+    let within = vec2u(block.y % across, block.y / across) * 8u + local.xy;
+    if (any(within >= lit.tile.zw)) {
+        return;
+    }
+    let texel = lit.tile.xy + within;
+    let index = texel.y * CANDELITE_RADIANCE_WIDTH + texel.x;
+    let instance = candeliteInstances[lit.slot];
+    let first = candeliteMeshCards[instance.mesh];
+    if (first == 0xFFFFFFFFu) {
+        candeliteRadiance[index] = vec2u(0u);
+        return;
+    }
+    // The mesh's card under this texel, and what it captured there.
+    let card = candeliteCards[first + lit.face];
+    let uv = (vec2f(within) + 0.5) / vec2f(lit.tile.zw);
+    let at = card.tile.xy + min(vec2u(uv * vec2f(card.tile.zw)), card.tile.zw - 1u);
+    let share = textureLoad(candeliteDepth, at, 0);
+    if (share >= 1.0) {
+        candeliteRadiance[index] = vec2u(0u);
+        indirect[index] = vec2u(0u);
+        return;
+    }
+    // Where that is, in the mesh's space then the world's, and which way it faces.
+    let s = uv.x * 2.0 - 1.0;
+    let t = 1.0 - uv.y * 2.0;
+    let n = cross(card.u.xyz, card.v.xyz);
+    let p = card.center.xyz + card.u.xyz * (s * card.u.w) + card.v.xyz * (t * card.v.w) - n * (share * card.center.w);
+    let m = instance.transform;
+    let world = vec3f(dot(m[0], vec4f(p, 1.0)), dot(m[1], vec4f(p, 1.0)), dot(m[2], vec4f(p, 1.0)));
+    let captured = textureLoad(candeliteNormal, at, 0).xyz * 2.0 - 1.0;
+    let normal = normalize(vec3f(dot(m[0].xyz, captured), dot(m[1].xyz, captured), dot(m[2].xyz, captured)));
+    let albedo = textureLoad(candeliteDiffuse, at, 0).rgb;
+
+    // The sun, if a shadow ray reaches it.
+    var direct = vec3f(0.0);
+    let facing = dot(normal, light.towardSun);
+    if (facing > 0.0 && !candelite_blocked(world + normal * 0.05 + light.towardSun * 0.15, light.towardSun, 1.0e4)) {
+        direct = albedo * light.sun * facing;
+    }
+
+    // One ray of indirect light, cosine-weighted about the normal, averaged with those before:
+    // what it hit as lit (last frame's light on its cards, so light bounces again each frame), or
+    // the sky.
+    let a = pcg(index ^ pcg(light.frame));
+    let b2 = pcg(a);
+    let r1 = f32(a) / 4294967296.0;
+    let r2 = f32(b2) / 4294967296.0;
+    let side = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
+    let tangent = normalize(cross(side, normal));
+    let bitangent = cross(normal, tangent);
+    let radius = sqrt(r1);
+    let phi = 6.2831853 * r2;
+    let direction = normalize(tangent * (radius * cos(phi)) + bitangent * (radius * sin(phi)) + normal * sqrt(max(1.0 - r1, 0.0)));
+    let hit = candelite_trace(world + normal * 0.1, direction, 200.0);
+    let incoming = candelite_hit_light(hit, light.towardSun, light.sun, light.sky);
+    let before = candelite_unpack(indirect[index]);
+    let count = min(before.a + 1.0, MOST_SAMPLES);
+    let gathered = mix(before.rgb, albedo * incoming, 1.0 / count);
+    indirect[index] = candelite_pack(vec4f(gathered, count));
+    candeliteRadiance[index] = candelite_pack(vec4f(direct + gathered, 1.0));
+}
+"#;
+
+/// The light on the cards (see the module's description): each instance near the eye given lit
+/// cards of its own - its mesh's cards, in a radiance atlas, coarser the farther it is - lit by
+/// the sun and by what their surfaces see, a budget of texels a frame.
+pub struct SurfaceLight {
+    shelves: ShelfAllocator,
+    lit_cards: Vec<GpuLitCard>,
+    /// Runs of six lit cards given back, by their first.
+    free_lit: Vec<u32>,
+    lit: HashMap<u32, Lit>,
+    instance_lit: Vec<u32>,
+    radiance: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    /// The lit cards and each slot's first, on the GPU, made afresh when they change.
+    gpu: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    changed: bool,
+    /// Runs never lit yet, by their first, lit before the rest.
+    fresh: std::collections::VecDeque<u32>,
+    /// Every run, by its first, and the next to light in turn.
+    runs: Vec<u32>,
+    cursor: usize,
+    lookup_layout: wgpu::BindGroupLayout,
+    light_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    frame: u32,
+    handed_out: Option<([f32; 3], u32)>,
+    full: bool,
+}
+
+impl SurfaceLight {
+    /// The light, with nothing lit yet; [`None`] if `device` cannot trace rays.
+    pub fn new(device: &wgpu::Device) -> Option<Self> {
+        if !can_trace(device) {
+            return None;
+        }
+        let buffer = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: RADIANCE_SIZE as u64 * RADIANCE_SIZE as u64 * 8,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let lookup_layout = lookup_layout_with(device, wgpu::ShaderStages::COMPUTE, true);
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let storage = |read_only| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteLight"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(1, storage(true)),
+                entry(2, storage(false)),
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteLight"),
+            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{}\n{LIGHT_SHADER}", lookup_writable()).into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("CandeliteLight"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("CandeliteLight"),
+                bind_group_layouts: &[Some(&lookup_layout), Some(&light_layout)],
+                immediate_size: 0,
+            })),
+            module: &module,
+            entry_point: Some("light_cards"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Some(Self {
+            shelves: ShelfAllocator::new(RADIANCE_SIZE),
+            lit_cards: Vec::new(),
+            free_lit: Vec::new(),
+            lit: HashMap::new(),
+            instance_lit: Vec::new(),
+            radiance: buffer("CandeliteRadiance"),
+            indirect: buffer("CandeliteIndirect"),
+            gpu: None,
+            changed: true,
+            fresh: Default::default(),
+            runs: Vec::new(),
+            cursor: 0,
+            lookup_layout,
+            light_layout,
+            pipeline,
+            frame: 0,
+            handed_out: None,
+            full: false,
+        })
+    }
+
+    /// How many halvings an instance `distance` meters from the eye has its cards lit at.
+    pub fn level(distance: f32) -> u32 {
+        if distance <= LIT_FULL {
+            0
+        } else {
+            ((distance / LIT_FULL).log2().floor() as u32 + 1).min(LIT_COARSEST)
+        }
+    }
+
+    /// Hands out lit cards to the instances within [`LIT_REACH`] of `eye`, nearest first, as
+    /// fine as their distance calls for (see [`LIT_FULL`]), while the atlas has room; takes them
+    /// from the rest. Whether it ran out of room.
+    fn hand_out(&mut self, pool: &GeometryPool, cache: &SurfaceCache, eye: [f32; 3]) -> bool {
+        let mesh_cards = cache.mesh_cards();
+        let mut wanted: Vec<(f32, u32, u32, u32)> = pool
+            .placed()
+            .filter(|(_, record)| mesh_cards.get(record.mesh as usize).is_some_and(|&c| c != NO_CARDS))
+            .filter_map(|(slot, record)| {
+                let t = &record.transform;
+                // The mesh's bounds, from its cards: +x, -x, +y, -y, +z, -z faces' middles.
+                let cards = &cache.cards()[mesh_cards[record.mesh as usize] as usize..][..6];
+                let middle: [f32; 3] = std::array::from_fn(|i| (cards[2 * i].center[i] + cards[2 * i + 1].center[i]) * 0.5);
+                let half: [f32; 3] = std::array::from_fn(|i| (cards[2 * i].center[i] - cards[2 * i + 1].center[i]).abs() * 0.5);
+                let scale = (0..3).map(|c| (t[c] * t[c] + t[4 + c] * t[4 + c] + t[8 + c] * t[8 + c]).sqrt()).fold(0.0, f32::max);
+                let radius = (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt() * scale;
+                let at: [f32; 3] = std::array::from_fn(|r| t[4 * r] * middle[0] + t[4 * r + 1] * middle[1] + t[4 * r + 2] * middle[2] + t[4 * r + 3]);
+                let d = ((at[0] - eye[0]).powi(2) + (at[1] - eye[1]).powi(2) + (at[2] - eye[2]).powi(2)).sqrt();
+                let d = (d - radius).max(0.0);
+                (d < LIT_REACH).then(|| (d, slot, record.mesh, Self::level(d)))
+            })
+            .collect();
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let keep: HashMap<u32, (u32, u32)> = wanted.iter().map(|&(_, slot, mesh, level)| (slot, (mesh, level))).collect();
+        let gone: Vec<u32> = self
+            .lit
+            .iter()
+            .filter(|(slot, lit)| keep.get(slot) != Some(&(lit.mesh, lit.level)))
+            .map(|(&slot, _)| slot)
+            .collect();
+        for slot in gone {
+            self.release(slot);
+        }
+        let mut full = false;
+        for (_, slot, mesh, level) in wanted {
+            if self.lit.contains_key(&slot) {
+                continue;
+            }
+            let first_card = mesh_cards[mesh as usize] as usize;
+            let mut tiles = [[0u32; 4]; 6];
+            let mut placed = 0;
+            for (face, tile) in tiles.iter_mut().enumerate() {
+                let [_, _, w, h] = cache.cards()[first_card + face].tile;
+                let (w, h) = ((w >> level).max(2), (h >> level).max(2));
+                match self.shelves.allocate(w, h) {
+                    Some([x, y]) => {
+                        *tile = [x, y, w, h];
+                        placed += 1;
+                    }
+                    None => break,
+                }
+            }
+            if placed < 6 {
+                for tile in &tiles[..placed] {
+                    self.shelves.free([tile[0], tile[1]], tile[2], tile[3]);
+                }
+                full = true;
+                break;
+            }
+            let first = self.free_lit.pop().unwrap_or_else(|| {
+                let first = self.lit_cards.len() as u32;
+                self.lit_cards.resize(self.lit_cards.len() + 6, GpuLitCard::default());
+                first
+            });
+            for (face, tile) in tiles.iter().enumerate() {
+                self.lit_cards[first as usize + face] = GpuLitCard {
+                    tile: *tile,
+                    slot,
+                    face: face as u32,
+                    _padding: [0; 2],
+                };
+            }
+            if self.instance_lit.len() <= slot as usize {
+                self.instance_lit.resize(slot as usize + 1, NO_CARDS);
+            }
+            self.instance_lit[slot as usize] = first;
+            self.lit.insert(slot, Lit { first, mesh, level, tiles });
+            self.fresh.push_back(first);
+            self.changed = true;
+        }
+        self.runs = self.lit.values().map(|lit| lit.first).collect();
+        self.runs.sort_unstable();
+        full
+    }
+
+    fn release(&mut self, slot: u32) {
+        let Some(lit) = self.lit.remove(&slot) else {
+            return;
+        };
+        for tile in lit.tiles {
+            self.shelves.free([tile[0], tile[1]], tile[2], tile[3]);
+        }
+        self.free_lit.push(lit.first);
+        self.fresh.retain(|&first| first != lit.first);
+        self.instance_lit[slot as usize] = NO_CARDS;
+        self.changed = true;
+    }
+
+    /// The tiles of the lit cards of the instance in `slot`, in the radiance atlas, if it has
+    /// any: x, y, width and height in texels.
+    pub fn lit_tiles(&self, slot: u32) -> Option<[[u32; 4]; 6]> {
+        self.lit.get(&slot).map(|lit| lit.tiles)
+    }
+
+    /// The radiance atlas: each texel's light as four half floats (red, green, blue, 1), row
+    /// after row, [`RADIANCE_SIZE`] to a row.
+    pub fn radiance(&self) -> &wgpu::Buffer {
+        &self.radiance
+    }
+
+    fn buffers(&mut self, device: &wgpu::Device) -> (&wgpu::Buffer, &wgpu::Buffer) {
+        if self.changed || self.gpu.is_none() {
+            let make = |label, contents: &[u8]| {
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: if contents.is_empty() { &[0xFF; 32] } else { contents },
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+            };
+            self.gpu = Some((
+                make("CandeliteLitCards", bytemuck::cast_slice(&self.lit_cards)),
+                make("CandeliteInstanceLit", bytemuck::cast_slice(&self.instance_lit)),
+            ));
+            self.changed = false;
+        }
+        let (cards, instances) = self.gpu.as_ref().expect("made above");
+        (cards, instances)
+    }
+
+    /// Lights a budget of the cards ([`LIGHT_BUDGET`] texels) with `light`, recorded into
+    /// `encoder`, handing out lit cards first if the eye has moved or it is time. `scene` must be
+    /// up to date ([`TraceScene::update`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &mut TraceScene,
+        pool: &GeometryPool,
+        cache: &mut SurfaceCache,
+        eye: [f32; 3],
+        light: &Sunlight,
+    ) {
+        self.frame = self.frame.wrapping_add(1);
+        let due = self.handed_out.is_none_or(|(at, frame)| {
+            let moved = (0..3).map(|i| (at[i] - eye[i]).powi(2)).sum::<f32>().sqrt();
+            moved >= LIT_MOVE || self.frame.wrapping_sub(frame) >= LIT_EVERY
+        });
+        if due {
+            self.full |= self.hand_out(pool, cache, eye);
+            self.handed_out = Some((eye, self.frame));
+        }
+        // New runs first, then the rest in turn, to the budget.
+        let mut chosen: Vec<u32> = Vec::new();
+        let mut texels = 0u32;
+        let size = |s: &Self, first: u32| (0..6).map(|f| s.lit_cards[(first + f) as usize].tile).map(|t| t[2] * t[3]).sum::<u32>();
+        while let Some(&first) = self.fresh.front() {
+            let cost = size(self, first);
+            if texels + cost > LIGHT_BUDGET && !chosen.is_empty() {
+                break;
+            }
+            self.fresh.pop_front();
+            chosen.push(first);
+            texels += cost;
+        }
+        let mut looked = 0;
+        while looked < self.runs.len() && texels < LIGHT_BUDGET {
+            self.cursor %= self.runs.len();
+            let first = self.runs[self.cursor];
+            self.cursor += 1;
+            looked += 1;
+            if chosen.contains(&first) {
+                continue;
+            }
+            texels += size(self, first);
+            chosen.push(first);
+        }
+        let mut blocks: Vec<[u32; 2]> = Vec::new();
+        for first in chosen {
+            for face in 0..6 {
+                let card = first + face;
+                let tile = self.lit_cards[card as usize].tile;
+                let count = tile[2].div_ceil(8) * tile[3].div_ceil(8);
+                blocks.extend((0..count).map(|b| [card, b]));
+            }
+        }
+        if blocks.is_empty() {
+            return;
+        }
+        self.buffers(device);
+        let (lit_cards, instance_lit) = self.gpu.as_ref().expect("made above");
+        let Some(lookup) = lookup_group_with(device, &self.lookup_layout, scene, pool, cache, [lit_cards, instance_lit, &self.radiance]) else {
+            return;
+        };
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Uniforms {
+            toward_sun: [f32; 3],
+            frame: u32,
+            sun: [f32; 3],
+            block_count: u32,
+            sky: [f32; 3],
+            _padding: u32,
+        }
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteLight"),
+            contents: bytemuck::bytes_of(&Uniforms {
+                toward_sun: light.toward_sun,
+                frame: self.frame,
+                sun: light.sun,
+                block_count: blocks.len() as u32,
+                sky: light.sky,
+                _padding: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let block_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteLightBlocks"),
+            contents: bytemuck::cast_slice(&blocks),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteLight"),
+            layout: &self.light_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: block_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.indirect.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("CandeliteLight"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &lookup, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        let count = blocks.len() as u32;
+        pass.dispatch_workgroups(count.min(65535), count.div_ceil(65535), 1);
+    }
+
+    /// Whether the atlas has run out of room for every instance in reach.
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+}
+
+/// [`LOOKUP_WGSL`] with the radiance atlas writable, for the pass that lights it.
+fn lookup_writable() -> String {
+    LOOKUP_WGSL.replace(
+        "var<storage, read> candeliteRadiance",
+        "var<storage, read_write> candeliteRadiance",
+    )
+}
 
 /// What [`SurfaceView`] shows of what the rays hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -912,6 +1537,9 @@ pub enum ViewShows {
     Shaded,
     /// The normal, as the G-Buffer stores it (each axis from -1 to 1 brought to 0 to 1).
     Normal,
+    /// The light leaving what was hit: from its lit cards, or lit where it is (see
+    /// [`SurfaceLight`]); brought into range by x / (1 + x).
+    Lit,
 }
 
 const VIEW_SHADER: &str = r#"
@@ -921,6 +1549,9 @@ struct View {
     shows: u32,
     size: vec2f,
     pad0: vec2f,
+    towardSun: vec4f,
+    sun: vec4f,
+    sky: vec4f,
 };
 @group(1) @binding(0) var<uniform> view: View;
 
@@ -938,6 +1569,10 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
     let far = view.inverseViewProjection * vec4f(ndc, 1.0, 1.0);
     let direction = normalize(far.xyz / far.w - view.eye);
     let hit = candelite_trace(view.eye, direction, 1.0e4);
+    if (view.shows == 3u && hit.seen) {
+        let light = candelite_hit_light(hit, view.towardSun.xyz, view.sun.xyz, view.sky.xyz);
+        return vec4f(light / (1.0 + light), 1.0);
+    }
     if (!hit.hit) {
         return vec4f(0.0);
     }
@@ -1039,13 +1674,15 @@ impl SurfaceView {
         scene: &mut TraceScene,
         pool: &GeometryPool,
         cache: &mut SurfaceCache,
+        light: &mut SurfaceLight,
+        sunlight: &Sunlight,
         inverse_view_projection: [[f32; 4]; 4],
         eye: [f32; 3],
         shows: ViewShows,
         target: &wgpu::Texture,
     ) {
         let view = target.create_view(&Default::default());
-        let lookup = lookup_group(device, &self.lookup_layout, scene, pool, cache);
+        let lookup = lookup_group(device, &self.lookup_layout, scene, pool, cache, light);
         #[repr(C)]
         #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         struct Uniforms {
@@ -1054,6 +1691,9 @@ impl SurfaceView {
             shows: u32,
             size: [f32; 2],
             _padding: [f32; 2],
+            toward_sun: [f32; 4],
+            sun: [f32; 4],
+            sky: [f32; 4],
         }
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("CandeliteView"),
@@ -1064,9 +1704,13 @@ impl SurfaceView {
                     ViewShows::Diffuse => 0,
                     ViewShows::Shaded => 1,
                     ViewShows::Normal => 2,
+                    ViewShows::Lit => 3,
                 },
                 size: [target.width() as f32, target.height() as f32],
                 _padding: [0.0; 2],
+                toward_sun: [sunlight.toward_sun[0], sunlight.toward_sun[1], sunlight.toward_sun[2], 0.0],
+                sun: [sunlight.sun[0], sunlight.sun[1], sunlight.sun[2], 0.0],
+                sky: [sunlight.sky[0], sunlight.sky[1], sunlight.sky[2], 0.0],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -1107,16 +1751,21 @@ impl SurfaceView {
 
 /// The bind group layout of [`LOOKUP_WGSL`], for the shader stages `visibility`.
 pub fn lookup_layout(device: &wgpu::Device, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayout {
-    let storage = |binding| wgpu::BindGroupLayoutEntry {
+    lookup_layout_with(device, visibility, false)
+}
+
+fn lookup_layout_with(device: &wgpu::Device, visibility: wgpu::ShaderStages, radiance_writable: bool) -> wgpu::BindGroupLayout {
+    let storage_as = |binding, read_only| wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
         ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            ty: wgpu::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
             min_binding_size: None,
         },
         count: None,
     };
+    let storage = |binding| storage_as(binding, true);
     let texture = |binding, sample_type| wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -1148,17 +1797,36 @@ pub fn lookup_layout(device: &wgpu::Device, visibility: wgpu::ShaderStages) -> w
             storage(7),
             storage(8),
             storage(9),
+            storage(10),
+            storage(11),
+            storage_as(12, !radiance_writable),
         ],
     })
 }
 
-/// The bind group of [`LOOKUP_WGSL`], for `layout` (see [`lookup_layout`]).
+/// The bind group of [`LOOKUP_WGSL`], for `layout` (see [`lookup_layout`]), with the light on
+/// the cards from `light`.
 pub fn lookup_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     scene: &mut TraceScene,
     pool: &GeometryPool,
     cache: &mut SurfaceCache,
+    light: &mut SurfaceLight,
+) -> Option<wgpu::BindGroup> {
+    light.buffers(device);
+    let (lit_cards, instance_lit) = light.gpu.as_ref().expect("made above");
+    lookup_group_with(device, layout, scene, pool, cache, [lit_cards, instance_lit, &light.radiance])
+}
+
+/// As [`lookup_group`], with the lit cards, each slot's first and the radiance atlas given.
+fn lookup_group_with(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    scene: &mut TraceScene,
+    pool: &GeometryPool,
+    cache: &mut SurfaceCache,
+    [lit_cards, instance_lit, radiance]: [&wgpu::Buffer; 3],
 ) -> Option<wgpu::BindGroup> {
     scene.cutout_buffers(device);
     let tlas = scene.tlas.as_ref()?;
@@ -1213,6 +1881,18 @@ pub fn lookup_group(
             wgpu::BindGroupEntry {
                 binding: 9,
                 resource: masks.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: instance_lit.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: lit_cards.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: radiance.as_entire_binding(),
             },
         ],
     }))
@@ -1560,6 +2240,8 @@ mod test {
         let materials = [material(0, [1.0, 0.5, 0.25, 1.0], &white), material(1, [0.25, 0.5, 1.0, 1.0], &half)];
         let mut drawer = GBufferDrawer::new(&device);
         let view = SurfaceView::new(&device).expect("can trace");
+        let mut light = SurfaceLight::new(&device).expect("can trace");
+        let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [1.0; 3], sky: [0.0; 3] };
 
         // From the origin at the box's middle height, looking down -z, 90 degrees across.
         const SIZE: u32 = 64;
@@ -1580,7 +2262,7 @@ mod test {
             let mut encoder = device.create_command_encoder(&Default::default());
             cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
             assert!(scene.update(&device, &mut encoder, &pool));
-            view.record(&device, &mut encoder, &mut scene, &pool, &mut cache, inverse, eye, shows, &target);
+            view.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &sunlight, inverse, eye, shows, &target);
             queue.submit([encoder.finish()]);
             texels(&device, &queue, &target, wgpu::TextureAspect::All, 4)
         };
@@ -1602,5 +2284,129 @@ mod test {
         // Through the card's drawn half, the card; through its see-through half, the box behind.
         assert_eq!(diffuse[at(30, SIZE / 2)].to_le_bytes(), [64, 128, 255, 255], "the card's drawn half");
         assert_eq!(diffuse[at(34, SIZE / 2)].to_le_bytes(), [255, 128, 64, 255], "the box, through the card");
+    }
+
+    #[test]
+    fn the_sun_lights_the_cards_where_a_shadow_ray_reaches_it() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray tracing: skipped");
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .expect("device");
+
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        let mut captures = Vec::new();
+        let shifted = |t: [f32; 3]| [1.0, 0.0, 0.0, t[0], 0.0, 1.0, 0.0, t[1], 0.0, 0.0, 1.0, t[2]];
+        // A floor 4 m square facing up, its colour orange; and over its left half, 1 m up, a slab
+        // shading it from a sun straight overhead.
+        for (min, max, top_only, at, slot) in [
+            ([-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], true, [0.0; 3], 0),
+            ([-2.5, 1.0, -2.5], [0.0, 1.2, 2.5], false, [0.0; 3], 1),
+        ] {
+            let (vertices, indices) = boxed(min, max, top_only);
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let first = pool.mesh(mesh).unwrap().first_cluster;
+            let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+            captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
+            scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+            pool.add_instance(&device, &queue, mesh, shifted(at), slot);
+        }
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let material = |slot, colour: [f32; 4]| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: colour,
+                ..Default::default()
+            },
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, [1.0, 0.5, 0.25, 1.0]), material(1, [0.2, 0.2, 0.2, 1.0])];
+        let mut drawer = GBufferDrawer::new(&device);
+        let mut light = SurfaceLight::new(&device).expect("can trace");
+        let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [1.0; 3], sky: [0.0; 3] };
+        // From above the floor, close enough for its cards to be lit at full detail.
+        let eye = [0.0, 3.0, 0.0];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+        assert!(scene.update(&device, &mut encoder, &pool));
+        queue.submit([encoder.finish()]);
+        for _ in 0..8 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            light.update(&device, &mut encoder, &mut scene, &pool, &mut cache, eye, &sunlight);
+            queue.submit([encoder.finish()]);
+        }
+        let floor = pool.placed().find(|(_, record)| record.material == 0).map(|(slot, _)| slot).expect("floor");
+        // Its top card (+y), seen from above: x across it, -z up it.
+        let tile = light.lit_tiles(floor).expect("lit")[2];
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: light.radiance().size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(light.radiance(), 0, &staging, 0, light.radiance().size());
+        queue.submit([encoder.finish()]);
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let words: Vec<u32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
+        let at = |x: u32, y: u32| {
+            let i = ((tile[1] + y) * RADIANCE_SIZE + tile[0] + x) as usize * 2;
+            let (a, b) = (words[i], words[i + 1]);
+            let half = |h: u32| half::f16::from_bits(h as u16).to_f32();
+            [half(a & 0xFFFF), half(a >> 16), half(b & 0xFFFF)]
+        };
+        let (w, h) = (tile[2], tile[3]);
+        let row = h / 2;
+        let lit = at(w * 7 / 8, row);
+        let shaded = at(w / 8, row);
+        // In the sun: its colour, the sun a white surface gives off as 1.
+        assert!((lit[0] - 1.0).abs() < 0.05 && (lit[1] - 0.5).abs() < 0.05 && (lit[2] - 0.25).abs() < 0.05, "lit {lit:?}");
+        // In the slab's shade, with no sky: only light bounced off the lit floor and the slab's
+        // underside, far less.
+        assert!(shaded[0] < 0.2 * lit[0], "shaded {shaded:?}, lit {lit:?}");
+        assert!(shaded[0] > 0.0, "some light bounces into the shade: {shaded:?}");
+
+        // And through the view, as a ray from above finds it: the light on the floor's lit cards,
+        // brought into range.
+        const SIZE: u32 = 32;
+        let view = SurfaceView::new(&device).expect("can trace");
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // Looking straight down from 3 m over the floor's right half, 90 degrees across.
+        let eye = [1.0, 3.0, 0.0];
+        let inverse = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 0.0], [eye[0], eye[1] - 1.0, eye[2], 1.0]];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        view.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &sunlight, inverse, eye, ViewShows::Lit, &target);
+        queue.submit([encoder.finish()]);
+        let seen = texels(&device, &queue, &target, wgpu::TextureAspect::All, 4);
+        let middle = seen[(SIZE / 2 * SIZE + SIZE / 2) as usize].to_le_bytes();
+        let expected = lit.map(|c| (c / (1.0 + c) * 255.0).round() as u8);
+        assert!((0..3).all(|i| middle[i].abs_diff(expected[i]) <= 3), "seen {middle:?}, lit {expected:?}");
     }
 }

@@ -124,8 +124,19 @@ prefixes. The method follows the published description of Lumen cited above.
    `GraphicsEffects::with_candelite_view` lays over the frame what a ray from the eye finds
    (Wilderness: WILDERNESS_CANDELITE_VIEW=1): trunks, ground and crowns, with 1.7% of what is not
    sky found on no card, mostly at thin treetops - from 46% with foliage traced solid.
-3. **Lighting the surface cache**: sun and lamps with traced shadows, plus last frame's indirect
-   light (multiple bounces over time), updated a budget of texels per frame.
+3. **Lighting the surface cache** - done for the sun and sky (`SurfaceLight`): cards are captured
+   per mesh, but light differs per instance, so each instance within 60 m of the eye (measured to
+   its bounds) is given lit cards of its own in a 2048-square radiance atlas - its mesh's tiles,
+   halved for each doubling of distance past 8 m - and a budget of texels (128k) is lit each frame,
+   new cards first: the sun, if a shadow ray traced against the cutouts reaches it; and one
+   cosine-weighted ray of indirect light, averaged over up to 16 updates, taking what it hit from
+   that instance's lit cards (last frame's light, so light bounces again each frame), else lit
+   where it hit (hit lighting: sun with a shadow ray, and half the sky), else the sky. The lookup
+   returns `lit`/`radiance` from the hit's lit cards. GPU-tested: a floor under an overhead sun
+   gives off its colour times the sun, and in a slab's shade only bounced light, also as the view
+   sees it. fyrox-gfx `with_candelite_light_view` (Wilderness: WILDERNESS_CANDELITE_VIEW=lit).
+   Lamps are still to come. Known: a mesh as big as the ground gets coarse cards (its shadows in
+   metre-wide blocks), and some flowering bushes are hits no card saw (magenta since phase 2).
 4. **Screen probes**: diffuse GI gathered at probes every 16 pixels, rays importance-sampled,
    filtered spatially and temporally, interpolated to every pixel. Replaces the ambient colour.
 5. **World radiance cache**: probes around the camera for long rays and stability.
