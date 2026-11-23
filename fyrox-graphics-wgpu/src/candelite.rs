@@ -827,6 +827,13 @@ struct SurfaceHit {
     radiance: vec3f,
 };
 
+// How many cutout triangles a ray asks about at most; past them, the next it crosses stops it. A
+// ray across a forest at the height of its crowns crosses leaf card after leaf card, mostly
+// through their see-through parts: unbounded, one such ray costs a wave as much as hundreds, and
+// a frame with a few hundred of them stalls. Past this many layers of leaves, light hardly gets
+// through anyway.
+const CANDELITE_MOST_CUTOUTS: u32 = 32u;
+
 // How far a card's captured surface may be from the hit, in meters, and still be taken as it:
 // a few of its texels, as a surface sloping across a texel is captured at one depth.
 const CANDELITE_DEPTH_SLACK: f32 = 0.3;
@@ -858,11 +865,14 @@ fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
     var hit = SurfaceHit(false, false, false, reach, origin + direction * reach, vec3f(0.0), -direction, false, vec3f(0.0));
     var query: ray_query;
     rayQueryInitialize(&query, candeliteScene, RayDesc(0u, 0xFFu, 0.0, reach, origin, direction));
-    // Only cutouts are asked about: whether the ray is stopped where it crosses them.
+    // Only cutouts are asked about: whether the ray is stopped where it crosses them - up to
+    // CANDELITE_MOST_CUTOUTS of them, past which the next stops it (see there).
+    var asked = 0u;
     while (rayQueryProceed(&query)) {
         let candidate = rayQueryGetCandidateIntersection(&query);
         let mesh = candeliteInstances[candidate.instance_custom_data].mesh;
-        if (candelite_stops(mesh, candidate.primitive_index, candidate.barycentrics)) {
+        asked++;
+        if (asked > CANDELITE_MOST_CUTOUTS || candelite_stops(mesh, candidate.primitive_index, candidate.barycentrics)) {
             rayQueryConfirmIntersection(&query);
         }
     }
@@ -964,10 +974,12 @@ fn candelite_blocked(origin: vec3f, direction: vec3f, reach: f32) -> bool {
     var query: ray_query;
     // Ended at the first hit: which one does not matter.
     rayQueryInitialize(&query, candeliteScene, RayDesc(0x4u, 0xFFu, 0.0, reach, origin, direction));
+    var asked = 0u;
     while (rayQueryProceed(&query)) {
         let candidate = rayQueryGetCandidateIntersection(&query);
         let mesh = candeliteInstances[candidate.instance_custom_data].mesh;
-        if (candelite_stops(mesh, candidate.primitive_index, candidate.barycentrics)) {
+        asked++;
+        if (asked > CANDELITE_MOST_CUTOUTS || candelite_stops(mesh, candidate.primitive_index, candidate.barycentrics)) {
             rayQueryConfirmIntersection(&query);
         }
     }
@@ -1003,6 +1015,14 @@ pub const RADIANCE_SIZE: u32 = 2048;
 /// Within how far of the eye, in meters, an instance has lit cards of its own: measured to the
 /// nearest of its bounds, so a big mesh - the ground - underfoot is near however far its middle.
 pub const LIT_REACH: f32 = 60.0;
+/// How big an instance has to be - the radius of its bounds - for each meter its middle is from the
+/// eye, to have lit cards: a tree does all through [`LIT_REACH`], a fern only within ten or twenty
+/// meters. Rays from many small instances scattered through a forest are traced in no order a
+/// GPU likes - lighting ten thousand floor plants' cards cost tens of milliseconds a frame - and a
+/// small plant far off adds next to nothing to the light between surfaces; what hits it is lit
+/// where it hit.
+pub const LIT_SIZE: f32 = 0.03;
+
 /// Within how far of the eye an instance's lit cards are as fine as its mesh's captured ones;
 /// each doubling of the distance past it halves them, to [`LIT_COARSEST`] halvings.
 pub const LIT_FULL: f32 = 8.0;
@@ -1063,7 +1083,9 @@ struct Light {
     pad0: u32,
 };
 @group(1) @binding(0) var<uniform> light: Light;
-// Each block to light: its lit card, and which block of 8 by 8 texels of its tile, row by row.
+// Each texel to light: its lit card, and which texel of its tile, row by row. Packed, 64 to a
+// workgroup whatever cards they are of: a ray costs a wave about as much as its slowest lane, so
+// a coarse card's few texels must not each take a wave of their own.
 @group(1) @binding(1) var<storage, read> blocks: array<vec2u>;
 // The indirect light on each texel so far, and over how many updates it was averaged (alpha).
 @group(1) @binding(2) var<storage, read_write> indirect: array<vec2u>;
@@ -1078,23 +1100,15 @@ fn pcg(v: u32) -> u32 {
 // than one over it.
 const MOST_SAMPLES: f32 = 16.0;
 
-@compute @workgroup_size(8, 8)
-fn light_cards(
-    @builtin(workgroup_id) group: vec3u,
-    @builtin(num_workgroups) groups: vec3u,
-    @builtin(local_invocation_id) local: vec3u,
-) {
-    let b = group.y * groups.x + group.x;
+@compute @workgroup_size(64)
+fn light_cards(@builtin(global_invocation_id) id: vec3u) {
+    let b = id.y * 65535u * 64u + id.x;
     if (b >= light.blockCount) {
         return;
     }
     let block = blocks[b];
     let lit = candeliteLitCards[block.x];
-    let across = (lit.tile.z + 7u) / 8u;
-    let within = vec2u(block.y % across, block.y / across) * 8u + local.xy;
-    if (any(within >= lit.tile.zw)) {
-        return;
-    }
+    let within = vec2u(block.y % lit.tile.z, block.y / lit.tile.z);
     let texel = lit.tile.xy + within;
     let index = texel.y * CANDELITE_RADIANCE_WIDTH + texel.x;
     let instance = candeliteInstances[lit.slot];
@@ -1287,9 +1301,10 @@ impl SurfaceLight {
                 let scale = (0..3).map(|c| (t[c] * t[c] + t[4 + c] * t[4 + c] + t[8 + c] * t[8 + c]).sqrt()).fold(0.0, f32::max);
                 let radius = (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt() * scale;
                 let at: [f32; 3] = std::array::from_fn(|r| t[4 * r] * middle[0] + t[4 * r + 1] * middle[1] + t[4 * r + 2] * middle[2] + t[4 * r + 3]);
-                let d = ((at[0] - eye[0]).powi(2) + (at[1] - eye[1]).powi(2) + (at[2] - eye[2]).powi(2)).sqrt();
-                let d = (d - radius).max(0.0);
-                (d < LIT_REACH).then(|| (d, slot, record.mesh, Self::level(d)))
+                let middle_distance = ((at[0] - eye[0]).powi(2) + (at[1] - eye[1]).powi(2) + (at[2] - eye[2]).powi(2)).sqrt();
+                let d = (middle_distance - radius).max(0.0);
+                let big_enough = radius >= middle_distance * LIT_SIZE;
+                (d < LIT_REACH && big_enough).then(|| (d, slot, record.mesh, Self::level(d)))
             })
             .collect();
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -1447,13 +1462,13 @@ impl SurfaceLight {
             texels += size(self, first);
             chosen.push(first);
         }
-        let mut blocks: Vec<[u32; 2]> = Vec::new();
+        // Every texel of them, a lit card and a texel of its tile each.
+        let mut blocks: Vec<[u32; 2]> = Vec::with_capacity(texels as usize);
         for first in chosen {
             for face in 0..6 {
                 let card = first + face;
                 let tile = self.lit_cards[card as usize].tile;
-                let count = tile[2].div_ceil(8) * tile[3].div_ceil(8);
-                blocks.extend((0..count).map(|b| [card, b]));
+                blocks.extend((0..tile[2] * tile[3]).map(|t| [card, t]));
             }
         }
         if blocks.is_empty() {
@@ -1516,8 +1531,8 @@ impl SurfaceLight {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &lookup, &[]);
         pass.set_bind_group(1, &group, &[]);
-        let count = blocks.len() as u32;
-        pass.dispatch_workgroups(count.min(65535), count.div_ceil(65535), 1);
+        let groups = (blocks.len() as u32).div_ceil(64);
+        pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
     }
 
     /// Whether the atlas has run out of room for every instance in reach.
@@ -1532,6 +1547,461 @@ fn lookup_writable() -> String {
         "var<storage, read> candeliteRadiance",
         "var<storage, read_write> candeliteRadiance",
     )
+}
+
+/// How many nested grids the world radiance cache has round the eye (at most 4). A fourth, 16 m
+/// apart, cost five to eight times each of the others - its probes high over the crowns and far
+/// across the forest - and came in spikes that stalled frames.
+pub const CACHE_LEVELS: u32 = 3;
+/// How many probes each grid has along a side.
+pub const CACHE_SIZE: u32 = 16;
+/// How far apart the finest grid's probes are, in meters; each grid's twice the one before.
+pub const CACHE_SPACING: f32 = 2.0;
+/// How many of the cache's probes are traced a frame, at most: those new to it first, then the
+/// rest in turn.
+pub const CACHE_BUDGET: usize = 256;
+/// How far the cache's probes' rays reach, at most, in meters: past it, the sky.
+pub const CACHE_REACH: f32 = 64.0;
+/// How far a screen probe's ray is traced, in meters, before the cache is asked what lies beyond.
+pub const SCREEN_REACH: f32 = 8.0;
+const CACHE_PROBES: u32 = CACHE_SIZE * CACHE_SIZE * CACHE_SIZE;
+
+/// Directions as octahedral maps, and sampling the world radiance cache: for shaders including
+/// it, with the cache bound at group `CACHE_GROUP` (see [`RadianceCache`]).
+const CACHE_COMMON: &str = r#"
+struct CacheLevels {
+    // Each grid's first cell, in cells of its own spacing; and the spacings.
+    origin: array<vec4i, 4>,
+    spacing: vec4f,
+};
+
+// A unit vector to where it lies on an octahedral map, 0 to 1 each way (up the middle).
+fn cache_octahedral(d: vec3f) -> vec2f {
+    var p = d.xz / (abs(d.x) + abs(d.y) + abs(d.z));
+    if (d.y < 0.0) {
+        p = (1.0 - abs(p.yx)) * select(vec2f(-1.0), vec2f(1.0), p >= vec2f(0.0));
+    }
+    return p * 0.5 + 0.5;
+}
+
+fn cache_direction(uv: vec2f) -> vec3f {
+    var p = uv * 2.0 - 1.0;
+    let y = 1.0 - abs(p.x) - abs(p.y);
+    if (y < 0.0) {
+        p = (1.0 - abs(p.yx)) * select(vec2f(-1.0), vec2f(1.0), p >= vec2f(0.0));
+    }
+    return normalize(vec3f(p.x, y, p.y));
+}
+
+// The cache's slot for `cell` of grid `level`: cells wrap round the grid.
+fn cache_slot(level: u32, cell: vec3i) -> u32 {
+    let s = ((cell % 16) + 16) % 16;
+    return level * 4096u + u32(s.x) + 16u * (u32(s.y) + 16u * u32(s.z));
+}
+"#;
+
+const CACHE_SAMPLE: &str = r#"
+@group(2) @binding(0) var<uniform> cacheLevels: CacheLevels;
+@group(2) @binding(1) var<storage, read> cacheCells: array<vec4i>;
+@group(2) @binding(2) var<storage, read> cacheRadiance: array<vec2u>;
+
+// The light arriving at `x` from `d`, from the probes round it of the finest grid that holds it,
+// and 1; or nothing, and 0, if no grid holds it or none of the probes round it can be used.
+fn cache_radiance(x: vec3f, d: vec3f) -> vec4f {
+    let texel = vec2u(clamp(cache_octahedral(d) * 8.0, vec2f(0.0), vec2f(7.999)));
+    let within = texel.y * 8u + texel.x;
+    for (var level = 0u; level < 4u; level++) {
+        let g = x / cacheLevels.spacing[level];
+        let base = vec3i(floor(g));
+        let origin = cacheLevels.origin[level].xyz;
+        if (any(base < origin) || any(base + 1 >= origin + 16)) {
+            continue;
+        }
+        let f = g - vec3f(base);
+        var sum = vec3f(0.0);
+        var weight = 0.0;
+        for (var k = 0; k < 8; k++) {
+            let offset = vec3i(k & 1, (k >> 1) & 1, k >> 2);
+            let cell = base + offset;
+            let slot = cache_slot(level, cell);
+            let stored = cacheCells[slot];
+            if (any(stored.xyz != cell) || stored.w != 1) {
+                continue;
+            }
+            let w = select(1.0 - f.x, f.x, offset.x == 1) * select(1.0 - f.y, f.y, offset.y == 1) * select(1.0 - f.z, f.z, offset.z == 1);
+            sum += candelite_unpack(cacheRadiance[slot * 64u + within]).rgb * w;
+            weight += w;
+        }
+        if (weight > 0.01) {
+            return vec4f(sum / weight, 1.0);
+        }
+    }
+    return vec4f(0.0);
+}
+"#;
+
+const CACHE_UPDATE: &str = r#"
+struct CacheUpdate {
+    levels: CacheLevels,
+    towardSun: vec4f,
+    sun: vec4f,
+    sky: vec4f,
+    frame: u32,
+    jobCount: u32,
+    pad0: u32,
+    pad1: u32,
+};
+@group(1) @binding(0) var<uniform> update: CacheUpdate;
+@group(1) @binding(1) var<storage, read> jobs: array<u32>;
+@group(1) @binding(2) var<storage, read_write> cells: array<vec4i>;
+@group(1) @binding(3) var<storage, read_write> radiance: array<vec2u>;
+
+fn cache_pcg(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+var<workgroup> backfaces: atomic<u32>;
+
+// A probe a workgroup, a texel of its octahedral map a lane: its ray, through a point of the
+// texel turned each frame, the light it brings back averaged with what the texel had - unless the
+// slot has just been given a new cell. A probe whose rays mostly hit the backs of things is inside
+// something, and is not used.
+@compute @workgroup_size(8, 8)
+fn update_cache(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) local: vec3u, @builtin(local_invocation_index) lane: u32) {
+    let job_index = group.y * 65535u + group.x;
+    if (job_index >= update.jobCount) {
+        return;
+    }
+    if (lane == 0u) {
+        atomicStore(&backfaces, 0u);
+    }
+    workgroupBarrier();
+    let job = jobs[job_index];
+    let level = job / 4096u;
+    let s = vec3i(i32(job % 16u), i32((job / 16u) % 16u), i32((job / 256u) % 16u));
+    let origin = update.levels.origin[level].xyz;
+    // The cell of the grid's window this slot holds now.
+    let cell = origin + (((s - ((origin % 16) + 16) % 16) % 16) + 16) % 16;
+    let spacing = update.levels.spacing[level];
+    let position = vec3f(cell) * spacing;
+    let turn = cache_pcg(job * 7919u + update.frame * 104729u + lane);
+    let jitter = vec2f(f32(turn & 0xFFFFu), f32(turn >> 16u)) / 65536.0;
+    let direction = cache_direction((vec2f(local.xy) + jitter) / 8.0);
+    // Out to 16 of its grid's cells, but never past CACHE_REACH: past that, the next grid's
+    // probes see - and the coarsest grid's long rays, from high over the crowns down through
+    // them, cost many times the rest.
+    let hit = candelite_trace(position, direction, min(spacing * 16.0, CACHE_REACH));
+    if (hit.hit && dot(hit.normal, direction) > 0.0) {
+        atomicAdd(&backfaces, 1u);
+    }
+    // Lit where it hit, if it has no lit cards: with a shadow ray if it is within 4 m; further,
+    // without
+    // - a ray from the forest's far side towards the sun crosses crown after crown, and costs
+    // many times one near by - as half in the sun.
+    var light: vec3f;
+    if (!hit.hit || hit.lit || !hit.seen || hit.distance < 4.0) {
+        light = candelite_hit_light(hit, update.towardSun.xyz, update.sun.xyz, update.sky.xyz);
+    } else {
+        let facing = max(dot(hit.normal, update.towardSun.xyz), 0.0);
+        light = candelite_linear(hit.diffuse) * (update.sky.xyz * 0.5 + update.sun.xyz * facing * 0.5);
+    }
+    let stored = cells[job];
+    let fresh = any(stored.xyz != cell) || stored.w == 0;
+    let index = job * 64u + lane;
+    var kept = light;
+    if (!fresh) {
+        kept = mix(candelite_unpack(radiance[index]).rgb, light, 0.25);
+    }
+    radiance[index] = candelite_pack(vec4f(kept, 1.0));
+    workgroupBarrier();
+    if (lane == 0u) {
+        let inside = atomicLoad(&backfaces) > 16u;
+        cells[job] = vec4i(cell, select(1, 2, inside));
+    }
+}
+"#;
+
+/// The bind group layout the world radiance cache is sampled through (`cache_radiance`).
+fn cache_sample_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    let storage = wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only: true },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("CandeliteCacheSample"),
+        entries: &[
+            entry(
+                0,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+            entry(1, storage),
+            entry(2, storage),
+        ],
+    })
+}
+
+/// Candelite's world radiance cache, after Lumen's: [`CACHE_LEVELS`] nested grids of probes round
+/// the eye, [`CACHE_SIZE`] a side, the finest [`CACHE_SPACING`] apart and each the next twice as
+/// far; each probe keeps the light reaching it from every direction, as an 8 by 8 octahedral map,
+/// traced against the lit cards and averaged over frames. Screen probes trace only
+/// [`SCREEN_REACH`], and take the light from beyond it from here: long rays cost less, and the
+/// light they bring back flickers less. The grids move with the eye a cell at a time; a slot
+/// handed a new cell is traced before the rest, which are traced again in turn,
+/// [`CACHE_BUDGET`] probes a frame.
+pub struct RadianceCache {
+    cells: wgpu::Buffer,
+    radiance: wgpu::Buffer,
+    lookup_layout: wgpu::BindGroupLayout,
+    update_layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    origins: [Option<[i32; 3]>; CACHE_LEVELS as usize],
+    /// Slots handed new cells, waiting to be traced, and whether each is waiting.
+    waiting: std::collections::VecDeque<u32>,
+    queued: Vec<bool>,
+    cursor: u32,
+    frame: u32,
+    levels: Option<wgpu::Buffer>,
+}
+
+impl RadianceCache {
+    /// An empty cache; [`None`] if `device` cannot trace rays.
+    pub fn new(device: &wgpu::Device) -> Option<Self> {
+        if !can_trace(device) {
+            return None;
+        }
+        let probes = (CACHE_LEVELS * CACHE_PROBES) as u64;
+        let cells = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("CandeliteCacheCells"),
+            size: probes * 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let radiance = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("CandeliteCacheRadiance"),
+            size: probes * 64 * 8,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let lookup_layout = lookup_layout(device, wgpu::ShaderStages::COMPUTE);
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty,
+            count: None,
+        };
+        let storage = |read_only| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let update_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteCacheUpdate"),
+            entries: &[
+                entry(
+                    0,
+                    wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                ),
+                entry(1, storage(true)),
+                entry(2, storage(false)),
+                entry(3, storage(false)),
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteCacheUpdate"),
+            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{CACHE_COMMON}\nconst CACHE_REACH: f32 = {CACHE_REACH:?};\n{CACHE_UPDATE}").into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("CandeliteCacheUpdate"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("CandeliteCacheUpdate"),
+                bind_group_layouts: &[Some(&lookup_layout), Some(&update_layout)],
+                immediate_size: 0,
+            })),
+            module: &module,
+            entry_point: Some("update_cache"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Some(Self {
+            cells,
+            radiance,
+            lookup_layout,
+            update_layout,
+            pipeline,
+            origins: [None; CACHE_LEVELS as usize],
+            waiting: Default::default(),
+            queued: vec![false; (CACHE_LEVELS * CACHE_PROBES) as usize],
+            cursor: 0,
+            frame: 0,
+            levels: None,
+        })
+    }
+
+    /// Each grid's spacing, in meters.
+    pub fn spacing(level: u32) -> f32 {
+        CACHE_SPACING * (1u32 << level) as f32
+    }
+
+    /// Each grid's first cell, for the eye at `eye`: the eye in its middle.
+    fn origin(level: u32, eye: [f32; 3]) -> [i32; 3] {
+        eye.map(|e| (e / Self::spacing(level)).floor() as i32 - CACHE_SIZE as i32 / 2)
+    }
+
+    fn levels_bytes(&self) -> [u8; 80] {
+        let mut words = [0u32; 20];
+        for (level, origin) in self.origins.iter().enumerate() {
+            let o = origin.unwrap_or([i32::MIN / 2; 3]);
+            for i in 0..3 {
+                words[level * 4 + i] = o[i] as u32;
+            }
+        }
+        for level in 0..CACHE_LEVELS {
+            words[16 + level as usize] = Self::spacing(level).to_bits();
+        }
+        let mut out = [0u8; 80];
+        out.copy_from_slice(bytemuck::cast_slice(&words));
+        out
+    }
+
+    /// Moves the grids with `eye`, and traces [`CACHE_BUDGET`] of the probes against what `light`
+    /// has lit, recorded into `encoder`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &mut TraceScene,
+        pool: &GeometryPool,
+        cache: &mut SurfaceCache,
+        light: &mut SurfaceLight,
+        eye: [f32; 3],
+        sunlight: &Sunlight,
+    ) {
+        self.frame = self.frame.wrapping_add(1);
+        let n = CACHE_SIZE as i32;
+        for level in 0..CACHE_LEVELS {
+            let origin = Self::origin(level, eye);
+            let before = self.origins[level as usize];
+            if before == Some(origin) {
+                continue;
+            }
+            // Every cell of the new window not in the old one: its slot is handed it.
+            for z in 0..n {
+                for y in 0..n {
+                    for x in 0..n {
+                        let cell = [origin[0] + x, origin[1] + y, origin[2] + z];
+                        let was_in = before.is_some_and(|b| (0..3).all(|i| cell[i] >= b[i] && cell[i] < b[i] + n));
+                        if was_in {
+                            continue;
+                        }
+                        let s = cell.map(|c| c.rem_euclid(n) as u32);
+                        let slot = level * CACHE_PROBES + s[0] + CACHE_SIZE * (s[1] + CACHE_SIZE * s[2]);
+                        if !self.queued[slot as usize] {
+                            self.queued[slot as usize] = true;
+                            self.waiting.push_back(slot);
+                        }
+                    }
+                }
+            }
+            self.origins[level as usize] = Some(origin);
+        }
+        let mut jobs: Vec<u32> = Vec::with_capacity(CACHE_BUDGET);
+        while jobs.len() < CACHE_BUDGET {
+            let Some(slot) = self.waiting.pop_front() else {
+                break;
+            };
+            self.queued[slot as usize] = false;
+            jobs.push(slot);
+        }
+        let total = CACHE_LEVELS * CACHE_PROBES;
+        while jobs.len() < CACHE_BUDGET {
+            // In a scrambled order (an odd multiplier, the slots a power of two): probes next to
+            // each other cost alike - a slab of them inside the crowns, say - and are spread
+            // over many frames rather than taken together.
+            let slot = self.cursor.wrapping_mul(2_654_435_761) % total;
+            self.cursor = (self.cursor + 1) % total;
+            if !self.queued[slot as usize] {
+                jobs.push(slot);
+            }
+        }
+        let Some(lookup) = lookup_group(device, &self.lookup_layout, scene, pool, cache, light) else {
+            return;
+        };
+        let levels = self.levels_bytes();
+        self.levels = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteCacheLevels"),
+            contents: &levels,
+            usage: wgpu::BufferUsages::UNIFORM,
+        }));
+        let mut uniform = Vec::with_capacity(144);
+        uniform.extend_from_slice(&levels);
+        let four = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+        uniform.extend_from_slice(bytemuck::cast_slice(&four(sunlight.toward_sun)));
+        uniform.extend_from_slice(bytemuck::cast_slice(&four(sunlight.sun)));
+        uniform.extend_from_slice(bytemuck::cast_slice(&four(sunlight.sky)));
+        uniform.extend_from_slice(bytemuck::cast_slice(&[self.frame, jobs.len() as u32, 0, 0]));
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteCacheUpdate"),
+            contents: &uniform,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let job_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteCacheJobs"),
+            contents: bytemuck::cast_slice(&jobs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteCacheUpdate"),
+            layout: &self.update_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: job_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.cells.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.radiance.as_entire_binding() },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("CandeliteCacheUpdate"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &lookup, &[]);
+        pass.set_bind_group(1, &group, &[]);
+        let count = jobs.len() as u32;
+        pass.dispatch_workgroups(count.min(65535), count.div_ceil(65535), 1);
+    }
+
+    /// The bind group to sample the cache through, for `layout` (see `cache_sample_layout`);
+    /// [`None`] before the first [`Self::update`].
+    fn sample_group(&self, device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Option<wgpu::BindGroup> {
+        let levels = self.levels.as_ref()?;
+        Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteCacheSample"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: levels.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.cells.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.radiance.as_entire_binding() },
+            ],
+        }))
+    }
 }
 
 /// How many pixels apart screen probes are, each way.
@@ -1641,8 +2111,23 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
         let tangent = normalize(cross(side, normal));
         let bitangent = cross(normal, tangent);
         let direction = normalize(tangent * (out * cos(phi)) + bitangent * (out * sin(phi)) + normal * up);
-        let hit = candelite_trace(position + normal * 0.1, direction, 200.0);
-        let light = candelite_hit_light(hit, probes.towardSun.xyz, probes.sun.xyz, probes.sky.xyz);
+        // Traced a little way; past that, the light from beyond is the world radiance cache's,
+        // where it has probes round the ray's end - else traced on.
+        let start = position + normal * 0.1;
+        let hit = candelite_trace(start, direction, SCREEN_REACH);
+        var light: vec3f;
+        if (hit.hit) {
+            light = candelite_hit_light(hit, probes.towardSun.xyz, probes.sun.xyz, probes.sky.xyz);
+        } else {
+            let end = start + direction * SCREEN_REACH;
+            let cached = cache_radiance(end, direction);
+            if (cached.w > 0.0) {
+                light = cached.rgb;
+            } else {
+                let far = candelite_trace(end, direction, 1.0e3);
+                light = candelite_hit_light(far, probes.towardSun.xyz, probes.sun.xyz, probes.sky.xyz);
+            }
+        }
         // Each ray stands for 2 pi / 64 of the hemisphere.
         let basis = vec4f(0.282095, 0.488603 * direction.y, 0.488603 * direction.z, 0.488603 * direction.x) * (6.2831853 / 64.0);
         r = basis * light.r;
@@ -1767,6 +2252,7 @@ pub struct ScreenProbes {
     trace: wgpu::ComputePipeline,
     gather: wgpu::RenderPipeline,
     empty_layout: wgpu::BindGroupLayout,
+    cache_layout: wgpu::BindGroupLayout,
     /// This frame's probes and last frame's, swapped each frame, with the grid they were for.
     buffers: Option<([wgpu::Buffer; 2], [u32; 2])>,
     previous_view_projection: Option<[[f32; 4]; 4]>,
@@ -1829,9 +2315,15 @@ impl ScreenProbes {
             label: Some("CandeliteProbeGather"),
             entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true))],
         });
+        let cache_layout = cache_sample_layout(device);
         let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("CandeliteProbes"),
-            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{PROBES_COMMON}\n{PROBES_TRACE}").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{PROBES_COMMON}\n{CACHE_COMMON}\n{CACHE_SAMPLE}\nconst SCREEN_REACH: f32 = {SCREEN_REACH:?};\n{PROBES_TRACE}"
+                )
+                .into(),
+            ),
         });
         let gather_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("CandeliteProbeGather"),
@@ -1841,7 +2333,7 @@ impl ScreenProbes {
             label: Some("CandeliteProbes"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("CandeliteProbes"),
-                bind_group_layouts: &[Some(&lookup_layout), Some(&trace_layout)],
+                bind_group_layouts: &[Some(&lookup_layout), Some(&trace_layout), Some(&cache_layout)],
                 immediate_size: 0,
             })),
             module: &trace_module,
@@ -1883,14 +2375,17 @@ impl ScreenProbes {
             trace,
             gather,
             empty_layout: empty,
+            cache_layout,
             buffers: None,
             previous_view_projection: None,
             frame: 0,
         })
     }
 
-    /// Places and traces the probes for `frame` against what `light` has lit, and draws the
-    /// light they gathered into `frame.target`, recorded into `encoder`.
+    /// Places and traces the probes for `frame` against what `light` has lit - beyond
+    /// [`SCREEN_REACH`], taking the light from `radiance` - and draws the light they gathered into
+    /// `frame.target`, recorded into `encoder`. `radiance` must have been updated
+    /// ([`RadianceCache::update`]).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -1900,6 +2395,7 @@ impl ScreenProbes {
         pool: &GeometryPool,
         cache: &mut SurfaceCache,
         light: &mut SurfaceLight,
+        radiance: &RadianceCache,
         sunlight: &Sunlight,
         frame: &ProbeFrame,
     ) {
@@ -1920,6 +2416,9 @@ impl ScreenProbes {
         }
         self.frame = self.frame.wrapping_add(1);
         let Some(lookup) = lookup_group(device, &self.lookup_layout, scene, pool, cache, light) else {
+            return;
+        };
+        let Some(cached) = radiance.sample_group(device, &self.cache_layout) else {
             return;
         };
         let ([history, current], _) = self.buffers.as_ref().expect("made above");
@@ -1988,6 +2487,7 @@ impl ScreenProbes {
             pass.set_pipeline(&self.trace);
             pass.set_bind_group(0, &lookup, &[]);
             pass.set_bind_group(1, &trace_group, &[]);
+            pass.set_bind_group(2, &cached, &[]);
             pass.dispatch_workgroups(grid[0], grid[1], 1);
         }
         let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2965,6 +3465,7 @@ mod test {
         let mut drawer = GBufferDrawer::new(&device);
         let mut light = SurfaceLight::new(&device).expect("can trace");
         let mut probes = ScreenProbes::new(&device).expect("can trace");
+        let mut radiance = RadianceCache::new(&device).expect("can trace");
         // Only the sky, of radiance 1: a floor open to all of it gathers 1.
         let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [0.0; 3], sky: [1.0; 3] };
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -3020,9 +3521,18 @@ mod test {
         let inverse = [[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, -2.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
         let forward = [[0.5, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, -0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
         let frame = ProbeFrame { depth: &depth, normal: &normal, view_projection: forward, inverse_view_projection: inverse, target: &target };
+        // Every probe of the cache traced once (64 grids' worth of slots at its budget a frame),
+        // then the screen probes, a few frames over.
+        let eye = [0.0, 3.0, 0.0];
+        for _ in 0..(CACHE_LEVELS * CACHE_PROBES) as usize / CACHE_BUDGET {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            radiance.update(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, eye, &sunlight);
+            queue.submit([encoder.finish()]);
+        }
         for _ in 0..8 {
             let mut encoder = device.create_command_encoder(&Default::default());
-            probes.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &sunlight, &frame);
+            radiance.update(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, eye, &sunlight);
+            probes.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &radiance, &sunlight, &frame);
             queue.submit([encoder.finish()]);
         }
         // Red of each pixel, a half float in the low half of its first word.
@@ -3034,5 +3544,18 @@ mod test {
         let shaded = red(8, SIZE / 2);
         assert!(open > 0.7 && open < 1.05, "open {open}");
         assert!(shaded < 0.5 * open, "shaded {shaded}, open {open}");
+
+        // The sky put out, the cache left as it was: a ray leaving the screen probes' reach takes
+        // its light from the cache, so the open floor still gathers the sky the cache saw.
+        let dark = Sunlight { sky: [0.0; 3], ..sunlight };
+        for _ in 0..16 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            probes.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &radiance, &dark, &frame);
+            queue.submit([encoder.finish()]);
+        }
+        let seen = texels(&device, &queue, &target, wgpu::TextureAspect::All, 8);
+        let red = |x: u32, y: u32| half::f16::from_bits((seen[(y * SIZE + x) as usize] & 0xFFFF) as u16).to_f32();
+        let cached = red(60, SIZE / 2);
+        assert!(cached > 0.6 * open, "from the cache {cached}, open {open}");
     }
 }

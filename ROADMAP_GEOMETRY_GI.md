@@ -151,7 +151,23 @@ prefixes. The method follows the published description of Lumen cited above.
    (Wilderness: WILDERNESS_CANDELITE=1): about 3.3 ms of GPU time with the cards' lighting.
    Still to do: importance sampling, spatial filtering of the probes, light through leaves (crowns
    come out darker than with the flat ambient colour).
-5. **World radiance cache**: probes around the camera for long rays and stability.
+5. **World radiance cache** - done (`RadianceCache`): three nested grids of 16 cubed probes round
+   the eye, 2, 4 and 8 m apart, each probe the light reaching it from every direction as an 8 by 8
+   octahedral map, averaged over frames. The grids move with the eye a cell at a time (slots wrap
+   round), slots handed new cells traced first, the rest in a scrambled turn, 256 probes a frame;
+   a probe whose rays mostly hit the backs of things is inside something and is not used. Screen
+   probes trace 8 m (`SCREEN_REACH`) and take the light from beyond from the 8 probes round the
+   ray's end in the finest grid holding it, else trace on. GPU-tested: with the sky put out after
+   the cache saw it, open floor still gathers the sky from the cache.
+   What made it affordable, and kept frames from stalling: cache rays end at 64 m or 16 cells; a
+   hit without lit cards further than 4 m is lit without a shadow ray (as half in the sun); every
+   ray asks about at most 32 cutout triangles (`CANDELITE_MOST_CUTOUTS`), past which the next
+   stops it; a fourth grid, 16 m apart, cost five to eight times the others in spikes of tens of
+   milliseconds, and was dropped. Lighting the cards packs texels 64 to a workgroup whatever cards
+   they are of; and only instances big enough for their distance get lit cards (`LIT_SIZE`):
+   lighting ten thousand floor plants' small cards made rays in no order a GPU likes, tens of
+   milliseconds a frame while walking. In the glade: cards 2-3 ms, cache about 1 ms, screen
+   probes 3.5-5.5 ms of GPU time.
 6. **Reflections**: glossy reflections traced into the same surface cache.
 
 ## Order

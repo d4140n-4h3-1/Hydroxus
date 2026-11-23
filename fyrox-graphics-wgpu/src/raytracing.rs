@@ -94,9 +94,21 @@ impl CutoutMask {
 /// What a cutout keeps for the shader: the texture coordinates of each of its triangles'
 /// corners, and its mask.
 struct Cutout {
-    corners: Vec<[f32; 2]>,
+    corners: CutoutCorners,
     mask: Arc<CutoutMask>,
 }
+
+impl Cutout {
+    /// What tells its record apart: copies of one surface - bent each its own way, so each
+    /// geometry of its own - share their corners and mask, and so one record.
+    fn key(&self) -> (usize, usize) {
+        (Arc::as_ptr(&self.corners) as *const u8 as usize, Arc::as_ptr(&self.mask) as *const u8 as usize)
+    }
+}
+
+/// The texture coordinates of each corner of a cutout's triangles, triangle after triangle:
+/// see [`WgpuGraphicsServer::cutout_corners`]. Shared by geometry built from the same surface.
+pub type CutoutCorners = Arc<Vec<[f32; 2]>>;
 
 /// How geometry stands in a ray's way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,8 +207,10 @@ fn lets_through_bits([r, g, b]: [f32; 3]) -> u32 {
 /// What the shaders read about a scene's cutouts, in storage buffers: one record per cutout,
 /// the texture coordinates of each of their triangles' corners, and their masks' bits.
 struct CutoutBuffers {
-    /// Which geometry each record is, in order.
-    ids: Vec<u64>,
+    /// Which corners and mask each record is, in order (see [`Cutout::key`]); held, so that
+    /// their addresses are not used again by others while they tell records apart.
+    keys: Vec<(usize, usize)>,
+    _held: Vec<(CutoutCorners, Arc<CutoutMask>)>,
     records: wgpu::Buffer,
     corners: wgpu::Buffer,
     masks: wgpu::Buffer,
@@ -215,24 +229,26 @@ struct CutoutRecord {
 }
 
 impl CutoutBuffers {
-    /// Buffers for `cutouts`, in that order. Never empty, as a binding has to have something in
-    /// it.
-    fn new(device: &wgpu::Device, cutouts: &[&RayTracedGeometry]) -> Self {
+    /// Buffers for `cutouts`, in that order, each a record; a mask several share is put in once.
+    /// Never empty, as a binding has to have something in it.
+    fn new(device: &wgpu::Device, cutouts: &[&Cutout]) -> Self {
         let mut records = Vec::with_capacity(cutouts.len());
         let mut corners: Vec<[f32; 2]> = Vec::new();
         let mut masks: Vec<u32> = Vec::new();
-        for geometry in cutouts {
-            let Some(cutout) = &geometry.cutout else {
-                continue;
-            };
+        let mut placed_masks: HashMap<usize, u32> = HashMap::new();
+        for cutout in cutouts {
+            let first_word = *placed_masks.entry(Arc::as_ptr(&cutout.mask) as *const u8 as usize).or_insert_with(|| {
+                let first = masks.len() as u32;
+                masks.extend_from_slice(&cutout.mask.bits);
+                first
+            });
             records.push(CutoutRecord {
                 first_triangle: (corners.len() / 3) as u32,
-                first_word: masks.len() as u32,
+                first_word,
                 width: cutout.mask.width,
                 height: cutout.mask.height,
             });
             corners.extend_from_slice(&cutout.corners);
-            masks.extend_from_slice(&cutout.mask.bits);
         }
         if records.is_empty() {
             records.push(<CutoutRecord as bytemuck::Zeroable>::zeroed());
@@ -251,7 +267,8 @@ impl CutoutBuffers {
             })
         };
         Self {
-            ids: cutouts.iter().map(|geometry| geometry.id).collect(),
+            keys: cutouts.iter().map(|cutout| cutout.key()).collect(),
+            _held: cutouts.iter().map(|cutout| (cutout.corners.clone(), cutout.mask.clone())).collect(),
             records: buffer("CutoutRecords", bytemuck::cast_slice(&records)),
             corners: buffer("CutoutCorners", bytemuck::cast_slice(&corners)),
             masks: buffer("CutoutMasks", bytemuck::cast_slice(&masks)),
@@ -919,11 +936,32 @@ impl WgpuGraphicsServer {
         mask: Arc<CutoutMask>,
         updatable: bool,
     ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
+        let corners = Self::cutout_corners(indices, uvs);
+        self.build_ray_traced_cutout_sharing(vertices, indices, corners, mask, updatable)
+    }
+
+    /// The texture coordinates of each corner of the triangles `indices` makes, from each
+    /// vertex's `uvs` (two floats each): for [`Self::build_ray_traced_cutout_sharing`].
+    pub fn cutout_corners(indices: &[u32], uvs: &[f32]) -> CutoutCorners {
         let uv = |i: u32| {
             let i = i as usize * 2;
             [uvs.get(i).copied().unwrap_or(0.0), uvs.get(i + 1).copied().unwrap_or(0.0)]
         };
-        let corners = indices[..indices.len() / 3 * 3].iter().map(|&i| uv(i)).collect();
+        Arc::new(indices[..indices.len() / 3 * 3].iter().map(|&i| uv(i)).collect())
+    }
+
+    /// As [`Self::build_ray_traced_cutout`], with the corners' texture coordinates worked out
+    /// already ([`Self::cutout_corners`]) and shared: geometry built from one surface again and
+    /// again - a copy of its own for each plant bent its own way - sharing them shares one
+    /// record of the scene's cutouts.
+    pub fn build_ray_traced_cutout_sharing(
+        &self,
+        vertices: &[f32],
+        indices: &[u32],
+        corners: CutoutCorners,
+        mask: Arc<CutoutMask>,
+        updatable: bool,
+    ) -> Result<Option<RayTracedGeometry>, FrameworkError> {
         self.build_geometry(vertices, indices, updatable, Kind::Cutout, Some(Cutout { corners, mask }))
     }
 
@@ -1098,23 +1136,22 @@ impl WgpuGraphicsServer {
             scene.capacity = wanted;
             scene.used = 0;
         }
-        // Each cutout placed gets a record for the shaders, in the order they first come; the
-        // records are only written again when which cutouts there are changes.
-        let mut cutouts: Vec<&RayTracedGeometry> = Vec::new();
+        // Each cutout placed gets a record for the shaders, in the order they first come - one
+        // for all the geometry sharing its corners and mask (see [`Cutout::key`]); the records
+        // are only written again when which cutouts there are changes.
+        let mut cutouts: Vec<&Cutout> = Vec::new();
+        let mut records: HashMap<(usize, usize), u32> = HashMap::new();
         let mut custom_data: Vec<u32> = Vec::with_capacity(instances.len());
         for instance in instances {
-            let geometry = instance.geometry;
-            custom_data.push(if geometry.cutout.is_some() {
-                let record = match cutouts.iter().position(|had| had.id == geometry.id) {
-                    Some(index) => index,
-                    None => {
-                        cutouts.push(geometry);
-                        cutouts.len() - 1
-                    }
-                };
-                CUTOUT_BIT | record as u32
-            } else {
-                lets_through_bits(instance.lets_through)
+            custom_data.push(match &instance.geometry.cutout {
+                Some(cutout) => {
+                    let record = *records.entry(cutout.key()).or_insert_with(|| {
+                        cutouts.push(cutout);
+                        cutouts.len() as u32 - 1
+                    });
+                    CUTOUT_BIT | record
+                }
+                None => lets_through_bits(instance.lets_through),
             });
         }
         if cutouts.len() >= CUTOUT_BIT as usize {
@@ -1124,8 +1161,8 @@ impl WgpuGraphicsServer {
                 CUTOUT_BIT - 1
             )));
         }
-        let ids: Vec<u64> = cutouts.iter().map(|geometry| geometry.id).collect();
-        if ids != scene.cutouts.ids {
+        let keys: Vec<(usize, usize)> = cutouts.iter().map(|cutout| cutout.key()).collect();
+        if keys != scene.cutouts.keys {
             scene.cutouts = CutoutBuffers::new(&self.state.device, &cutouts);
         }
 
