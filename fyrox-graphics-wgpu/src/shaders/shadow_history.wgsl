@@ -63,12 +63,32 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     if (any(was < vec2f(0.0)) || any(was > vec2f(1.0))) {
         return vec4f(now, range);
     }
-    let before = textureSampleLevel(history, historySampler, was, 0.0);
-    // The same surface then: as far from the frame before's near plane as this place is, within
-    // what depth's precision and the filtering of the history allow.
+    // The four texels of the history round where it was, each taken only if it held the same
+    // surface then - as far from the frame before's near plane as this place is, within what
+    // depth's precision allows - and weighted bilinearly among those that did. Filtered together,
+    // a texel of the ground beside a trunk or rock took in the trunk's range too, failed the test,
+    // and started again from this frame's one ray: and as the view's jitter moved where it was by
+    // a fraction of a pixel each frame, the shadow round the foot of trunks and rocks blinked.
     let expected = distance(position, unproject(uniforms.previousInverseViewProjection, was, 0.0));
-    if (abs(before.a - expected) > 0.02 * expected + 0.05) {
+    let size = vec2i(textureDimensions(history));
+    let at = was * vec2f(size) - 0.5;
+    let corner = vec2i(floor(at));
+    let f = at - floor(at);
+    var sum = vec3f(0.0);
+    var weight = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let offset = vec2i(k & 1, k >> 1);
+        let texel = clamp(corner + offset, vec2i(0), size - 1);
+        let then = textureLoad(history, texel, 0);
+        if (abs(then.a - expected) > 0.02 * expected + 0.05) {
+            continue;
+        }
+        let w = select(1.0 - f.x, f.x, offset.x == 1) * select(1.0 - f.y, f.y, offset.y == 1) + 1.0e-4;
+        sum += then.rgb * w;
+        weight += w;
+    }
+    if (weight <= 0.0) {
         return vec4f(now, range);
     }
-    return vec4f(mix(before.rgb, now, uniforms.blend), range);
+    return vec4f(mix(sum / weight, now, uniforms.blend), range);
 }
