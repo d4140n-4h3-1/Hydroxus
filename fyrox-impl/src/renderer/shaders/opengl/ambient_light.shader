@@ -47,6 +47,11 @@
             binding: 8
         ),
         (
+            name: "indirectDiffuseTexture",
+            kind: Texture(kind: Sampler2D, fallback: Black),
+            binding: 9
+        ),
+        (
             name: "properties",
             kind: PropertyGroup([
                 (name: "worldViewProjection", kind: Matrix4()),
@@ -55,6 +60,7 @@
                 (name: "invViewProj", kind: Matrix4()),
                 (name: "skyboxLighting", kind: Bool()),
                 (name: "environmentLightingBrightness", kind: Float()),
+                (name: "indirectDiffuse", kind: Bool()),
             ]),
             binding: 0
         ),
@@ -148,7 +154,8 @@
                         vec4 bakedLighting = texture(bakedLightingTexture, texCoord);
 
                         vec3 irradiance = S_SRGBToLinear(texture(irradianceMap, fragmentNormal)).rgb;
-                        vec3 diffuse = (bakedLighting.rgb + properties.environmentLightingBrightness * (properties.skyboxLighting ? irradiance : properties.ambientColor.rgb)) * albedo.rgb;
+                        vec3 ambientLighting = properties.indirectDiffuse ? texture(indirectDiffuseTexture, texCoord).rgb : (properties.skyboxLighting ? irradiance : properties.ambientColor.rgb);
+                        vec3 diffuse = (bakedLighting.rgb + properties.environmentLightingBrightness * ambientLighting) * albedo.rgb;
 
                         FragColor.rgb = (kD * diffuse + specular) * ambientOcclusion;
                         FragColor.a = bakedLighting.a;

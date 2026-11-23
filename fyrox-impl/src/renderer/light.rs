@@ -111,6 +111,9 @@ pub(crate) struct DeferredRendererContext<'a> {
     pub environment_map_irradiance_convolution: &'a EnvironmentMapIrradianceConvolution,
     pub need_recalculate_convolution: &'a mut bool,
     pub light_shadow_tracer: Option<&'a mut (dyn LightShadowTracer + 'static)>,
+    /// Light between surfaces to light with in place of the ambient colour: see
+    /// [`super::Renderer::set_indirect_diffuse`].
+    pub indirect_diffuse: Option<GpuTexture>,
 }
 
 /// The part of the screen a light can possibly reach: the screen-space bounds of the sphere that
@@ -350,6 +353,7 @@ impl DeferredLightRenderer {
             environment_map_irradiance_convolution,
             need_recalculate_convolution,
             mut light_shadow_tracer,
+            indirect_diffuse,
         } = args;
 
         let viewport = Rect::new(0, 0, gbuffer.width, gbuffer.height);
@@ -488,6 +492,7 @@ impl DeferredLightRenderer {
             EnvironmentLightingSource::SkyBox
         );
         let ambient_color = ambient_color.srgb_to_linear_f32();
+        let has_indirect_diffuse = indirect_diffuse.is_some();
         let properties = PropertyGroup::from([
             property("worldViewProjection", &frame_matrix),
             property("ambientColor", &ambient_color),
@@ -498,6 +503,7 @@ impl DeferredLightRenderer {
                 "environmentLightingBrightness",
                 &scene.rendering_options.environment_lighting_brightness,
             ),
+            property("indirectDiffuse", &has_indirect_diffuse),
         ]);
         let material = RenderMaterial::from([
             binding(
@@ -557,6 +563,13 @@ impl DeferredLightRenderer {
             binding(
                 "brdfLUT",
                 (&self.brdf_lut, &renderer_resources.linear_clamp_sampler),
+            ),
+            binding(
+                "indirectDiffuseTexture",
+                (
+                    indirect_diffuse.as_ref().unwrap_or(&renderer_resources.black_dummy),
+                    &renderer_resources.nearest_clamp_sampler,
+                ),
             ),
             binding("properties", &properties),
         ]);

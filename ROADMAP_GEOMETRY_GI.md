@@ -137,8 +137,20 @@ prefixes. The method follows the published description of Lumen cited above.
    sees it. fyrox-gfx `with_candelite_light_view` (Wilderness: WILDERNESS_CANDELITE_VIEW=lit).
    Lamps are still to come. Known: a mesh as big as the ground gets coarse cards (its shadows in
    metre-wide blocks), and some flowering bushes are hits no card saw (magenta since phase 2).
-4. **Screen probes**: diffuse GI gathered at probes every 16 pixels, rays importance-sampled,
-   filtered spatially and temporally, interpolated to every pixel. Replaces the ambient colour.
+4. **Screen probes** - done (`ScreenProbes`): a probe every 16 pixels each way, placed on what
+   the G-Buffer sees at a pixel of its tile (a different one each frame), traces 64 rays spread
+   evenly over the hemisphere about its normal (turned each frame) against the lit cards, keeps
+   what they bring back as L1 spherical harmonics, and is averaged (up to 12 frames) with last
+   frame's probe where it reprojects, if that lay on the same surface. Each pixel is lit from its
+   four nearest probes, weighted by nearness, by how far each lies off the pixel's surface and by
+   how alike their normals are (else any of nine round it), at its own normal. The renderer lights
+   with that in place of the ambient colour (`Renderer::set_indirect_diffuse`, a texture per scene,
+   used by the ambient pass). Candelite's light is now in linear colour, the sun as the renderer's
+   diffuse lighting gives off (colour times intensity over pi). GPU-tested: floor open to a sky of
+   1 gathers about 1, under a slab under half that. fyrox-gfx `GraphicsEffects::with_candelite`
+   (Wilderness: WILDERNESS_CANDELITE=1): about 3.3 ms of GPU time with the cards' lighting.
+   Still to do: importance sampling, spatial filtering of the probes, light through leaves (crowns
+   come out darker than with the flat ambient colour).
 5. **World radiance cache**: probes around the camera for long rays and stability.
 6. **Reflections**: glossy reflections traced into the same surface cache.
 

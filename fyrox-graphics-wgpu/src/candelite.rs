@@ -760,6 +760,11 @@ struct CandeliteLitCard {
 @group(0) @binding(12) var<storage, read> candeliteRadiance: array<vec2u>;
 const CANDELITE_RADIANCE_WIDTH: u32 = 2048u;
 
+// The atlas's diffuse colour is stored as the G-Buffer stores it, in sRGB: light works in linear.
+fn candelite_linear(c: vec3f) -> vec3f {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3f(2.4)), step(vec3f(0.04045), c));
+}
+
 fn candelite_unpack(packed: vec2u) -> vec4f {
     return vec4f(unpack2x16float(packed.x), unpack2x16float(packed.y));
 }
@@ -988,7 +993,7 @@ fn candelite_hit_light(hit: SurfaceHit, toward_sun: vec3f, sun: vec3f, sky: vec3
     if (facing > 0.0 && !candelite_blocked(hit.position + hit.normal * 0.05 + toward_sun * 0.15, toward_sun, 1.0e4)) {
         light += sun * facing;
     }
-    return hit.diffuse * light;
+    return candelite_linear(hit.diffuse) * light;
 }
 "#;
 
@@ -1032,9 +1037,10 @@ pub struct GpuLitCard {
 pub struct Sunlight {
     /// Towards the sun, a unit vector.
     pub toward_sun: [f32; 3],
-    /// The light a white surface squarely facing the sun gives off.
+    /// The light a white surface squarely facing the sun gives off, linear: as the renderer
+    /// lights, its colour times its intensity over pi.
     pub sun: [f32; 3],
-    /// The sky's radiance, the same all over.
+    /// The sky's radiance, the same all over, linear.
     pub sky: [f32; 3],
 }
 
@@ -1116,7 +1122,7 @@ fn light_cards(
     let world = vec3f(dot(m[0], vec4f(p, 1.0)), dot(m[1], vec4f(p, 1.0)), dot(m[2], vec4f(p, 1.0)));
     let captured = textureLoad(candeliteNormal, at, 0).xyz * 2.0 - 1.0;
     let normal = normalize(vec3f(dot(m[0].xyz, captured), dot(m[1].xyz, captured), dot(m[2].xyz, captured)));
-    let albedo = textureLoad(candeliteDiffuse, at, 0).rgb;
+    let albedo = candelite_linear(textureLoad(candeliteDiffuse, at, 0).rgb);
 
     // The sun, if a shadow ray reaches it.
     var direct = vec3f(0.0);
@@ -1526,6 +1532,498 @@ fn lookup_writable() -> String {
         "var<storage, read> candeliteRadiance",
         "var<storage, read_write> candeliteRadiance",
     )
+}
+
+/// How many pixels apart screen probes are, each way.
+pub const PROBE_SPACING: u32 = 16;
+/// The format [`ScreenProbes`] draws the light between surfaces in: per pixel, what to light it
+/// with in place of the ambient colour - its diffuse colour times this is the light it gives off.
+pub const PROBES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The probes' parameters and the screen's depth and normals, shared by both their shaders.
+const PROBES_COMMON: &str = r#"
+struct Probes {
+    inverseViewProjection: mat4x4f,
+    previousViewProjection: mat4x4f,
+    towardSun: vec4f,
+    sun: vec4f,
+    sky: vec4f,
+    size: vec2u,
+    grid: vec2u,
+    frame: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+// A probe: where it is (w 1 if it is on something), which way it faces (w how many frames it
+// has been averaged over), and the light reaching it as L1 spherical harmonics, red, green and
+// blue (each the constant term, then y, z, x).
+struct Probe {
+    position: vec4f,
+    normal: vec4f,
+    r: vec4f,
+    g: vec4f,
+    b: vec4f,
+};
+@group(1) @binding(0) var<uniform> probes: Probes;
+@group(1) @binding(1) var sceneDepth: texture_depth_2d;
+@group(1) @binding(2) var sceneNormal: texture_2d<f32>;
+
+// Where the surface seen at `pixel` is, from its depth (OpenGL's clip space, depth 0 to 1).
+fn probes_unproject(pixel: vec2f, depth: f32) -> vec3f {
+    let uv = pixel / vec2f(probes.size);
+    let clip = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth * 2.0 - 1.0, 1.0);
+    let p = probes.inverseViewProjection * clip;
+    return p.xyz / p.w;
+}
+
+fn probes_normal(pixel: vec2u) -> vec3f {
+    return normalize(textureLoad(sceneNormal, pixel, 0).xyz * 2.0 - 1.0);
+}
+
+// The irradiance at a surface facing `n`, over pi - what to light a diffuse colour with - from a
+// probe's harmonics.
+fn probes_irradiance(probe: Probe, n: vec3f) -> vec3f {
+    let band1 = vec4f(0.0, 0.488603 * 2.0943951 * n.y, 0.488603 * 2.0943951 * n.z, 0.488603 * 2.0943951 * n.x);
+    // E(n) = pi c0 Y0 + 2 pi / 3 c1 . Y1(n): the clamped cosine convolved with the harmonics.
+    let constant = 0.282095 * 3.14159265;
+    let r = probe.r.x * constant + dot(probe.r.yzw, band1.yzw);
+    let g = probe.g.x * constant + dot(probe.g.yzw, band1.yzw);
+    let b = probe.b.x * constant + dot(probe.b.yzw, band1.yzw);
+    return max(vec3f(r, g, b), vec3f(0.0)) / 3.14159265;
+}
+"#;
+
+const PROBES_TRACE: &str = r#"
+@group(1) @binding(3) var<storage, read> history: array<Probe>;
+@group(1) @binding(4) var<storage, read_write> current: array<Probe>;
+
+fn probes_pcg(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+var<workgroup> gatheredR: array<vec4f, 64>;
+var<workgroup> gatheredG: array<vec4f, 64>;
+var<workgroup> gatheredB: array<vec4f, 64>;
+
+// Over how many frames a probe's light is averaged, at most.
+const PROBE_HISTORY: f32 = 12.0;
+
+// A probe a workgroup, a ray a lane: placed on what is seen at a pixel of its 16 by 16 tile, a
+// different one each frame; its 64 rays spread evenly over the hemisphere about its normal,
+// turned each frame; what each brings back projected onto the harmonics; then averaged with what
+// the probe there saw last frame, if it is on the same surface.
+@compute @workgroup_size(8, 8)
+fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) local: vec3u, @builtin(local_invocation_index) lane: u32) {
+    let index = group.y * probes.grid.x + group.x;
+    let seed = probes_pcg(index * 9781u + probes.frame * 6271u);
+    let jitter = vec2u(seed % 16u, (seed >> 8u) % 16u);
+    let pixel = min(group.xy * 16u + jitter, probes.size - 1u);
+    let depth = textureLoad(sceneDepth, pixel, 0);
+    let on_something = depth < 1.0;
+    let position = probes_unproject(vec2f(pixel) + 0.5, depth);
+    let normal = probes_normal(pixel);
+
+    var r = vec4f(0.0);
+    var g = vec4f(0.0);
+    var b = vec4f(0.0);
+    if (on_something) {
+        let turn = probes_pcg(seed ^ lane);
+        let u1 = (f32(local.x) + f32(turn & 0xFFFFu) / 65536.0) / 8.0;
+        let u2 = (f32(local.y) + f32(turn >> 16u) / 65536.0) / 8.0;
+        // Uniform over the hemisphere: up the normal by u1, round it by u2.
+        let up = u1;
+        let out = sqrt(max(1.0 - up * up, 0.0));
+        let phi = 6.2831853 * u2;
+        let side = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
+        let tangent = normalize(cross(side, normal));
+        let bitangent = cross(normal, tangent);
+        let direction = normalize(tangent * (out * cos(phi)) + bitangent * (out * sin(phi)) + normal * up);
+        let hit = candelite_trace(position + normal * 0.1, direction, 200.0);
+        let light = candelite_hit_light(hit, probes.towardSun.xyz, probes.sun.xyz, probes.sky.xyz);
+        // Each ray stands for 2 pi / 64 of the hemisphere.
+        let basis = vec4f(0.282095, 0.488603 * direction.y, 0.488603 * direction.z, 0.488603 * direction.x) * (6.2831853 / 64.0);
+        r = basis * light.r;
+        g = basis * light.g;
+        b = basis * light.b;
+    }
+    gatheredR[lane] = r;
+    gatheredG[lane] = g;
+    gatheredB[lane] = b;
+    workgroupBarrier();
+    if (lane != 0u) {
+        return;
+    }
+    var probe = Probe(vec4f(position, select(0.0, 1.0, on_something)), vec4f(normal, 1.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
+    if (!on_something) {
+        current[index] = probe;
+        return;
+    }
+    for (var i = 0u; i < 64u; i++) {
+        probe.r += gatheredR[i];
+        probe.g += gatheredG[i];
+        probe.b += gatheredB[i];
+    }
+    // Last frame's probe where this one was then, if it was on the same surface.
+    let before = probes.previousViewProjection * vec4f(position, 1.0);
+    if (before.w > 0.0) {
+        let ndc = before.xy / before.w;
+        let then = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(probes.size);
+        if (all(then >= vec2f(0.0)) && all(then < vec2f(probes.size))) {
+            let cell = min(vec2u(then) / 16u, probes.grid - 1u);
+            let old = history[cell.y * probes.grid.x + cell.x];
+            let distance = length(position - probes_unproject(vec2f(probes.size) * 0.5, 0.0));
+            let apart = abs(dot(old.position.xyz - position, normal));
+            if (old.position.w > 0.5 && dot(old.normal.xyz, normal) > 0.8 && apart < 0.05 + 0.02 * distance) {
+                let count = min(old.normal.w + 1.0, PROBE_HISTORY);
+                probe.r = mix(old.r, probe.r, 1.0 / count);
+                probe.g = mix(old.g, probe.g, 1.0 / count);
+                probe.b = mix(old.b, probe.b, 1.0 / count);
+                probe.normal.w = count;
+            }
+        }
+    }
+    current[index] = probe;
+}
+"#;
+
+const PROBES_GATHER: &str = r#"
+@group(1) @binding(3) var<storage, read> current: array<Probe>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+    let x = f32(i32(index) / 2) * 4.0 - 1.0;
+    let y = f32(i32(index) & 1) * 4.0 - 1.0;
+    return vec4f(x, y, 0.0, 1.0);
+}
+
+// Each pixel lit from the probes round it: the four nearest, each by how near it is, and only
+// as far as it lies on the pixel's surface and faces its way; if none does, any of the nine
+// round it facing its way; if none, the sky.
+@fragment
+fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    let pixel = vec2u(at.xy);
+    let depth = textureLoad(sceneDepth, pixel, 0);
+    if (depth >= 1.0) {
+        return vec4f(probes.sky.rgb, 1.0);
+    }
+    let p = probes_unproject(at.xy, depth);
+    let n = probes_normal(pixel);
+    let eye = probes_unproject(vec2f(probes.size) * 0.5, 0.0);
+    let slack = 0.05 + 0.02 * length(p - eye);
+    let cell = (at.xy - 8.0) / 16.0;
+    let base = vec2i(floor(cell));
+    let f = fract(cell);
+    var sum = vec3f(0.0);
+    var weight = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let offset = vec2i(k & 1, k >> 1);
+        let c = clamp(base + offset, vec2i(0), vec2i(probes.grid) - 1);
+        let probe = current[u32(c.y) * probes.grid.x + u32(c.x)];
+        if (probe.position.w < 0.5) {
+            continue;
+        }
+        let near = select(1.0 - f.x, f.x, offset.x == 1) * select(1.0 - f.y, f.y, offset.y == 1) + 1.0e-3;
+        let plane = exp(-abs(dot(probe.position.xyz - p, n)) / slack);
+        let facing = pow(max(dot(probe.normal.xyz, n), 0.0), 4.0);
+        let w = near * plane * facing;
+        sum += probes_irradiance(probe, n) * w;
+        weight += w;
+    }
+    if (weight < 1.0e-4) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let c = clamp(vec2i(floor(at.xy / 16.0)) + vec2i(dx, dy), vec2i(0), vec2i(probes.grid) - 1);
+                let probe = current[u32(c.y) * probes.grid.x + u32(c.x)];
+                if (probe.position.w < 0.5) {
+                    continue;
+                }
+                let w = max(dot(probe.normal.xyz, n), 0.0) + 1.0e-3;
+                sum += probes_irradiance(probe, n) * w;
+                weight += w;
+            }
+        }
+    }
+    if (weight <= 0.0) {
+        return vec4f(probes.sky.rgb, 1.0);
+    }
+    return vec4f(sum / weight, 1.0);
+}
+"#;
+
+/// Candelite's final gather: the light between surfaces brought to every pixel, after Lumen's
+/// screen probes. A probe is placed every [`PROBE_SPACING`] pixels each way, on what the screen
+/// sees there (a different pixel of its tile each frame); it traces 64 rays over the hemisphere
+/// about its normal against the lit cards ([`SurfaceLight`]), and keeps what they bring back as
+/// spherical harmonics, averaged with what the probe there saw last frame if it is on the same
+/// surface. Each pixel is then lit from the probes round it on its surface, at its own normal:
+/// what the renderer lights its diffuse colour with in place of the ambient colour.
+pub struct ScreenProbes {
+    lookup_layout: wgpu::BindGroupLayout,
+    trace_layout: wgpu::BindGroupLayout,
+    gather_layout: wgpu::BindGroupLayout,
+    trace: wgpu::ComputePipeline,
+    gather: wgpu::RenderPipeline,
+    empty_layout: wgpu::BindGroupLayout,
+    /// This frame's probes and last frame's, swapped each frame, with the grid they were for.
+    buffers: Option<([wgpu::Buffer; 2], [u32; 2])>,
+    previous_view_projection: Option<[[f32; 4]; 4]>,
+    frame: u32,
+}
+
+/// What [`ScreenProbes::record`] needs of the frame.
+pub struct ProbeFrame<'a> {
+    /// The scene's depth, as the G-Buffer has it (OpenGL's clip space, 0 to 1): a depth texture.
+    pub depth: &'a wgpu::Texture,
+    /// The scene's normals, as the G-Buffer has them (each axis brought to 0 to 1).
+    pub normal: &'a wgpu::Texture,
+    /// From the world to clip space, column by column (OpenGL's).
+    pub view_projection: [[f32; 4]; 4],
+    /// And back.
+    pub inverse_view_projection: [[f32; 4]; 4],
+    /// Where to draw the light: of [`PROBES_FORMAT`], the size of `depth`.
+    pub target: &'a wgpu::Texture,
+}
+
+impl ScreenProbes {
+    /// The probes' pipelines; [`None`] if `device` cannot trace rays.
+    pub fn new(device: &wgpu::Device) -> Option<Self> {
+        if !can_trace(device) {
+            return None;
+        }
+        let lookup_layout = lookup_layout(device, wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT);
+        let both = wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT;
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: both,
+            ty,
+            count: None,
+        };
+        let uniform = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let depth = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let normal = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let storage = |read_only| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let trace_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteProbes"),
+            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true)), entry(4, storage(false))],
+        });
+        let gather_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteProbeGather"),
+            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true))],
+        });
+        let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteProbes"),
+            source: wgpu::ShaderSource::Wgsl(format!("enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{PROBES_COMMON}\n{PROBES_TRACE}").into()),
+        });
+        let gather_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteProbeGather"),
+            source: wgpu::ShaderSource::Wgsl(format!("{PROBES_COMMON}\n{PROBES_GATHER}").into()),
+        });
+        let trace = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("CandeliteProbes"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("CandeliteProbes"),
+                bind_group_layouts: &[Some(&lookup_layout), Some(&trace_layout)],
+                immediate_size: 0,
+            })),
+            module: &trace_module,
+            entry_point: Some("trace"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // The gather binds nothing of the lookup: group 0 is left empty.
+        let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+        let gather = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CandeliteProbeGather"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("CandeliteProbeGather"),
+                bind_group_layouts: &[Some(&empty), Some(&gather_layout)],
+                immediate_size: 0,
+            })),
+            vertex: wgpu::VertexState {
+                module: &gather_module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &gather_module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(PROBES_FORMAT.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Some(Self {
+            lookup_layout,
+            trace_layout,
+            gather_layout,
+            trace,
+            gather,
+            empty_layout: empty,
+            buffers: None,
+            previous_view_projection: None,
+            frame: 0,
+        })
+    }
+
+    /// Places and traces the probes for `frame` against what `light` has lit, and draws the
+    /// light they gathered into `frame.target`, recorded into `encoder`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &mut TraceScene,
+        pool: &GeometryPool,
+        cache: &mut SurfaceCache,
+        light: &mut SurfaceLight,
+        sunlight: &Sunlight,
+        frame: &ProbeFrame,
+    ) {
+        let size = [frame.depth.width(), frame.depth.height()];
+        let grid = [size[0].div_ceil(PROBE_SPACING), size[1].div_ceil(PROBE_SPACING)];
+        if self.buffers.as_ref().is_none_or(|(_, g)| *g != grid) {
+            let make = || {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("CandeliteProbes"),
+                    size: grid[0] as u64 * grid[1] as u64 * 80,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            };
+            // Zeroed: no probe is on anything, so nothing is taken from them.
+            self.buffers = Some(([make(), make()], grid));
+            self.previous_view_projection = None;
+        }
+        self.frame = self.frame.wrapping_add(1);
+        let Some(lookup) = lookup_group(device, &self.lookup_layout, scene, pool, cache, light) else {
+            return;
+        };
+        let ([history, current], _) = self.buffers.as_ref().expect("made above");
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Uniforms {
+            inverse_view_projection: [[f32; 4]; 4],
+            previous_view_projection: [[f32; 4]; 4],
+            toward_sun: [f32; 4],
+            sun: [f32; 4],
+            sky: [f32; 4],
+            size: [u32; 2],
+            grid: [u32; 2],
+            frame: u32,
+            _padding: [u32; 3],
+        }
+        let four = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteProbes"),
+            contents: bytemuck::bytes_of(&Uniforms {
+                inverse_view_projection: frame.inverse_view_projection,
+                // With no last frame, a matrix that puts everything behind the eye: no history.
+                previous_view_projection: self.previous_view_projection.unwrap_or([[0.0; 4]; 4]),
+                toward_sun: four(sunlight.toward_sun),
+                sun: four(sunlight.sun),
+                sky: four(sunlight.sky),
+                size,
+                grid,
+                frame: self.frame,
+                _padding: [0; 3],
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let depth = frame.depth.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let normal = frame.normal.create_view(&Default::default());
+        let common = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+        let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteProbes"),
+            layout: &self.trace_layout,
+            entries: &[
+                common(0, uniforms.as_entire_binding()),
+                common(1, wgpu::BindingResource::TextureView(&depth)),
+                common(2, wgpu::BindingResource::TextureView(&normal)),
+                common(3, history.as_entire_binding()),
+                common(4, current.as_entire_binding()),
+            ],
+        });
+        let gather_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteProbeGather"),
+            layout: &self.gather_layout,
+            entries: &[
+                common(0, uniforms.as_entire_binding()),
+                common(1, wgpu::BindingResource::TextureView(&depth)),
+                common(2, wgpu::BindingResource::TextureView(&normal)),
+                common(3, current.as_entire_binding()),
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("CandeliteProbes"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.trace);
+            pass.set_bind_group(0, &lookup, &[]);
+            pass.set_bind_group(1, &trace_group, &[]);
+            pass.dispatch_workgroups(grid[0], grid[1], 1);
+        }
+        let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.empty_layout,
+            entries: &[],
+        });
+        let view = frame.target.create_view(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("CandeliteProbeGather"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.gather);
+            pass.set_bind_group(0, &empty, &[]);
+            pass.set_bind_group(1, &gather_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // This frame's probes are next frame's history.
+        if let Some((buffers, _)) = self.buffers.as_mut() {
+            buffers.swap(0, 1);
+        }
+        self.previous_view_projection = Some(frame.view_projection);
+    }
 }
 
 /// What [`SurfaceView`] shows of what the rays hit.
@@ -2034,8 +2532,10 @@ mod test {
         for y in 0..h as usize {
             for x in 0..w as usize {
                 let at = y * row as usize + x * bytes as usize;
+                // The first word of a texel wider than one.
+                let n = bytes.min(4) as usize;
                 let mut word = [0u8; 4];
-                word[..bytes as usize].copy_from_slice(&data[at..at + bytes as usize]);
+                word[..n].copy_from_slice(&data[at..at + n]);
                 out.push(u32::from_le_bytes(word));
             }
         }
@@ -2377,8 +2877,9 @@ mod test {
         let row = h / 2;
         let lit = at(w * 7 / 8, row);
         let shaded = at(w / 8, row);
-        // In the sun: its colour, the sun a white surface gives off as 1.
-        assert!((lit[0] - 1.0).abs() < 0.05 && (lit[1] - 0.5).abs() < 0.05 && (lit[2] - 0.25).abs() < 0.05, "lit {lit:?}");
+        // In the sun: its colour, linear (sRGB 0.5 is 0.214, 0.25 is 0.051), the sun a white
+        // surface gives off as 1.
+        assert!((lit[0] - 1.0).abs() < 0.05 && (lit[1] - 0.214).abs() < 0.03 && (lit[2] - 0.051).abs() < 0.02, "lit {lit:?}");
         // In the slab's shade, with no sky: only light bounced off the lit floor and the slab's
         // underside, far less.
         assert!(shaded[0] < 0.2 * lit[0], "shaded {shaded:?}, lit {lit:?}");
@@ -2408,5 +2909,130 @@ mod test {
         let middle = seen[(SIZE / 2 * SIZE + SIZE / 2) as usize].to_le_bytes();
         let expected = lit.map(|c| (c / (1.0 + c) * 255.0).round() as u8);
         assert!((0..3).all(|i| middle[i].abs_diff(expected[i]) <= 3), "seen {middle:?}, lit {expected:?}");
+    }
+
+    #[test]
+    fn screen_probes_light_the_open_floor_with_the_sky_and_the_shaded_floor_less() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray tracing: skipped");
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .expect("device");
+
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        let mut captures = Vec::new();
+        let shifted = |t: [f32; 3]| [1.0, 0.0, 0.0, t[0], 0.0, 1.0, 0.0, t[1], 0.0, 0.0, 1.0, t[2]];
+        // The floor, 4 m square; over its left half, 1 m up, a slab.
+        for (min, max, top_only, slot) in [
+            ([-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], true, 0),
+            ([-2.5, 1.0, -2.5], [0.0, 1.2, 2.5], false, 1),
+        ] {
+            let (vertices, indices) = boxed(min, max, top_only);
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let first = pool.mesh(mesh).unwrap().first_cluster;
+            let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+            captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
+            scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+            pool.add_instance(&device, &queue, mesh, shifted([0.0; 3]), slot);
+        }
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let material = |slot, colour: [f32; 4]| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: colour,
+                ..Default::default()
+            },
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, [0.5, 0.5, 0.5, 1.0]), material(1, [0.2, 0.2, 0.2, 1.0])];
+        let mut drawer = GBufferDrawer::new(&device);
+        let mut light = SurfaceLight::new(&device).expect("can trace");
+        let mut probes = ScreenProbes::new(&device).expect("can trace");
+        // Only the sky, of radiance 1: a floor open to all of it gathers 1.
+        let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [0.0; 3], sky: [1.0; 3] };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+        assert!(scene.update(&device, &mut encoder, &pool));
+        queue.submit([encoder.finish()]);
+
+        // The screen: the floor seen from straight above, 4 m across, at depth 0.5 - as if a
+        // G-Buffer had drawn it. Clip x is world x / 2, clip y is -z / 2, clip z is -y.
+        const SIZE: u32 = 64;
+        let texture = |format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let depth = texture(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let normal = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let target = texture(PROBES_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let fill = |texture: &wgpu::Texture, texel: &[u8]| {
+            let data: Vec<u8> = texel.iter().copied().cycle().take(texel.len() * (SIZE * SIZE) as usize).collect();
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SIZE * texel.len() as u32), rows_per_image: None },
+                wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            );
+        };
+        {
+            let view = depth.create_view(&Default::default());
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.5), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            queue.submit([encoder.finish()]);
+        }
+        fill(&normal, &[128, 255, 128, 255]);
+        let inverse = [[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, -2.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let forward = [[0.5, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, -0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let frame = ProbeFrame { depth: &depth, normal: &normal, view_projection: forward, inverse_view_projection: inverse, target: &target };
+        for _ in 0..8 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            probes.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &sunlight, &frame);
+            queue.submit([encoder.finish()]);
+        }
+        // Red of each pixel, a half float in the low half of its first word.
+        let seen = texels(&device, &queue, &target, wgpu::TextureAspect::All, 8);
+        let red = |x: u32, y: u32| half::f16::from_bits((seen[(y * SIZE + x) as usize] & 0xFFFF) as u16).to_f32();
+        // x = 1.75 m, out in the open but for the slab's edge 1.75 m off: most of the sky.
+        let open = red(60, SIZE / 2);
+        // x = -1.5 m, under the slab: only the sky round its edges.
+        let shaded = red(8, SIZE / 2);
+        assert!(open > 0.7 && open < 1.05, "open {open}");
+        assert!(shaded < 0.5 * open, "shaded {shaded}, open {open}");
     }
 }

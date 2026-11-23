@@ -420,6 +420,9 @@ pub struct Renderer {
     /// Meshes another renderer draws, left out of the camera's own draw: see
     /// [`Self::set_taken_over_meshes`].
     taken_over_meshes: Option<TakenOverMeshes>,
+    /// Light between surfaces to light with in place of the ambient colour: see
+    /// [`Self::set_indirect_diffuse`].
+    indirect_diffuse: Option<IndirectDiffuse>,
     /// Makes shadows for lights in place of shadow maps, when set.
     light_shadow_tracer: Option<Box<dyn LightShadowTracer>>,
     /// How far every camera's view is shifted this frame, in pixels. See
@@ -599,6 +602,10 @@ pub struct SceneRenderPassContext<'a, 'b> {
 /// each scene has a set of its own.
 pub type TakenOverMeshes = Rc<RefCell<fxhash::FxHashMap<Handle<Scene>, fxhash::FxHashSet<Handle<Node>>>>>;
 
+/// Each scene's light between surfaces, shared with whatever works it out: see
+/// [`Renderer::set_indirect_diffuse`].
+pub type IndirectDiffuse = Rc<RefCell<fxhash::FxHashMap<Handle<Scene>, GpuTexture>>>;
+
 /// A context for custom scene render passes that draw into the G-Buffer, as the renderer's own
 /// meshes do (see [`SceneRenderPass::on_gbuffer_render`]).
 pub struct GBufferPassContext<'a, 'b> {
@@ -774,6 +781,7 @@ impl Renderer {
             shader_cache,
             scene_render_passes: Default::default(),
             taken_over_meshes: None,
+            indirect_diffuse: None,
             light_shadow_tracer: None,
             projection_jitter: Vector2::zeros(),
             uniform_buffer_cache: UniformBufferCache::new(server.clone()),
@@ -809,6 +817,15 @@ impl Renderer {
     /// the set can change from frame to frame. [`None`] draws every mesh again.
     pub fn set_taken_over_meshes(&mut self, meshes: Option<TakenOverMeshes>) {
         self.taken_over_meshes = meshes;
+    }
+
+    /// Lights each scene in `light` with its texture there - the size of the frame, each pixel
+    /// what to light its diffuse colour with - in place of the ambient colour (or the skybox's
+    /// irradiance): global illumination worked out by a [`SceneRenderPass`], say, from
+    /// [`SceneRenderPass::on_gbuffer_render`], which runs before the lighting. A scene with none
+    /// is lit as before. [`None`] lights every scene as before.
+    pub fn set_indirect_diffuse(&mut self, light: Option<IndirectDiffuse>) {
+        self.indirect_diffuse = light;
     }
 
     /// How long the GPU spent on each section of the frame, in milliseconds, averaged over the
@@ -1242,6 +1259,10 @@ impl Renderer {
                         .environment_map_irradiance_convolution,
                     need_recalculate_convolution: &mut render_data.need_recalculate_convolution,
                     light_shadow_tracer: self.light_shadow_tracer.as_deref_mut(),
+                    indirect_diffuse: self
+                        .indirect_diffuse
+                        .as_ref()
+                        .and_then(|light| light.borrow().get(&scene_handle).cloned()),
                 })?;
 
         render_data.statistics += light_stats;

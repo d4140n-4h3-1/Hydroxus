@@ -47,6 +47,11 @@
             binding: 8
         ),
         (
+            name: "indirectDiffuseTexture",
+            kind: Texture(kind: Sampler2D, fallback: Black),
+            binding: 9
+        ),
+        (
             name: "properties",
             kind: PropertyGroup([
                 (name: "worldViewProjection", kind: Matrix4()),
@@ -55,6 +60,7 @@
                 (name: "invViewProj", kind: Matrix4()),
                 (name: "skyboxLighting", kind: Bool()),
                 (name: "environmentLightingBrightness", kind: Float()),
+                (name: "indirectDiffuse", kind: Bool()),
             ]),
             binding: 0
         ),
@@ -158,7 +164,11 @@
                         let irradiance = S_SRGBToLinear(textureSample(irradianceMap_tex, irradianceMap_samp, S_RenderedCubeDirection(fragment_normal))).rgb;
 
                         var ambient_lighting: vec3f;
-                        if (properties.skyboxLighting != 0u) {
+                        if (properties.indirectDiffuse != 0u) {
+                            // Light between surfaces, worked out for this pixel (global
+                            // illumination): in place of the ambient colour.
+                            ambient_lighting = textureSample(indirectDiffuseTexture_tex, indirectDiffuseTexture_samp, tex_coord).rgb;
+                        } else if (properties.skyboxLighting != 0u) {
                             ambient_lighting = irradiance;
                         } else {
                             ambient_lighting = properties.ambientColor.rgb;
