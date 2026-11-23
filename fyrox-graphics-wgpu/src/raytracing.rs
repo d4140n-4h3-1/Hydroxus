@@ -40,6 +40,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 /// Which texels of a texture are solid, a bit each, row by row: for a cutout, where a ray is
@@ -359,6 +360,242 @@ impl RayTracedScene {
     /// [`cutout_wgsl`]).
     pub(crate) fn cutout_entries(&self, first: u32) -> [wgpu::BindGroupEntry<'_>; 3] {
         self.cutouts.entries(first)
+    }
+}
+
+/// A mesh's blend shapes, on the GPU, for [`RayTracedPoser`] to bend copies of its geometry by:
+/// where its vertices are unbent, and how far each shape moves each of them.
+pub struct RayTracedMorph {
+    buffer: wgpu::Buffer,
+    vertex_count: u32,
+    targets: u32,
+    id: u64,
+}
+
+/// The most blend shapes a [`RayTracedMorph`] can have.
+pub const MAX_POSE_TARGETS: u32 = 60;
+
+impl RayTracedMorph {
+    /// How many vertices it bends: only geometry with as many is bent by it.
+    pub fn vertex_count(&self) -> u32 {
+        self.vertex_count
+    }
+
+    /// A mesh's blend shapes: `positions` unbent, three floats a vertex, in its own space; and
+    /// `offsets`, three floats each, `targets` to a vertex, vertex after vertex. [`None`] if they
+    /// do not agree, or there are more targets than [`MAX_POSE_TARGETS`].
+    pub fn new(device: &wgpu::Device, positions: &[f32], offsets: &[f32], targets: u32) -> Option<Self> {
+        let vertex_count = (positions.len() / 3) as u32;
+        if vertex_count == 0
+            || targets == 0
+            || targets > MAX_POSE_TARGETS
+            || offsets.len() != vertex_count as usize * targets as usize * 3
+        {
+            return None;
+        }
+        let mut contents = Vec::with_capacity(positions.len() + offsets.len());
+        contents.extend_from_slice(&positions[..vertex_count as usize * 3]);
+        contents.extend_from_slice(offsets);
+        Some(Self {
+            buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("RayTracedMorph"),
+                contents: bytemuck::cast_slice(&contents),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+            vertex_count,
+            targets,
+            id: NEXT_GEOMETRY.fetch_add(1, Ordering::Relaxed),
+        })
+    }
+}
+
+const POSE_SHADER: &str = r"
+// Bends a copy of a mesh's geometry by its blend shapes: each vertex where it is unbent, moved by
+// every shape with a weight. A job is 256 bytes: how many vertices and shapes, and the weights.
+struct Job {
+    vertexCount: u32,
+    targets: u32,
+    pad0: u32,
+    pad1: u32,
+    weights: array<vec4f, 15>,
+};
+
+@group(0) @binding(0) var<storage, read> job: Job;
+@group(0) @binding(1) var<storage, read> morph: array<f32>;
+@group(0) @binding(2) var<storage, read_write> positions: array<f32>;
+
+@compute @workgroup_size(64)
+fn pose(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) groups: vec3u) {
+    let v = id.y * groups.x * 64u + id.x;
+    if (v >= job.vertexCount) {
+        return;
+    }
+    var p = vec3f(morph[v * 3u], morph[v * 3u + 1u], morph[v * 3u + 2u]);
+    let offsets = job.vertexCount * 3u + v * job.targets * 3u;
+    for (var t = 0u; t < job.targets; t++) {
+        let weight = job.weights[t / 4u][t % 4u];
+        if (weight == 0.0) {
+            continue;
+        }
+        let at = offsets + t * 3u;
+        p += vec3f(morph[at], morph[at + 1u], morph[at + 2u]) * weight;
+    }
+    positions[v * 3u] = p.x;
+    positions[v * 3u + 1u] = p.y;
+    positions[v * 3u + 2u] = p.z;
+}
+";
+
+/// How many bytes a job of [`RayTracedPoser`] takes: one dynamic offset apart.
+const POSE_JOB_BYTES: u64 = 256;
+
+/// Bends copies of meshes' geometry by their blend shapes on the GPU, and refits them, all
+/// together: as the renderer bends the meshes, so that their shadows move with them. The CPU
+/// only hands over the weights. Kept between frames, so its pipeline is made once and each
+/// geometry's bindings once.
+pub struct RayTracedPoser {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    jobs: wgpu::Buffer,
+    job_capacity: u32,
+    /// Each geometry's bindings, by its and its morph's numbers, while the job buffer stays.
+    groups: HashMap<(u64, u64), wgpu::BindGroup>,
+}
+
+impl RayTracedPoser {
+    /// The poser's pipeline.
+    pub fn new(device: &wgpu::Device) -> Self {
+        let storage = |binding, read_only, dynamic| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: dynamic,
+                min_binding_size: wgpu::BufferSize::new(if dynamic { POSE_JOB_BYTES } else { 0 }),
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RayTracedPose"),
+            entries: &[storage(0, true, true), storage(1, true, false), storage(2, false, false)],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RayTracedPose"),
+            source: wgpu::ShaderSource::Wgsl(POSE_SHADER.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RayTracedPose"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("RayTracedPose"),
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            })),
+            module: &module,
+            entry_point: Some("pose"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self {
+            layout,
+            pipeline,
+            jobs: Self::job_buffer(device, 64),
+            job_capacity: 64,
+            groups: HashMap::new(),
+        }
+    }
+
+    fn job_buffer(device: &wgpu::Device, capacity: u32) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RayTracedPoseJobs"),
+            size: capacity as u64 * POSE_JOB_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Bends each geometry - updatable, with as many vertices as its morph - by its morph and
+    /// weights (1 a shape at full strength; past the morph's shapes left out), and refits it.
+    pub fn pose(
+        &mut self,
+        server: &WgpuGraphicsServer,
+        poses: &[(&RayTracedGeometry, &RayTracedMorph, &[f32])],
+    ) -> Result<(), FrameworkError> {
+        let poses: Vec<_> = poses
+            .iter()
+            .filter(|(geometry, morph, _)| geometry.updatable && geometry.vertex_count == morph.vertex_count)
+            .collect();
+        if poses.is_empty() {
+            return Ok(());
+        }
+        let device = &server.state.device;
+        let queue = &server.state.queue;
+        if poses.len() as u32 > self.job_capacity {
+            self.job_capacity = (poses.len() as u32).next_power_of_two();
+            self.jobs = Self::job_buffer(device, self.job_capacity);
+            self.groups.clear();
+        }
+        let mut jobs = vec![0u8; poses.len() * POSE_JOB_BYTES as usize];
+        for (job, (_, morph, weights)) in jobs.chunks_exact_mut(POSE_JOB_BYTES as usize).zip(&poses) {
+            let mut words = [0u32; POSE_JOB_BYTES as usize / 4];
+            words[0] = morph.vertex_count;
+            words[1] = morph.targets;
+            for (i, w) in weights.iter().take(morph.targets as usize).enumerate() {
+                words[4 + i] = w.to_bits();
+            }
+            job.copy_from_slice(bytemuck::cast_slice(&words));
+        }
+        queue.write_buffer(&self.jobs, 0, &jobs);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("RayTracedPose"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("RayTracedPose"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            for (i, (geometry, morph, _)) in poses.iter().enumerate() {
+                let group = self.groups.entry((geometry.id, morph.id)).or_insert_with(|| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("RayTracedPose"),
+                        layout: &self.layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &self.jobs,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(POSE_JOB_BYTES),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: morph.buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: geometry.vertices.as_entire_binding(),
+                            },
+                        ],
+                    })
+                });
+                pass.set_bind_group(0, &*group, &[(i as u64 * POSE_JOB_BYTES) as u32]);
+                let groups = morph.vertex_count.div_ceil(64);
+                pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+            }
+        }
+        let entries: Vec<wgpu::BlasBuildEntry> = poses.iter().map(|(geometry, _, _)| geometry.build_entry()).collect();
+        encoder.build_acceleration_structures(entries.iter(), std::iter::empty());
+        queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
+    /// Lets go of the bindings of geometry and morphs no longer posed, so they can be freed:
+    /// those not in `kept` (by geometry).
+    pub fn forget_others(&mut self, kept: &[&RayTracedGeometry]) {
+        let ids: std::collections::HashSet<u64> = kept.iter().map(|g| g.id).collect();
+        self.groups.retain(|(geometry, _), _| ids.contains(geometry));
     }
 }
 
@@ -709,7 +946,10 @@ impl WgpuGraphicsServer {
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RayTracedVertices"),
             contents: bytemuck::cast_slice(vertices),
-            usage: wgpu::BufferUsages::BLAS_INPUT | wgpu::BufferUsages::COPY_DST,
+            // Updatable geometry can be posed on the GPU, too (see [`RayTracedPoser`]).
+            usage: wgpu::BufferUsages::BLAS_INPUT
+                | wgpu::BufferUsages::COPY_DST
+                | if updatable { wgpu::BufferUsages::STORAGE } else { wgpu::BufferUsages::empty() },
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("RayTracedIndices"),
@@ -1441,6 +1681,11 @@ mod test {
     #[test]
     fn the_shadow_history_shader_is_valid() {
         validate(HISTORY_SHADER);
+    }
+
+    #[test]
+    fn the_pose_shader_is_valid() {
+        validate(POSE_SHADER);
     }
 
     #[test]
