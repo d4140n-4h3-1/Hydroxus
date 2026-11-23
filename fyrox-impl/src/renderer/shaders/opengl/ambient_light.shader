@@ -52,6 +52,11 @@
             binding: 9
         ),
         (
+            name: "indirectSpecularTexture",
+            kind: Texture(kind: Sampler2D, fallback: Black),
+            binding: 10
+        ),
+        (
             name: "properties",
             kind: PropertyGroup([
                 (name: "worldViewProjection", kind: Matrix4()),
@@ -61,6 +66,7 @@
                 (name: "skyboxLighting", kind: Bool()),
                 (name: "environmentLightingBrightness", kind: Float()),
                 (name: "indirectDiffuse", kind: Bool()),
+                (name: "indirectSpecular", kind: Bool()),
             ]),
             binding: 0
         ),
@@ -141,7 +147,7 @@
 
                         ivec2 cubeMapSize = textureSize(prefilteredSpecularMap, 0);
                         float mip = roughness * (floor(log2(float(cubeMapSize.x))) + 1.0);
-                        vec3 reflection = properties.skyboxLighting ? S_SRGBToLinear(textureLod(prefilteredSpecularMap, reflectionVector, mip)).rgb : properties.ambientColor.rgb;
+                        vec3 reflection = properties.indirectSpecular ? texture(indirectSpecularTexture, texCoord).rgb : (properties.skyboxLighting ? S_SRGBToLinear(textureLod(prefilteredSpecularMap, reflectionVector, mip)).rgb : properties.ambientColor.rgb);
 
                         vec3 F0 = mix(vec3(0.04), albedo.rgb, metallic);
                         vec3 F = S_FresnelSchlickRoughness(clampedCosViewAngle, F0, roughness);

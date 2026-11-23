@@ -2526,6 +2526,512 @@ impl ScreenProbes {
     }
 }
 
+/// How rough a surface may be and still have its reflections traced (as Lumen's default): rougher,
+/// it reflects much what it is lit with from all round, and takes the screen probes' light. From
+/// [`REFLECTION_BLEND`] of this up, the two are blended.
+pub const REFLECTION_ROUGHEST: f32 = 0.4;
+/// From how much of [`REFLECTION_ROUGHEST`] traced reflections give way to the screen probes'.
+pub const REFLECTION_BLEND: f32 = 0.75;
+/// The format [`Reflections`] draws in: per pixel, the light arriving along its reflection.
+pub const REFLECTIONS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The reflections' parameters and the screen's depth, normals and roughness, shared by both
+/// their shaders.
+const REFLECT_COMMON: &str = r#"
+struct Reflect {
+    inverseViewProjection: mat4x4f,
+    previousViewProjection: mat4x4f,
+    towardSun: vec4f,
+    sun: vec4f,
+    sky: vec4f,
+    size: vec2u,
+    traced: vec2u,
+    frame: u32,
+    roughest: f32,
+    blend: f32,
+    pad0: u32,
+};
+// A traced pixel: the light its ray brought back (w how many frames it has been averaged over),
+// where it is (w 1 if it was traced), and which way it faces.
+struct Traced {
+    light: vec4f,
+    position: vec4f,
+    normal: vec4f,
+};
+@group(1) @binding(0) var<uniform> reflections: Reflect;
+@group(1) @binding(1) var sceneDepth: texture_depth_2d;
+@group(1) @binding(2) var sceneNormal: texture_2d<f32>;
+@group(1) @binding(3) var sceneMaterial: texture_2d<f32>;
+
+fn reflect_unproject(pixel: vec2f, depth: f32) -> vec3f {
+    let uv = pixel / vec2f(reflections.size);
+    let clip = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth * 2.0 - 1.0, 1.0);
+    let p = reflections.inverseViewProjection * clip;
+    return p.xyz / p.w;
+}
+
+fn reflect_normal(pixel: vec2u) -> vec3f {
+    return normalize(textureLoad(sceneNormal, pixel, 0).xyz * 2.0 - 1.0);
+}
+
+fn reflect_roughness(pixel: vec2u) -> f32 {
+    return textureLoad(sceneMaterial, pixel, 0).y;
+}
+"#;
+
+const REFLECT_TRACE: &str = r#"
+@group(1) @binding(4) var<storage, read> history: array<Traced>;
+@group(1) @binding(5) var<storage, read_write> current: array<Traced>;
+
+fn reflect_pcg(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// A half vector of the GGX distribution as `v` (toward the eye, z along the normal) sees it, for
+// roughness `alpha` (Dupuy and Benyoub's spherical caps): the reflections it gives are those the
+// BRDF weighs most.
+fn reflect_visible_normal(v: vec3f, alpha: f32, u: vec2f) -> vec3f {
+    let stretched = normalize(vec3f(v.xy * alpha, v.z));
+    let phi = 6.2831853 * u.x;
+    let z = (1.0 - u.y) * (1.0 + stretched.z) - stretched.z;
+    let r = sqrt(clamp(1.0 - z * z, 0.0, 1.0));
+    let h = vec3f(r * cos(phi), r * sin(phi), z) + stretched;
+    return normalize(vec3f(h.xy * alpha, max(h.z, 1.0e-4)));
+}
+
+// A pixel of each 2 by 2 block, a different one each frame, that is smooth enough: a ray along a
+// reflection its roughness gives, traced against the lit cards (beyond SCREEN_REACH, the world
+// radiance cache, else traced on), averaged with what the block brought back last frame if that
+// was on the same surface.
+@compute @workgroup_size(8, 8)
+fn trace(@builtin(global_invocation_id) id: vec3u) {
+    if (any(id.xy >= reflections.traced)) {
+        return;
+    }
+    let index = id.y * reflections.traced.x + id.x;
+    let seed = reflect_pcg(index * 9781u + reflections.frame * 6271u);
+    let corner = reflect_pcg(reflections.frame) % 4u;
+    let pixel = min(id.xy * 2u + vec2u(corner & 1u, corner >> 1u), reflections.size - 1u);
+    let depth = textureLoad(sceneDepth, pixel, 0);
+    let roughness = reflect_roughness(pixel);
+    if (depth >= 1.0 || roughness >= reflections.roughest) {
+        current[index] = Traced(vec4f(0.0), vec4f(0.0), vec4f(0.0));
+        return;
+    }
+    let position = reflect_unproject(vec2f(pixel) + 0.5, depth);
+    let normal = reflect_normal(pixel);
+    let toward_eye = normalize(reflect_unproject(vec2f(pixel) + 0.5, 0.0) - position);
+
+    let side = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
+    let tangent = normalize(cross(side, normal));
+    let bitangent = cross(normal, tangent);
+    let v = vec3f(dot(toward_eye, tangent), dot(toward_eye, bitangent), max(dot(toward_eye, normal), 1.0e-3));
+    let u = vec2f(f32(seed & 0xFFFFu), f32(seed >> 16u)) / 65536.0;
+    let alpha = max(roughness * roughness, 1.0e-3);
+    let h = reflect_visible_normal(v, alpha, u);
+    let half_vector = normalize(tangent * h.x + bitangent * h.y + normal * h.z);
+    var direction = reflect(-toward_eye, half_vector);
+    if (dot(direction, normal) <= 0.0) {
+        direction = reflect(-toward_eye, normal);
+    }
+    let start = position + normal * 0.05;
+    let hit = candelite_trace(start, direction, SCREEN_REACH);
+    var light: vec3f;
+    if (hit.hit) {
+        light = candelite_hit_light(hit, reflections.towardSun.xyz, reflections.sun.xyz, reflections.sky.xyz);
+    } else {
+        let end = start + direction * SCREEN_REACH;
+        let cached = cache_radiance(end, direction);
+        if (cached.w > 0.0) {
+            light = cached.rgb;
+        } else {
+            let far = candelite_trace(end, direction, 1.0e3);
+            light = candelite_hit_light(far, reflections.towardSun.xyz, reflections.sun.xyz, reflections.sky.xyz);
+        }
+    }
+    var traced = Traced(vec4f(light, 1.0), vec4f(position, 1.0), vec4f(normal, roughness));
+    // Last frame's block where this pixel was then, if it was on the same surface: averaged over
+    // more frames the rougher the surface (a mirror's reflection moves with the eye).
+    let before = reflections.previousViewProjection * vec4f(position, 1.0);
+    if (before.w > 0.0) {
+        let ndc = before.xy / before.w;
+        let then = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(reflections.size);
+        if (all(then >= vec2f(0.0)) && all(then < vec2f(reflections.size))) {
+            let cell = min(vec2u(then) / 2u, reflections.traced - 1u);
+            let old = history[cell.y * reflections.traced.x + cell.x];
+            let distance = length(position - reflect_unproject(vec2f(reflections.size) * 0.5, 0.0));
+            let apart = abs(dot(old.position.xyz - position, normal));
+            if (old.position.w > 0.5 && dot(old.normal.xyz, normal) > 0.9 && apart < 0.05 + 0.02 * distance) {
+                let most = mix(3.0, 12.0, clamp(roughness / reflections.roughest, 0.0, 1.0));
+                let count = min(old.light.w + 1.0, most);
+                traced.light = vec4f(mix(old.light.rgb, light, 1.0 / count), count);
+            }
+        }
+    }
+    current[index] = traced;
+}
+"#;
+
+const REFLECT_RESOLVE: &str = r#"
+@group(1) @binding(4) var<storage, read> current: array<Traced>;
+@group(1) @binding(5) var screenProbes: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+    let x = f32(i32(index) / 2) * 4.0 - 1.0;
+    let y = f32(i32(index) & 1) * 4.0 - 1.0;
+    return vec4f(x, y, 0.0, 1.0);
+}
+
+// Each pixel's reflection: from the traced pixels of the blocks round it, each by how near it is,
+// and only as far as it lies on the pixel's surface and faces its way; given way, as the pixel is
+// rougher, to the light the screen probes gathered there - all a very rough surface reflects.
+@fragment
+fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
+    let pixel = vec2u(at.xy);
+    let depth = textureLoad(sceneDepth, pixel, 0);
+    if (depth >= 1.0) {
+        return vec4f(reflections.sky.rgb, 1.0);
+    }
+    let diffuse = textureLoad(screenProbes, pixel, 0).rgb;
+    let roughness = reflect_roughness(pixel);
+    if (roughness >= reflections.roughest) {
+        return vec4f(diffuse, 1.0);
+    }
+    let p = reflect_unproject(at.xy, depth);
+    let n = reflect_normal(pixel);
+    let eye = reflect_unproject(vec2f(reflections.size) * 0.5, 0.0);
+    let slack = 0.05 + 0.02 * length(p - eye);
+    let block = vec2i(pixel / 2u);
+    var sum = vec3f(0.0);
+    var weight = 0.0;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let c = block + vec2i(dx, dy);
+            if (any(c < vec2i(0)) || any(c >= vec2i(reflections.traced))) {
+                continue;
+            }
+            let t = current[u32(c.y) * reflections.traced.x + u32(c.x)];
+            if (t.position.w < 0.5) {
+                continue;
+            }
+            let near = exp(-0.5 * f32(dx * dx + dy * dy));
+            let plane = exp(-abs(dot(t.position.xyz - p, n)) / slack);
+            let facing = pow(max(dot(t.normal.xyz, n), 0.0), 16.0);
+            let alike = exp(-abs(t.normal.w - roughness) * 8.0);
+            let w = near * plane * facing * alike;
+            sum += t.light.rgb * w;
+            weight += w;
+        }
+    }
+    let rough_share = smoothstep(reflections.roughest * reflections.blend, reflections.roughest, roughness);
+    if (weight < 1.0e-4) {
+        return vec4f(diffuse, 1.0);
+    }
+    return vec4f(mix(sum / weight, diffuse, rough_share), 1.0);
+}
+"#;
+
+/// Candelite's reflections, after Lumen's: of each 2 by 2 block of pixels, one a frame (a
+/// different one each frame) smoother than [`REFLECTION_ROUGHEST`] traces a ray along a reflection
+/// its roughness gives (the GGX distribution's visible normals) against the lit cards - beyond
+/// [`SCREEN_REACH`], the world radiance cache's light - averaged over frames where it reprojects
+/// onto the same surface. Each pixel then takes the traced pixels round it on its surface; rougher
+/// pixels take the screen probes' light, all a very rough surface reflects. What the renderer
+/// lights its specular term with, in place of the ambient colour.
+pub struct Reflections {
+    lookup_layout: wgpu::BindGroupLayout,
+    trace_layout: wgpu::BindGroupLayout,
+    resolve_layout: wgpu::BindGroupLayout,
+    trace: wgpu::ComputePipeline,
+    resolve: wgpu::RenderPipeline,
+    empty_layout: wgpu::BindGroupLayout,
+    cache_layout: wgpu::BindGroupLayout,
+    /// This frame's traced pixels and last frame's, swapped each frame, with how many there were
+    /// each way.
+    buffers: Option<([wgpu::Buffer; 2], [u32; 2])>,
+    previous_view_projection: Option<[[f32; 4]; 4]>,
+    frame: u32,
+}
+
+impl Reflections {
+    /// The reflections' pipelines; [`None`] if `device` cannot trace rays.
+    pub fn new(device: &wgpu::Device) -> Option<Self> {
+        if !can_trace(device) {
+            return None;
+        }
+        let both = wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT;
+        let lookup_layout = lookup_layout(device, both);
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: both,
+            ty,
+            count: None,
+        };
+        let uniform = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let depth = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Depth,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let float = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let storage = |read_only| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let trace_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteReflections"),
+            entries: &[
+                entry(0, uniform),
+                entry(1, depth),
+                entry(2, float),
+                entry(3, float),
+                entry(4, storage(true)),
+                entry(5, storage(false)),
+            ],
+        });
+        let resolve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("CandeliteReflectionResolve"),
+            entries: &[
+                entry(0, uniform),
+                entry(1, depth),
+                entry(2, float),
+                entry(3, float),
+                entry(4, storage(true)),
+                entry(5, float),
+            ],
+        });
+        let cache_layout = cache_sample_layout(device);
+        let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteReflections"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{REFLECT_COMMON}\n{CACHE_COMMON}\n{CACHE_SAMPLE}\nconst SCREEN_REACH: f32 = {SCREEN_REACH:?};\n{REFLECT_TRACE}"
+                )
+                .into(),
+            ),
+        });
+        let resolve_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CandeliteReflectionResolve"),
+            source: wgpu::ShaderSource::Wgsl(format!("{REFLECT_COMMON}\n{REFLECT_RESOLVE}").into()),
+        });
+        let trace = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("CandeliteReflections"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("CandeliteReflections"),
+                bind_group_layouts: &[Some(&lookup_layout), Some(&trace_layout), Some(&cache_layout)],
+                immediate_size: 0,
+            })),
+            module: &trace_module,
+            entry_point: Some("trace"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let empty = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+        let resolve = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CandeliteReflectionResolve"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("CandeliteReflectionResolve"),
+                bind_group_layouts: &[Some(&empty), Some(&resolve_layout)],
+                immediate_size: 0,
+            })),
+            vertex: wgpu::VertexState {
+                module: &resolve_module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &resolve_module,
+                entry_point: Some("fs_main"),
+                targets: &[Some(REFLECTIONS_FORMAT.into())],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Some(Self {
+            lookup_layout,
+            trace_layout,
+            resolve_layout,
+            trace,
+            resolve,
+            empty_layout: empty,
+            cache_layout,
+            buffers: None,
+            previous_view_projection: None,
+            frame: 0,
+        })
+    }
+
+    /// Traces the reflections for `frame` against what `light` has lit - beyond
+    /// [`SCREEN_REACH`], taking the light from `radiance` - and draws them into `target` (of
+    /// [`REFLECTIONS_FORMAT`], the size of `frame.depth`), recorded into `encoder`. `material` is
+    /// the G-Buffer's material texture (roughness in green); `frame.target` must hold this frame's
+    /// screen probes' light ([`ScreenProbes::record`]), which rough pixels reflect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &mut TraceScene,
+        pool: &GeometryPool,
+        cache: &mut SurfaceCache,
+        light: &mut SurfaceLight,
+        radiance: &RadianceCache,
+        sunlight: &Sunlight,
+        frame: &ProbeFrame,
+        material: &wgpu::Texture,
+        target: &wgpu::Texture,
+    ) {
+        let size = [frame.depth.width(), frame.depth.height()];
+        let traced = [size[0].div_ceil(2), size[1].div_ceil(2)];
+        if self.buffers.as_ref().is_none_or(|(_, t)| *t != traced) {
+            let make = || {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("CandeliteReflections"),
+                    size: traced[0] as u64 * traced[1] as u64 * 48,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            };
+            // Zeroed: nothing was traced, so nothing is taken from them.
+            self.buffers = Some(([make(), make()], traced));
+            self.previous_view_projection = None;
+        }
+        self.frame = self.frame.wrapping_add(1);
+        let Some(lookup) = lookup_group(device, &self.lookup_layout, scene, pool, cache, light) else {
+            return;
+        };
+        let Some(cached) = radiance.sample_group(device, &self.cache_layout) else {
+            return;
+        };
+        let ([history, current], _) = self.buffers.as_ref().expect("made above");
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct Uniforms {
+            inverse_view_projection: [[f32; 4]; 4],
+            previous_view_projection: [[f32; 4]; 4],
+            toward_sun: [f32; 4],
+            sun: [f32; 4],
+            sky: [f32; 4],
+            size: [u32; 2],
+            traced: [u32; 2],
+            frame: u32,
+            roughest: f32,
+            blend: f32,
+            _padding: u32,
+        }
+        let four = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("CandeliteReflections"),
+            contents: bytemuck::bytes_of(&Uniforms {
+                inverse_view_projection: frame.inverse_view_projection,
+                previous_view_projection: self.previous_view_projection.unwrap_or([[0.0; 4]; 4]),
+                toward_sun: four(sunlight.toward_sun),
+                sun: four(sunlight.sun),
+                sky: four(sunlight.sky),
+                size,
+                traced,
+                frame: self.frame,
+                roughest: REFLECTION_ROUGHEST,
+                blend: REFLECTION_BLEND,
+                _padding: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let depth = frame.depth.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let normal = frame.normal.create_view(&Default::default());
+        let material = material.create_view(&Default::default());
+        let probes = frame.target.create_view(&Default::default());
+        let common = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+        let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteReflections"),
+            layout: &self.trace_layout,
+            entries: &[
+                common(0, uniforms.as_entire_binding()),
+                common(1, wgpu::BindingResource::TextureView(&depth)),
+                common(2, wgpu::BindingResource::TextureView(&normal)),
+                common(3, wgpu::BindingResource::TextureView(&material)),
+                common(4, history.as_entire_binding()),
+                common(5, current.as_entire_binding()),
+            ],
+        });
+        let resolve_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("CandeliteReflectionResolve"),
+            layout: &self.resolve_layout,
+            entries: &[
+                common(0, uniforms.as_entire_binding()),
+                common(1, wgpu::BindingResource::TextureView(&depth)),
+                common(2, wgpu::BindingResource::TextureView(&normal)),
+                common(3, wgpu::BindingResource::TextureView(&material)),
+                common(4, current.as_entire_binding()),
+                common(5, wgpu::BindingResource::TextureView(&probes)),
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("CandeliteReflections"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.trace);
+            pass.set_bind_group(0, &lookup, &[]);
+            pass.set_bind_group(1, &trace_group, &[]);
+            pass.set_bind_group(2, &cached, &[]);
+            pass.dispatch_workgroups(traced[0].div_ceil(8), traced[1].div_ceil(8), 1);
+        }
+        let empty = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.empty_layout,
+            entries: &[],
+        });
+        let view = target.create_view(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("CandeliteReflectionResolve"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.resolve);
+            pass.set_bind_group(0, &empty, &[]);
+            pass.set_bind_group(1, &resolve_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if let Some((buffers, _)) = self.buffers.as_mut() {
+            buffers.swap(0, 1);
+        }
+        self.previous_view_projection = Some(frame.view_projection);
+    }
+}
+
 /// What [`SurfaceView`] shows of what the rays hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewShows {
@@ -3412,7 +3918,7 @@ mod test {
     }
 
     #[test]
-    fn screen_probes_light_the_open_floor_with_the_sky_and_the_shaded_floor_less() {
+    fn screen_probes_light_the_open_floor_with_the_sky_and_the_shaded_floor_less_and_reflections_see_them() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
             eprintln!("no GPU: skipped");
@@ -3490,7 +3996,7 @@ mod test {
         };
         let depth = texture(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
         let normal = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
-        let target = texture(PROBES_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let target = texture(PROBES_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING);
         let fill = |texture: &wgpu::Texture, texel: &[u8]| {
             let data: Vec<u8> = texel.iter().copied().cycle().take(texel.len() * (SIZE * SIZE) as usize).collect();
             queue.write_texture(
@@ -3544,6 +4050,32 @@ mod test {
         let shaded = red(8, SIZE / 2);
         assert!(open > 0.7 && open < 1.05, "open {open}");
         assert!(shaded < 0.5 * open, "shaded {shaded}, open {open}");
+
+        // Reflections, the floor a mirror: in the open it reflects the sky straight above, under
+        // the slab the slab's dark underside.
+        let material = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let reflected = texture(REFLECTIONS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let mut reflections = Reflections::new(&device).expect("can trace");
+        let mut reflect = |reflections: &mut Reflections, scene: &mut TraceScene, cache: &mut SurfaceCache, light: &mut SurfaceLight, frames| {
+            for _ in 0..frames {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                probes.record(&device, &mut encoder, scene, &pool, cache, light, &radiance, &sunlight, &frame);
+                reflections.record(&device, &mut encoder, scene, &pool, cache, light, &radiance, &sunlight, &frame, &material, &reflected);
+                queue.submit([encoder.finish()]);
+            }
+            let seen = texels(&device, &queue, &reflected, wgpu::TextureAspect::All, 8);
+            let gathered = texels(&device, &queue, &target, wgpu::TextureAspect::All, 8);
+            let red = |seen: &[u32], x: u32, y: u32| half::f16::from_bits((seen[(y * SIZE + x) as usize] & 0xFFFF) as u16).to_f32();
+            [red(&seen, 60, SIZE / 2), red(&seen, 8, SIZE / 2), red(&gathered, 60, SIZE / 2), red(&gathered, 8, SIZE / 2)]
+        };
+        fill(&material, &[0, 0, 255, 255]);
+        let [open_mirror, shaded_mirror, _, _] = reflect(&mut reflections, &mut scene, &mut cache, &mut light, 4);
+        assert!(open_mirror > 0.95 && open_mirror < 1.05, "mirror in the open {open_mirror}");
+        assert!(shaded_mirror < 0.1, "mirror under the slab {shaded_mirror}");
+        // The floor rough: it reflects what the screen probes gathered.
+        fill(&material, &[0, 255, 255, 255]);
+        let [open_rough, shaded_rough, open_gathered, shaded_gathered] = reflect(&mut reflections, &mut scene, &mut cache, &mut light, 1);
+        assert_eq!([open_rough, shaded_rough], [open_gathered, shaded_gathered]);
 
         // The sky put out, the cache left as it was: a ray leaving the screen probes' reach takes
         // its light from the cache, so the open floor still gathers the sky the cache saw.

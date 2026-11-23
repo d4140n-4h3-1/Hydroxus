@@ -168,7 +168,20 @@ prefixes. The method follows the published description of Lumen cited above.
    lighting ten thousand floor plants' small cards made rays in no order a GPU likes, tens of
    milliseconds a frame while walking. In the glade: cards 2-3 ms, cache about 1 ms, screen
    probes 3.5-5.5 ms of GPU time.
-6. **Reflections**: glossy reflections traced into the same surface cache.
+6. **Reflections** - done (`Reflections`): of each 2 by 2 block of pixels, one a frame (a
+   different one each frame) smoother than roughness 0.4 (`REFLECTION_ROUGHEST`, as Lumen's
+   default) traces one ray along a reflection its roughness gives - a visible normal of the GGX
+   distribution - against the lit cards, beyond 8 m taking the world radiance cache's light as
+   the screen probes do, averaged over 3 (a mirror) to 12 frames where it reprojects onto the same
+   surface. Each pixel takes the traced pixels of the nine blocks round it, weighted by nearness,
+   plane distance, normal and roughness alike; from 0.3 up it gives way to the screen probes'
+   light, all a rough surface reflects, which rougher pixels take alone. The renderer lights its
+   specular term with it in place of the ambient colour or skybox (`Renderer::set_indirect_specular`,
+   `IndirectSpecular`, as the diffuse hook; ambient pass wgpu and OpenGL). GPU-tested: a mirror
+   floor reflects the sky of 1 in the open and under the slab less than 0.1; rough, exactly the
+   screen probes' light. fyrox-gfx `with_candelite` turns it on with the rest. In Wilderness's glade
+   it costs 0.05 ms: the forest has almost nothing smoother than 0.4, so what shows is shaded
+   surfaces no longer reflecting the flat ambient colour.
 
 ## Order
 

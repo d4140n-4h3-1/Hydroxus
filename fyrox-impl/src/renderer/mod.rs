@@ -423,6 +423,9 @@ pub struct Renderer {
     /// Light between surfaces to light with in place of the ambient colour: see
     /// [`Self::set_indirect_diffuse`].
     indirect_diffuse: Option<IndirectDiffuse>,
+    /// Light reflected off each pixel, in place of the ambient colour or skybox: see
+    /// [`Self::set_indirect_specular`].
+    indirect_specular: Option<IndirectSpecular>,
     /// Makes shadows for lights in place of shadow maps, when set.
     light_shadow_tracer: Option<Box<dyn LightShadowTracer>>,
     /// How far every camera's view is shifted this frame, in pixels. See
@@ -606,6 +609,10 @@ pub type TakenOverMeshes = Rc<RefCell<fxhash::FxHashMap<Handle<Scene>, fxhash::F
 /// [`Renderer::set_indirect_diffuse`].
 pub type IndirectDiffuse = Rc<RefCell<fxhash::FxHashMap<Handle<Scene>, GpuTexture>>>;
 
+/// Each scene's reflected light, shared with whatever works it out: see
+/// [`Renderer::set_indirect_specular`].
+pub type IndirectSpecular = Rc<RefCell<fxhash::FxHashMap<Handle<Scene>, GpuTexture>>>;
+
 /// A context for custom scene render passes that draw into the G-Buffer, as the renderer's own
 /// meshes do (see [`SceneRenderPass::on_gbuffer_render`]).
 pub struct GBufferPassContext<'a, 'b> {
@@ -782,6 +789,7 @@ impl Renderer {
             scene_render_passes: Default::default(),
             taken_over_meshes: None,
             indirect_diffuse: None,
+            indirect_specular: None,
             light_shadow_tracer: None,
             projection_jitter: Vector2::zeros(),
             uniform_buffer_cache: UniformBufferCache::new(server.clone()),
@@ -826,6 +834,14 @@ impl Renderer {
     /// is lit as before. [`None`] lights every scene as before.
     pub fn set_indirect_diffuse(&mut self, light: Option<IndirectDiffuse>) {
         self.indirect_diffuse = light;
+    }
+
+    /// Lights each scene in `light` with its texture there - the size of the frame, each pixel
+    /// the light arriving along its reflection, as its roughness spreads it - in place of the
+    /// ambient colour (or the skybox's prefiltered reflection), weighted by the Fresnel term as
+    /// that is. Set as [`Self::set_indirect_diffuse`] is. [`None`] lights every scene as before.
+    pub fn set_indirect_specular(&mut self, light: Option<IndirectSpecular>) {
+        self.indirect_specular = light;
     }
 
     /// How long the GPU spent on each section of the frame, in milliseconds, averaged over the
@@ -1261,6 +1277,10 @@ impl Renderer {
                     light_shadow_tracer: self.light_shadow_tracer.as_deref_mut(),
                     indirect_diffuse: self
                         .indirect_diffuse
+                        .as_ref()
+                        .and_then(|light| light.borrow().get(&scene_handle).cloned()),
+                    indirect_specular: self
+                        .indirect_specular
                         .as_ref()
                         .and_then(|light| light.borrow().get(&scene_handle).cloned()),
                 })?;

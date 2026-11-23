@@ -52,6 +52,11 @@
             binding: 9
         ),
         (
+            name: "indirectSpecularTexture",
+            kind: Texture(kind: Sampler2D, fallback: Black),
+            binding: 10
+        ),
+        (
             name: "properties",
             kind: PropertyGroup([
                 (name: "worldViewProjection", kind: Matrix4()),
@@ -61,6 +66,7 @@
                 (name: "skyboxLighting", kind: Bool()),
                 (name: "environmentLightingBrightness", kind: Float()),
                 (name: "indirectDiffuse", kind: Bool()),
+                (name: "indirectSpecular", kind: Bool()),
             ]),
             binding: 0
         ),
@@ -145,7 +151,11 @@
                         let mip = roughness * (floor(log2(f32(cube_map_size.x))) + 1.0);
 
                         var reflection: vec3f;
-                        if (properties.skyboxLighting != 0u) {
+                        if (properties.indirectSpecular != 0u) {
+                            // Light arriving along this pixel's reflection, worked out for it
+                            // (traced reflections): in place of the ambient colour or skybox.
+                            reflection = textureSample(indirectSpecularTexture_tex, indirectSpecularTexture_samp, tex_coord).rgb;
+                        } else if (properties.skyboxLighting != 0u) {
                             reflection = S_SRGBToLinear(textureSampleLevel(prefilteredSpecularMap_tex, prefilteredSpecularMap_samp, S_RenderedCubeDirection(reflection_vector), mip)).rgb;
                         } else {
                             reflection = properties.ambientColor.rgb;

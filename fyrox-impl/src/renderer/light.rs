@@ -114,6 +114,9 @@ pub(crate) struct DeferredRendererContext<'a> {
     /// Light between surfaces to light with in place of the ambient colour: see
     /// [`super::Renderer::set_indirect_diffuse`].
     pub indirect_diffuse: Option<GpuTexture>,
+    /// Reflected light to light with in place of the ambient colour: see
+    /// [`super::Renderer::set_indirect_specular`].
+    pub indirect_specular: Option<GpuTexture>,
 }
 
 /// The part of the screen a light can possibly reach: the screen-space bounds of the sphere that
@@ -354,6 +357,7 @@ impl DeferredLightRenderer {
             need_recalculate_convolution,
             mut light_shadow_tracer,
             indirect_diffuse,
+            indirect_specular,
         } = args;
 
         let viewport = Rect::new(0, 0, gbuffer.width, gbuffer.height);
@@ -493,6 +497,7 @@ impl DeferredLightRenderer {
         );
         let ambient_color = ambient_color.srgb_to_linear_f32();
         let has_indirect_diffuse = indirect_diffuse.is_some();
+        let has_indirect_specular = indirect_specular.is_some();
         let properties = PropertyGroup::from([
             property("worldViewProjection", &frame_matrix),
             property("ambientColor", &ambient_color),
@@ -504,6 +509,7 @@ impl DeferredLightRenderer {
                 &scene.rendering_options.environment_lighting_brightness,
             ),
             property("indirectDiffuse", &has_indirect_diffuse),
+            property("indirectSpecular", &has_indirect_specular),
         ]);
         let material = RenderMaterial::from([
             binding(
@@ -568,6 +574,13 @@ impl DeferredLightRenderer {
                 "indirectDiffuseTexture",
                 (
                     indirect_diffuse.as_ref().unwrap_or(&renderer_resources.black_dummy),
+                    &renderer_resources.nearest_clamp_sampler,
+                ),
+            ),
+            binding(
+                "indirectSpecularTexture",
+                (
+                    indirect_specular.as_ref().unwrap_or(&renderer_resources.black_dummy),
                     &renderer_resources.nearest_clamp_sampler,
                 ),
             ),
