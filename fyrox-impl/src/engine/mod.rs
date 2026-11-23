@@ -605,6 +605,10 @@ pub struct ScriptedScene {
     /// Script message sender.
     pub message_sender: ScriptMessageSender,
     message_dispatcher: ScriptMessageDispatcher,
+    /// The nodes with scripts, to hand OS events to, and the engine's elapsed time when they were
+    /// listed: see [`Engine::handle_os_event_by_scripts`].
+    os_event_nodes: Vec<Handle<Node>>,
+    os_event_nodes_at: Option<f32>,
 }
 
 /// Script processor is used to run script methods in a strict order.
@@ -633,6 +637,8 @@ impl ScriptProcessor {
             handle: scene,
             message_sender: ScriptMessageSender { sender: tx },
             message_dispatcher: ScriptMessageDispatcher::new(rx),
+            os_event_nodes: Vec::new(),
+            os_event_nodes_at: None,
         });
 
         self.wait_list
@@ -1200,6 +1206,8 @@ fn process_node_scripts<T, C>(
     }
 }
 
+/// Runs `func` on the scripts of every node of `scene`, or only of the nodes `only` lists.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_scripts<T>(
     caller_name: &'static str,
     scene: &mut Scene,
@@ -1215,6 +1223,7 @@ pub(crate) fn process_scripts<T>(
     elapsed_time: f32,
     input_state: &InputState,
     error_queue: &mut ErrorQueue,
+    only: Option<&[Handle<Node>]>,
     mut func: T,
 ) where
     T: FnMut(&mut Script, &mut ScriptContext) -> GameResult,
@@ -1236,16 +1245,19 @@ pub(crate) fn process_scripts<T>(
         input_state,
     };
 
-    for node_index in 0..context.scene.graph.capacity() {
-        context.handle = context.scene.graph.handle_from_index(node_index);
-
-        process_node_scripts(
-            caller_name,
-            &mut context,
-            scene_handle,
-            error_queue,
-            &mut func,
-        );
+    match only {
+        None => {
+            for node_index in 0..context.scene.graph.capacity() {
+                context.handle = context.scene.graph.handle_from_index(node_index);
+                process_node_scripts(caller_name, &mut context, scene_handle, error_queue, &mut func);
+            }
+        }
+        Some(handles) => {
+            for &handle in handles {
+                context.handle = handle;
+                process_node_scripts(caller_name, &mut context, scene_handle, error_queue, &mut func);
+            }
+        }
     }
 }
 
@@ -2311,6 +2323,24 @@ impl Engine {
         {
             let scene = &mut self.scenes[scene_handle];
             if *scene.enabled {
+                // Only nodes with scripts take events, and a script takes them once started, in
+                // an update: the nodes with scripts are listed once an update, rather than every
+                // node of the scene visited for every event - several a frame, which in a scene of
+                // tens of thousands of nodes took milliseconds.
+                if scripted_scene.os_event_nodes_at != Some(self.elapsed_time) {
+                    scripted_scene.os_event_nodes.clear();
+                    scripted_scene.os_event_nodes.extend(
+                        scene
+                            .graph
+                            .pair_iter()
+                            .filter(|(_, node)| node.has_scripts_assigned())
+                            .map(|(handle, _)| handle),
+                    );
+                    scripted_scene.os_event_nodes_at = Some(self.elapsed_time);
+                }
+                if scripted_scene.os_event_nodes.is_empty() {
+                    return;
+                }
                 process_scripts(
                     "on_os_event",
                     scene,
@@ -2326,6 +2356,7 @@ impl Engine {
                     self.elapsed_time,
                     &self.input_state,
                     &mut self.error_queue,
+                    Some(&scripted_scene.os_event_nodes),
                     |script, context| {
                         if script.initialized && script.started {
                             script.on_os_event(event, context)

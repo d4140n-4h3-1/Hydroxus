@@ -1848,6 +1848,10 @@ pub struct GBufferDrawer {
     /// How small a cluster's radius on the screen, in pixels, the software rasterizer draws it
     /// (where there is one): [`SOFTWARE_PIXELS`] at first; 0 draws everything by the hardware.
     pub software_pixels: f32,
+    /// Each material slot's bind group, and what it was made of: made again only when that
+    /// changes. Made afresh every frame, each with a buffer of its own, they took the buffer
+    /// allocator's free list milliseconds a frame to find room for.
+    material_groups: std::cell::RefCell<std::collections::HashMap<u32, (ResolvedMaterial, wgpu::BindGroup)>>,
 }
 
 /// What [`GBufferDrawer::draw`] drew.
@@ -1926,6 +1930,7 @@ impl GBufferDrawer {
             source: wgpu::ShaderSource::Wgsl(GBUFFER_SHADER.into()),
         });
         Self {
+            material_groups: Default::default(),
             frame_layout,
             material_layout,
             module,
@@ -2102,6 +2107,18 @@ impl GBufferDrawer {
 
     /// The bind group a material is drawn with: what it reads, and its textures.
     fn material_group(&self, device: &wgpu::Device, material: &ResolvedMaterial) -> wgpu::BindGroup {
+        let mut groups = self.material_groups.borrow_mut();
+        if let Some((made_of, group)) = groups.get(&material.slot) {
+            if made_of.params == material.params && made_of.views == material.views && made_of.samplers == material.samplers {
+                return group.clone();
+            }
+        }
+        let group = self.make_material_group(device, material);
+        groups.insert(material.slot, (material.clone(), group.clone()));
+        group
+    }
+
+    fn make_material_group(&self, device: &wgpu::Device, material: &ResolvedMaterial) -> wgpu::BindGroup {
         let params = MaterialParams {
             slot: material.slot,
             ..material.params

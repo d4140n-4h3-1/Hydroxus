@@ -892,6 +892,12 @@ impl Default for RenderDataBundleStorageOptions {
     }
 }
 
+thread_local! {
+    /// By the concrete type of a node: whether it is or has a field that is a [`BaseLight`], and
+    /// a [`ReflectionProbe`]. See [`RenderDataBundleStorage::from_graph_skipping`].
+    static LIGHT_OR_PROBE: std::cell::RefCell<FxHashMap<std::any::TypeId, (bool, bool)>> = Default::default();
+}
+
 impl RenderDataBundleStorage {
     pub fn new_empty(observer_position: ObserverPosition) -> Self {
         Self {
@@ -960,6 +966,22 @@ impl RenderDataBundleStorage {
 
         let mut lod_filter = vec![true; graph.capacity() as usize];
         for (node_handle, node) in graph.pair_iter() {
+            // Whether this kind of node is, or has a field that is, a light or a reflection probe:
+            // finding out walks its fields by reflection, which for every node of a big scene
+            // took milliseconds a frame, yet a type's fields never change - so it is asked once
+            // a type.
+            let (may_be_light, may_be_probe) = LIGHT_OR_PROBE.with(|known| {
+                let inner = node.inner_ref();
+                *known
+                    .borrow_mut()
+                    .entry((inner as &dyn std::any::Any).type_id())
+                    .or_insert_with(|| {
+                        (
+                            node.self_or_field_ref::<BaseLight>().is_some(),
+                            node.self_or_field_ref::<ReflectionProbe>().is_some(),
+                        )
+                    })
+            });
             if let Some(lod_group) = node.lod_group() {
                 for level in lod_group.levels.iter() {
                     for &object in level.objects.iter() {
@@ -978,7 +1000,7 @@ impl RenderDataBundleStorage {
                 }
             }
 
-            if options.collect_environment {
+            if options.collect_environment && may_be_probe {
                 if let Some(reflection_probe) = node.self_or_field_ref::<ReflectionProbe>() {
                     if (reflection_probe as &dyn NodeTrait)
                         .world_bounding_box()
@@ -989,7 +1011,7 @@ impl RenderDataBundleStorage {
                 }
             }
 
-            if options.collect_lights {
+            if options.collect_lights && may_be_light {
                 if let Some(base_light) = node.self_or_field_ref::<BaseLight>() {
                     if frustum.is_intersects_aabb(&node.world_bounding_box())
                         && base_light.global_visibility()
