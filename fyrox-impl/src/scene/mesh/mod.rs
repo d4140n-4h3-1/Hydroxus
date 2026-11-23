@@ -467,6 +467,7 @@ impl Mesh {
 
     /// Sets surfaces for the mesh.
     pub fn set_surfaces(&mut self, surfaces: Vec<Surface>) -> Vec<Surface> {
+        self.base.mark_content_changed();
         self.surfaces.set_value_and_mark_modified(surfaces)
     }
 
@@ -479,6 +480,7 @@ impl Mesh {
     /// Returns mutable reference to array of surfaces.
     #[inline]
     pub fn surfaces_mut(&mut self) -> &mut [Surface] {
+        self.base.mark_content_changed();
         self.local_bounding_box_dirty.set(true);
         self.surfaces.get_value_mut_silent()
     }
@@ -486,6 +488,7 @@ impl Mesh {
     /// Removes all surfaces from mesh.
     #[inline]
     pub fn clear_surfaces(&mut self) {
+        self.base.mark_content_changed();
         self.surfaces.get_value_mut_and_mark_modified().clear();
         self.local_bounding_box_dirty.set(true);
     }
@@ -493,6 +496,7 @@ impl Mesh {
     /// Adds new surface into mesh, can be used to procedurally generate meshes.
     #[inline]
     pub fn add_surface(&mut self, surface: Surface) {
+        self.base.mark_content_changed();
         self.surfaces
             .get_value_mut_and_mark_modified()
             .push(surface);
@@ -506,11 +510,13 @@ impl Mesh {
 
     /// Returns a list of blend shapes.
     pub fn blend_shapes_mut(&mut self) -> &mut [BlendShape] {
+        self.base.mark_content_changed();
         self.blend_shapes.get_value_mut_and_mark_modified()
     }
 
     /// Sets new render path for the mesh.
     pub fn set_render_path(&mut self, render_path: RenderPath) -> RenderPath {
+        self.base.mark_content_changed();
         self.render_path.set_value_and_mark_modified(render_path)
     }
 

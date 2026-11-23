@@ -172,6 +172,43 @@ pub struct Graph {
 
     #[reflect(read_only)]
     instance_id_map: FxHashMap<SceneNodeId, Handle<Node>>,
+
+    #[reflect(hidden)]
+    journal: ChangeJournal,
+}
+
+/// How many graph updates back the change journal reaches (see [`Graph::changes_since`]).
+pub const JOURNAL_UPDATES: usize = 8;
+
+/// The nodes that changed, in the order they did, over the last [`JOURNAL_UPDATES`] updates: see
+/// [`Graph::changes_since`].
+#[derive(Default, Debug)]
+struct ChangeJournal {
+    entries: Vec<Handle<Node>>,
+    /// Where `entries[0]` is, counted from the graph's first change.
+    first: u64,
+    /// Where each of the last updates started.
+    marks: std::collections::VecDeque<u64>,
+}
+
+impl ChangeJournal {
+    fn end(&self) -> u64 {
+        self.first + self.entries.len() as u64
+    }
+
+    /// Starts an update: what is older than the last [`JOURNAL_UPDATES`] is let go.
+    fn mark(&mut self) {
+        self.marks.push_back(self.end());
+        while self.marks.len() > JOURNAL_UPDATES {
+            self.marks.pop_front();
+        }
+        let keep_from = self.marks.front().copied().unwrap_or(self.first);
+        let drop = (keep_from - self.first) as usize;
+        if drop > 0 {
+            self.entries.drain(..drop);
+            self.first = keep_from;
+        }
+    }
 }
 
 impl PartialEq for Graph {
@@ -230,6 +267,7 @@ impl Default for Graph {
             instance_id_map: Default::default(),
             message_receiver,
             user_data: Default::default(),
+            journal: Default::default(),
         }
     }
 }
@@ -441,7 +479,32 @@ impl Graph {
             instance_id_map,
             message_receiver,
             user_data: Default::default(),
+            journal: Default::default(),
         }
+    }
+
+    /// The nodes changed since `cursor` - added, removed, moved (with their descendants), shown
+    /// or hidden, enabled or disabled, or marked with [`crate::scene::base::Base::mark_content_changed`] (a mesh's
+    /// surfaces, blend shape weights, render path, whether it casts shadows) - as the graph's
+    /// updates took the changes in, a node once for each time; [`None`] if the journal no longer
+    /// reaches back to `cursor` (it keeps the last [`JOURNAL_UPDATES`] updates), when everything
+    /// must be looked at afresh. The cursor to pass next time is [`Self::changes_end`]. A cursor
+    /// of 0 always gets [`None`] once anything has been let go, so it suits a first look.
+    ///
+    /// For keeping something of one's own in step with the graph - a renderer's copy of the
+    /// meshes, say - without looking at every node every frame. Changes made to a node's fields
+    /// through reflection (an editor's) are not recorded.
+    pub fn changes_since(&self, cursor: u64) -> Option<&[Handle<Node>]> {
+        let journal = &self.journal;
+        if cursor < journal.first || cursor > journal.end() {
+            return None;
+        }
+        Some(&journal.entries[(cursor - journal.first) as usize..])
+    }
+
+    /// Where the change journal ends now: see [`Self::changes_since`].
+    pub fn changes_end(&self) -> u64 {
+        self.journal.end()
     }
 
     /// Begins multi-borrowing and gives access to the 3D physics world at the same time. The physics
@@ -1313,8 +1376,19 @@ impl Graph {
 
         let mut visited_flags = vec![Flags::NONE; self.pool.get_capacity() as usize];
         let mut roots = FxHashMap::default();
+        // Every node changed, for the change journal (see `Self::changes_since`).
+        let mut changed = Vec::new();
 
         while let Ok(message) = self.message_receiver.try_recv() {
+            let message_flag = match message.kind {
+                NodeMessageKind::TransformChanged => Flags::TRANSFORM_CHANGED,
+                NodeMessageKind::VisibilityChanged => Flags::VISIBILITY_CHANGED,
+                NodeMessageKind::EnabledFlagChanged => Flags::ENABLED_FLAG_CHANGED,
+                NodeMessageKind::ContentChanged => {
+                    changed.push(message.node);
+                    continue;
+                }
+            };
             if let NodeMessageKind::TransformChanged = message.kind {
                 if let Ok(node) = self.pool.try_borrow(message.node) {
                     node.on_local_transform_changed(&mut SyncContext {
@@ -1328,12 +1402,6 @@ impl Graph {
             }
 
             // Prepare for hierarchy propagation.
-            let message_flag = match message.kind {
-                NodeMessageKind::TransformChanged => Flags::TRANSFORM_CHANGED,
-                NodeMessageKind::VisibilityChanged => Flags::VISIBILITY_CHANGED,
-                NodeMessageKind::EnabledFlagChanged => Flags::ENABLED_FLAG_CHANGED,
-            };
-
             let visit_flags = &mut visited_flags[message.node.index() as usize];
 
             if visit_flags.contains(message_flag) {
@@ -1363,6 +1431,7 @@ impl Graph {
 
             traverse_recursive(self, message.node, &mut |h| {
                 visited_flags[h.index() as usize].insert(message_flag);
+                changed.push(h);
 
                 // Remove a descendant from the list of potential roots.
                 if h != message.node {
@@ -1376,6 +1445,8 @@ impl Graph {
                 }
             })
         }
+
+        self.journal.entries.extend(changed);
 
         for (node, flags) in roots {
             if flags.contains(Flags::TRANSFORM_CHANGED) {
@@ -1463,6 +1534,7 @@ impl Graph {
             return;
         }
 
+        self.journal.mark();
         let last_time = instant::Instant::now();
         self.process_node_messages(Some(&switches));
         self.performance_statistics.hierarchical_properties_time =
@@ -2104,6 +2176,8 @@ impl SceneGraph for Graph {
                 self.stack.push(child);
             }
 
+            self.journal.entries.push(handle);
+
             // Remove associated entities.
             let mut node = self.pool.free(handle);
             self.instance_id_map.remove(&node.instance_id);
@@ -2254,6 +2328,45 @@ mod test {
     }
 
     impl ScriptTrait for MyOtherScript {}
+
+    #[test]
+    fn the_change_journal_records_what_changed_and_lets_go_of_the_old() {
+        let mut graph = Graph::new();
+        let parent = PivotBuilder::new(BaseBuilder::new()).build(&mut graph);
+        let child = PivotBuilder::new(BaseBuilder::new()).build(&mut graph);
+        graph.link_nodes(child, parent);
+        let mesh = MeshBuilder::new(BaseBuilder::new()).build(&mut graph);
+        let update = |graph: &mut Graph| graph.update(Vector2::new(1.0, 1.0), 1.0 / 60.0, Default::default());
+        update(&mut graph);
+        let start = graph.changes_end();
+
+        // Nothing done, nothing recorded.
+        update(&mut graph);
+        assert_eq!(graph.changes_since(start), Some(&[][..]));
+
+        // Moving a node records it and what it carries; a mesh's weights changing, the mesh alone.
+        graph[parent].local_transform_mut().set_position(Vector3::new(1.0, 0.0, 0.0));
+        graph[mesh].blend_shapes_mut();
+        update(&mut graph);
+        let changed = graph.changes_since(start).unwrap().to_vec();
+        assert!(changed.contains(&parent.to_base()) && changed.contains(&child.to_base()));
+        assert!(changed.contains(&mesh.to_base()));
+        assert_eq!(changed.len(), 3);
+
+        // Taking a node out records it.
+        let cursor = graph.changes_end();
+        graph.remove_node(child);
+        update(&mut graph);
+        assert_eq!(graph.changes_since(cursor), Some(&[child.to_base()][..]));
+
+        // Past the updates it keeps, an old cursor is told to look at everything afresh.
+        for _ in 0..super::JOURNAL_UPDATES + 1 {
+            graph[parent].local_transform_mut().set_position(Vector3::new(2.0, 0.0, 0.0));
+            update(&mut graph);
+        }
+        assert_eq!(graph.changes_since(start), None);
+        assert!(graph.changes_since(graph.changes_end()).is_some());
+    }
 
     #[test]
     fn test_graph_scripts() {

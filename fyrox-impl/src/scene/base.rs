@@ -282,6 +282,9 @@ pub(crate) enum NodeMessageKind {
     TransformChanged,
     VisibilityChanged,
     EnabledFlagChanged,
+    /// What the node is changed, not where: a mesh's surfaces or blend shape weights, say. Only
+    /// recorded in the graph's change journal (see [`super::graph::Graph::changes_since`]).
+    ContentChanged,
 }
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
@@ -537,6 +540,13 @@ impl Base {
         self.notify(self.self_handle, NodeMessageKind::TransformChanged);
         self.notify(self.self_handle, NodeMessageKind::VisibilityChanged);
         self.notify(self.self_handle, NodeMessageKind::EnabledFlagChanged);
+    }
+
+    /// Records in the graph's change journal that what this node is has changed - not where it
+    /// is, which is recorded by itself - for those keeping something of their own in step with
+    /// the graph (see [`super::graph::Graph::changes_since`]). Taken in at the next graph update.
+    pub fn mark_content_changed(&self) {
+        self.notify(self.self_handle, NodeMessageKind::ContentChanged);
     }
 
     fn notify(&self, node: Handle<Node>, kind: NodeMessageKind) {
@@ -864,6 +874,7 @@ impl Base {
     /// Sets whether the mesh should cast shadows or not.
     #[inline]
     pub fn set_cast_shadows(&mut self, cast_shadows: bool) -> bool {
+        self.mark_content_changed();
         self.cast_shadows.set_value_and_mark_modified(cast_shadows)
     }
 
