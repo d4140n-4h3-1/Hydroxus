@@ -48,6 +48,10 @@ pub struct LightShadowTraceContext<'a> {
     pub depth: &'a GpuTexture,
     /// World-space normals of the G-buffer, packed into 0..1.
     pub normals: &'a GpuTexture,
+    /// The G-buffer's material texture: metallic, roughness, occlusion, and in alpha one minus
+    /// how much light comes through from behind (leaves): such a surface facing away from the
+    /// light is lit through, if nothing blocks the light on its other side.
+    pub materials: &'a GpuTexture,
     /// Turns a screen position and depth back into a world position.
     pub inv_view_projection: Matrix4<f32>,
     /// The light to shadow.

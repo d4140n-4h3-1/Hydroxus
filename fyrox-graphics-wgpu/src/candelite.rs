@@ -732,6 +732,9 @@ struct CandeliteCard {
 @group(0) @binding(4) var candeliteDiffuse: texture_2d<f32>;
 @group(0) @binding(5) var candeliteNormal: texture_2d<f32>;
 @group(0) @binding(6) var candeliteDepth: texture_depth_2d;
+// What the cards captured of the material: metallic, roughness, occlusion, and in alpha one minus
+// how much light comes through from behind (leaves).
+@group(0) @binding(13) var candeliteMaterial: texture_2d<f32>;
 
 // Each mesh slot's cutout, none wide for a solid mesh; each cutout triangle's corners' texture
 // coordinates; and the masks' bits.
@@ -1137,12 +1140,17 @@ fn light_cards(@builtin(global_invocation_id) id: vec3u) {
     let captured = textureLoad(candeliteNormal, at, 0).xyz * 2.0 - 1.0;
     let normal = normalize(vec3f(dot(m[0].xyz, captured), dot(m[1].xyz, captured), dot(m[2].xyz, captured)));
     let albedo = candelite_linear(textureLoad(candeliteDiffuse, at, 0).rgb);
+    // How much of the light on its back comes through (a leaf's), as the G-Buffer has it.
+    let through = 1.0 - textureLoad(candeliteMaterial, at, 0).a;
 
-    // The sun, if a shadow ray reaches it.
+    // The sun, if a shadow ray reaches it: on the front, or through the back of a leaf, the ray
+    // then starting off its back.
     var direct = vec3f(0.0);
     let facing = dot(normal, light.towardSun);
     if (facing > 0.0 && !candelite_blocked(world + normal * 0.05 + light.towardSun * 0.15, light.towardSun, 1.0e4)) {
         direct = albedo * light.sun * facing;
+    } else if (facing < 0.0 && through > 0.01 && !candelite_blocked(world - normal * 0.05 + light.towardSun * 0.15, light.towardSun, 1.0e4)) {
+        direct = albedo * light.sun * (-facing * through);
     }
 
     // One ray of indirect light, cosine-weighted about the normal, averaged with those before:
@@ -1152,14 +1160,19 @@ fn light_cards(@builtin(global_invocation_id) id: vec3u) {
     let b2 = pcg(a);
     let r1 = f32(a) / 4294967296.0;
     let r2 = f32(b2) / 4294967296.0;
-    let side = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
-    let tangent = normalize(cross(side, normal));
-    let bitangent = cross(normal, tangent);
+    // A leaf gathers from behind too, `through` as much: the ray goes out the back one time in
+    // 1 + 1 / through, and either way stands for 1 + through of what it brings back.
+    let r3 = f32(pcg(b2)) / 4294967296.0;
+    let behind = r3 * (1.0 + through) < through;
+    let out = select(normal, -normal, behind);
+    let side = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(out.y) > 0.9);
+    let tangent = normalize(cross(side, out));
+    let bitangent = cross(out, tangent);
     let radius = sqrt(r1);
     let phi = 6.2831853 * r2;
-    let direction = normalize(tangent * (radius * cos(phi)) + bitangent * (radius * sin(phi)) + normal * sqrt(max(1.0 - r1, 0.0)));
-    let hit = candelite_trace(world + normal * 0.1, direction, 200.0);
-    let incoming = candelite_hit_light(hit, light.towardSun, light.sun, light.sky);
+    let direction = normalize(tangent * (radius * cos(phi)) + bitangent * (radius * sin(phi)) + out * sqrt(max(1.0 - r1, 0.0)));
+    let hit = candelite_trace(world + out * 0.1, direction, 200.0);
+    let incoming = candelite_hit_light(hit, light.towardSun, light.sun, light.sky) * (1.0 + through);
     let before = candelite_unpack(indirect[index]);
     let count = min(before.a + 1.0, MOST_SAMPLES);
     let gathered = mix(before.rgb, albedo * incoming, 1.0 / count);
@@ -2038,6 +2051,12 @@ struct Probe {
 @group(1) @binding(0) var<uniform> probes: Probes;
 @group(1) @binding(1) var sceneDepth: texture_depth_2d;
 @group(1) @binding(2) var sceneNormal: texture_2d<f32>;
+// Metallic, roughness, occlusion; alpha one minus how much light comes through from behind.
+@group(1) @binding(5) var sceneMaterial: texture_2d<f32>;
+
+fn probes_through(pixel: vec2u) -> f32 {
+    return 1.0 - textureLoad(sceneMaterial, pixel, 0).a;
+}
 
 // Where the surface seen at `pixel` is, from its depth (OpenGL's clip space, depth 0 to 1).
 fn probes_unproject(pixel: vec2f, depth: f32) -> vec3f {
@@ -2095,6 +2114,8 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
     let on_something = depth < 1.0;
     let position = probes_unproject(vec2f(pixel) + 0.5, depth);
     let normal = probes_normal(pixel);
+    // On a leaf, the probe gathers from all round: the light from behind comes through.
+    let leaf = on_something && probes_through(pixel) > 0.01;
 
     var r = vec4f(0.0);
     var g = vec4f(0.0);
@@ -2103,8 +2124,9 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
         let turn = probes_pcg(seed ^ lane);
         let u1 = (f32(local.x) + f32(turn & 0xFFFFu) / 65536.0) / 8.0;
         let u2 = (f32(local.y) + f32(turn >> 16u) / 65536.0) / 8.0;
-        // Uniform over the hemisphere: up the normal by u1, round it by u2.
-        let up = u1;
+        // Uniform over the hemisphere: up the normal by u1, round it by u2; on a leaf, over the
+        // sphere.
+        let up = select(u1, u1 * 2.0 - 1.0, leaf);
         let out = sqrt(max(1.0 - up * up, 0.0));
         let phi = 6.2831853 * u2;
         let side = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(normal.y) > 0.9);
@@ -2113,7 +2135,8 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
         let direction = normalize(tangent * (out * cos(phi)) + bitangent * (out * sin(phi)) + normal * up);
         // Traced a little way; past that, the light from beyond is the world radiance cache's,
         // where it has probes round the ray's end - else traced on.
-        let start = position + normal * 0.1;
+        // Off the side the ray leaves by: a leaf's rays out its back start behind it.
+        let start = position + normal * select(0.1, -0.1, dot(direction, normal) < 0.0);
         let hit = candelite_trace(start, direction, SCREEN_REACH);
         var light: vec3f;
         if (hit.hit) {
@@ -2128,8 +2151,8 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
                 light = candelite_hit_light(far, probes.towardSun.xyz, probes.sun.xyz, probes.sky.xyz);
             }
         }
-        // Each ray stands for 2 pi / 64 of the hemisphere.
-        let basis = vec4f(0.282095, 0.488603 * direction.y, 0.488603 * direction.z, 0.488603 * direction.x) * (6.2831853 / 64.0);
+        // Each ray stands for 2 pi / 64 of the hemisphere (4 pi / 64 of the sphere).
+        let basis = vec4f(0.282095, 0.488603 * direction.y, 0.488603 * direction.z, 0.488603 * direction.x) * (select(6.2831853, 12.5663706, leaf) / 64.0);
         r = basis * light.r;
         g = basis * light.g;
         b = basis * light.b;
@@ -2141,7 +2164,8 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
     if (lane != 0u) {
         return;
     }
-    var probe = Probe(vec4f(position, select(0.0, 1.0, on_something)), vec4f(normal, 1.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
+    // position.w: 0 on nothing, 1 on something, 2 on a leaf (gathered from all round).
+    var probe = Probe(vec4f(position, select(select(0.0, 1.0, on_something), 2.0, leaf)), vec4f(normal, 1.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
     if (!on_something) {
         current[index] = probe;
         return;
@@ -2161,7 +2185,8 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
             let old = history[cell.y * probes.grid.x + cell.x];
             let distance = length(position - probes_unproject(vec2f(probes.size) * 0.5, 0.0));
             let apart = abs(dot(old.position.xyz - position, normal));
-            if (old.position.w > 0.5 && dot(old.normal.xyz, normal) > 0.8 && apart < 0.05 + 0.02 * distance) {
+            // Of the same kind, too: a leaf's probe gathers from all round, another's does not.
+            if (old.position.w == probe.position.w && dot(old.normal.xyz, normal) > 0.8 && apart < 0.05 + 0.02 * distance) {
                 let count = min(old.normal.w + 1.0, PROBE_HISTORY);
                 probe.r = mix(old.r, probe.r, 1.0 / count);
                 probe.g = mix(old.g, probe.g, 1.0 / count);
@@ -2196,6 +2221,7 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
     }
     let p = probes_unproject(at.xy, depth);
     let n = probes_normal(pixel);
+    let through = probes_through(pixel);
     let eye = probes_unproject(vec2f(probes.size) * 0.5, 0.0);
     let slack = 0.05 + 0.02 * length(p - eye);
     let cell = (at.xy - 8.0) / 16.0;
@@ -2203,6 +2229,9 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
     let f = fract(cell);
     var sum = vec3f(0.0);
     var weight = 0.0;
+    // A leaf's light from behind, from the probes that gathered from all round.
+    var behind = vec3f(0.0);
+    var behind_weight = 0.0;
     for (var k = 0; k < 4; k++) {
         let offset = vec2i(k & 1, k >> 1);
         let c = clamp(base + offset, vec2i(0), vec2i(probes.grid) - 1);
@@ -2216,6 +2245,10 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
         let w = near * plane * facing;
         sum += probes_irradiance(probe, n) * w;
         weight += w;
+        if (probe.position.w > 1.5) {
+            behind += probes_irradiance(probe, -n) * w;
+            behind_weight += w;
+        }
     }
     if (weight < 1.0e-4) {
         for (var dy = -1; dy <= 1; dy++) {
@@ -2228,13 +2261,21 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
                 let w = max(dot(probe.normal.xyz, n), 0.0) + 1.0e-3;
                 sum += probes_irradiance(probe, n) * w;
                 weight += w;
+                if (probe.position.w > 1.5) {
+                    behind += probes_irradiance(probe, -n) * w;
+                    behind_weight += w;
+                }
             }
         }
     }
     if (weight <= 0.0) {
         return vec4f(probes.sky.rgb, 1.0);
     }
-    return vec4f(sum / weight, 1.0);
+    var light = sum / weight;
+    if (through > 0.01 && behind_weight > 1.0e-6) {
+        light += behind / behind_weight * through;
+    }
+    return vec4f(light, 1.0);
 }
 "#;
 
@@ -2265,6 +2306,9 @@ pub struct ProbeFrame<'a> {
     pub depth: &'a wgpu::Texture,
     /// The scene's normals, as the G-Buffer has them (each axis brought to 0 to 1).
     pub normal: &'a wgpu::Texture,
+    /// The G-Buffer's material texture: metallic, roughness, occlusion, and in alpha one minus
+    /// how much light comes through from behind (leaves, which gather from all round).
+    pub material: &'a wgpu::Texture,
     /// From the world to clip space, column by column (OpenGL's).
     pub view_projection: [[f32; 4]; 4],
     /// And back.
@@ -2309,11 +2353,11 @@ impl ScreenProbes {
         };
         let trace_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("CandeliteProbes"),
-            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true)), entry(4, storage(false))],
+            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true)), entry(4, storage(false)), entry(5, normal)],
         });
         let gather_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("CandeliteProbeGather"),
-            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true))],
+            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true)), entry(5, normal)],
         });
         let cache_layout = cache_sample_layout(device);
         let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2457,6 +2501,7 @@ impl ScreenProbes {
             ..Default::default()
         });
         let normal = frame.normal.create_view(&Default::default());
+        let material = frame.material.create_view(&Default::default());
         let common = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("CandeliteProbes"),
@@ -2467,6 +2512,7 @@ impl ScreenProbes {
                 common(2, wgpu::BindingResource::TextureView(&normal)),
                 common(3, history.as_entire_binding()),
                 common(4, current.as_entire_binding()),
+                common(5, wgpu::BindingResource::TextureView(&material)),
             ],
         });
         let gather_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -2477,6 +2523,7 @@ impl ScreenProbes {
                 common(1, wgpu::BindingResource::TextureView(&depth)),
                 common(2, wgpu::BindingResource::TextureView(&normal)),
                 common(3, current.as_entire_binding()),
+                common(5, wgpu::BindingResource::TextureView(&material)),
             ],
         });
         {
@@ -2880,9 +2927,9 @@ impl Reflections {
 
     /// Traces the reflections for `frame` against what `light` has lit - beyond
     /// [`SCREEN_REACH`], taking the light from `radiance` - and draws them into `target` (of
-    /// [`REFLECTIONS_FORMAT`], the size of `frame.depth`), recorded into `encoder`. `material` is
-    /// the G-Buffer's material texture (roughness in green); `frame.target` must hold this frame's
-    /// screen probes' light ([`ScreenProbes::record`]), which rough pixels reflect.
+    /// [`REFLECTIONS_FORMAT`], the size of `frame.depth`), recorded into `encoder`, each pixel's
+    /// roughness from `frame.material`. `frame.target` must hold this frame's screen probes' light
+    /// ([`ScreenProbes::record`]), which rough pixels reflect.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -2895,7 +2942,6 @@ impl Reflections {
         radiance: &RadianceCache,
         sunlight: &Sunlight,
         frame: &ProbeFrame,
-        material: &wgpu::Texture,
         target: &wgpu::Texture,
     ) {
         let size = [frame.depth.width(), frame.depth.height()];
@@ -2959,7 +3005,7 @@ impl Reflections {
             ..Default::default()
         });
         let normal = frame.normal.create_view(&Default::default());
-        let material = material.create_view(&Default::default());
+        let material = frame.material.create_view(&Default::default());
         let probes = frame.target.create_view(&Default::default());
         let common = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3304,6 +3350,7 @@ fn lookup_layout_with(device: &wgpu::Device, visibility: wgpu::ShaderStages, rad
             storage(10),
             storage(11),
             storage_as(12, !radiance_writable),
+            texture(13, unfiltered),
         ],
     })
 }
@@ -3337,6 +3384,7 @@ fn lookup_group_with(
     let [cutouts, corners, masks] = scene.cutouts.as_ref().expect("made above");
     let diffuse = cache.layers[0].create_view(&Default::default());
     let normal = cache.layers[1].create_view(&Default::default());
+    let material = cache.layers[3].create_view(&Default::default());
     let depth = cache.depth.create_view(&wgpu::TextureViewDescriptor {
         aspect: wgpu::TextureAspect::DepthOnly,
         ..Default::default()
@@ -3397,6 +3445,10 @@ fn lookup_group_with(
             wgpu::BindGroupEntry {
                 binding: 12,
                 resource: radiance.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: wgpu::BindingResource::TextureView(&material),
             },
         ],
     }))
@@ -3918,6 +3970,97 @@ mod test {
     }
 
     #[test]
+    fn the_sun_lights_a_leaf_through_its_back() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray tracing: skipped");
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .expect("device");
+
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        // A sheet 4 m square facing up, orange, letting through `through` of the light on its
+        // back; and over its left half, 1 m up, a slab - which shades nothing of a sun straight
+        // below.
+        let mut captures = Vec::new();
+        for (min, max, top_only, slot) in [([-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], true, 0), ([-2.5, 1.0, -2.5], [0.0, 1.2, 2.5], false, 1)] {
+            let (vertices, indices) = boxed(min, max, top_only);
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let first = pool.mesh(mesh).unwrap().first_cluster;
+            let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+            captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
+            scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+            pool.add_instance(&device, &queue, mesh, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], slot);
+        }
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let through = 0.5;
+        let material = |slot, colour: [f32; 4], transmission| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: colour,
+                transmission,
+                ..Default::default()
+            },
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, [1.0, 0.5, 0.25, 1.0], through), material(1, [0.2, 0.2, 0.2, 1.0], 0.0)];
+        let mut drawer = GBufferDrawer::new(&device);
+        let mut light = SurfaceLight::new(&device).expect("can trace");
+        let sunlight = Sunlight { toward_sun: [0.0, -1.0, 0.0], sun: [1.0; 3], sky: [0.0; 3] };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+        assert!(scene.update(&device, &mut encoder, &pool));
+        queue.submit([encoder.finish()]);
+        for _ in 0..8 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            light.update(&device, &mut encoder, &mut scene, &pool, &mut cache, [0.0, 3.0, 0.0], &sunlight);
+            queue.submit([encoder.finish()]);
+        }
+        let sheet = pool.placed().find(|(_, record)| record.material == 0).map(|(slot, _)| slot).expect("sheet");
+        let tile = light.lit_tiles(sheet).expect("lit")[2];
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: light.radiance().size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(light.radiance(), 0, &staging, 0, light.radiance().size());
+        queue.submit([encoder.finish()]);
+        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let words: Vec<u32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
+        let at = |x: u32, y: u32| {
+            let i = ((tile[1] + y) * RADIANCE_SIZE + tile[0] + x) as usize * 2;
+            let half = |h: u32| half::f16::from_bits(h as u16).to_f32();
+            half(words[i] & 0xFFFF)
+        };
+        // Its top, the sun on its back: half of the sun comes through, on both halves (red is
+        // 1 linear); the slab over the left half adds only a little light bounced back down.
+        let (w, h) = (tile[2], tile[3]);
+        let open = at(w * 7 / 8, h / 2);
+        let under = at(w / 8, h / 2);
+        assert!((open - through).abs() < 0.05, "open {open}");
+        assert!(under >= open - 0.05 && under < open + 0.15, "under the slab {under}, open {open}");
+    }
+
+    #[test]
     fn screen_probes_light_the_open_floor_with_the_sky_and_the_shaded_floor_less_and_reflections_see_them() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
@@ -4026,7 +4169,10 @@ mod test {
         fill(&normal, &[128, 255, 128, 255]);
         let inverse = [[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, -2.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
         let forward = [[0.5, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, -0.5, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
-        let frame = ProbeFrame { depth: &depth, normal: &normal, view_projection: forward, inverse_view_projection: inverse, target: &target };
+        // Rough, nothing through.
+        let material = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        fill(&material, &[0, 255, 255, 255]);
+        let frame = ProbeFrame { depth: &depth, normal: &normal, material: &material, view_projection: forward, inverse_view_projection: inverse, target: &target };
         // Every probe of the cache traced once (64 grids' worth of slots at its budget a frame),
         // then the screen probes, a few frames over.
         let eye = [0.0, 3.0, 0.0];
@@ -4053,14 +4199,13 @@ mod test {
 
         // Reflections, the floor a mirror: in the open it reflects the sky straight above, under
         // the slab the slab's dark underside.
-        let material = texture(wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let reflected = texture(REFLECTIONS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let mut reflections = Reflections::new(&device).expect("can trace");
         let mut reflect = |reflections: &mut Reflections, scene: &mut TraceScene, cache: &mut SurfaceCache, light: &mut SurfaceLight, frames| {
             for _ in 0..frames {
                 let mut encoder = device.create_command_encoder(&Default::default());
                 probes.record(&device, &mut encoder, scene, &pool, cache, light, &radiance, &sunlight, &frame);
-                reflections.record(&device, &mut encoder, scene, &pool, cache, light, &radiance, &sunlight, &frame, &material, &reflected);
+                reflections.record(&device, &mut encoder, scene, &pool, cache, light, &radiance, &sunlight, &frame, &reflected);
                 queue.submit([encoder.finish()]);
             }
             let seen = texels(&device, &queue, &reflected, wgpu::TextureAspect::All, 8);
@@ -4076,6 +4221,15 @@ mod test {
         fill(&material, &[0, 255, 255, 255]);
         let [open_rough, shaded_rough, open_gathered, shaded_gathered] = reflect(&mut reflections, &mut scene, &mut cache, &mut light, 1);
         assert_eq!([open_rough, shaded_rough], [open_gathered, shaded_gathered]);
+
+        // The floor a leaf, all the light on its back coming through: the probes on it gather from
+        // all round, and it is lit by the sky above and, through it, the sky below - twice as much
+        // in the open; under the slab, it still has the sky below.
+        fill(&material, &[0, 255, 255, 0]);
+        let [_, _, open_leaf, shaded_leaf] = reflect(&mut reflections, &mut scene, &mut cache, &mut light, 12);
+        assert!(open_leaf > 1.8 && open_leaf < 2.1, "leaf in the open {open_leaf}, open {open}");
+        assert!(shaded_leaf > 0.9 && shaded_leaf < shaded + 1.25, "leaf under the slab {shaded_leaf}, shaded {shaded}");
+        fill(&material, &[0, 255, 255, 255]);
 
         // The sky put out, the cache left as it was: a ray leaving the screen probes' reach takes
         // its light from the cache, so the open floor still gathers the sky the cache saw.

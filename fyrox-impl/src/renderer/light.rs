@@ -816,6 +816,7 @@ impl DeferredLightRenderer {
                         scene,
                         depth: gbuffer_depth_map,
                         normals: gbuffer_normal_map,
+                        materials: gbuffer_material_map,
                         inv_view_projection,
                         light,
                         light_radius,

@@ -183,6 +183,18 @@ prefixes. The method follows the published description of Lumen cited above.
    it costs 0.05 ms: the forest has almost nothing smoother than 0.4, so what shows is shaded
    surfaces no longer reflecting the flat ambient colour.
 
+Light through leaves (since): a material's `MaterialParams::transmission` - how much of the light
+on its back comes through - is written into the G-Buffer's material alpha as one minus it (the
+engine's own shaders write 1). The sun's light pass adds that share of the light on a leaf's back
+(the traced shadow's rays then start off the leaf's sunlit side; `LightShadowTraceContext` carries
+the material texture for it); lighting the cards does the same with its shadow ray, and its ray of
+indirect light goes out the back a share of the time; a screen probe on a leaf gathers from the
+whole sphere, and a leaf's pixel adds its share of the light from behind (probes keep history only
+from probes of their own kind). fyrox-gfx gives every cutout material 0.5 (`LEAF_TRANSMISSION`), so
+crowns seen from below are lit through rather than dark. GPU-tested: a card with half let through,
+the sun straight below it, gives off half its colour on top; a leaf floor under a sky of 1 gathers
+2 in the open.
+
 ## Order
 
 Virtual geometry 1 to 4 first: that is where the frame time goes. GI follows once the visibility

@@ -70,7 +70,8 @@ struct Material {
     metallicChannel: u32,
     roughnessChannel: u32,
     slot: u32,
-    pad0: u32,
+    // How much light comes through from behind: the material alpha is one minus it.
+    transmission: f32,
 };
 
 // A vertex is this many floats: position, normal, texture coordinates, tangent.
@@ -195,7 +196,7 @@ fn fs_main(input: VertexOutput) -> GBufferOutput {
     output.outMaterial.x = material.metallicFactor * channel(textureSample(metallicTexture, metallicSampler, tc), material.metallicChannel);
     output.outMaterial.y = material.roughnessFactor * channel(textureSample(roughnessTexture, roughnessSampler, tc), material.roughnessChannel);
     output.outMaterial.z = textureSample(aoTexture, aoSampler, tc).r;
-    output.outMaterial.w = 1.0;
+    output.outMaterial.w = 1.0 - material.transmission;
     output.outAmbient = vec4f(material.emissionStrength * textureSample(emissionTexture, emissionSampler, tc).rgb, 1.0);
     output.outDecalMask = material.layerIndex;
     return output;

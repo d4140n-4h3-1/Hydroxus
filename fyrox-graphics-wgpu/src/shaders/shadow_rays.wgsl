@@ -63,6 +63,8 @@ struct Uniforms {
 @group(0) @binding(2) var depthSampler: sampler;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
 @group(0) @binding(4) var sceneNormal: texture_2d<f32>;
+// Metallic, roughness, occlusion; alpha one minus how much light comes through from behind.
+@group(0) @binding(8) var sceneMaterial: texture_2d<f32>;
 
 // A triangle covering the screen, from the vertex index alone.
 @vertex
@@ -192,7 +194,7 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     // itself - differently with every small move of the camera, so distant walls would flicker.
     // The offset covers that uncertainty as well.
     let normal = normalize(textureLoad(sceneNormal, pixel, 0).xyz * 2.0 - 1.0);
-    let origin = position + normal * (uniforms.bias + position_error(uv, depth, position));
+    var origin = position + normal * (uniforms.bias + position_error(uv, depth, position));
 
     // Where the middle of the light is, seen from here.
     var toLight = -normalize(uniforms.lightDirection);
@@ -205,9 +207,14 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
         }
         toLight = offset / distance;
     }
-    // Facing away from the light: it lights nothing here whatever the rays would say.
+    // Facing away from the light: it lights nothing here whatever the rays would say - unless
+    // light comes through it from behind (a leaf), when the rays start off its other side, the
+    // side the light falls on.
     if (dot(normal, toLight) <= 0.0) {
-        return vec4f(0.0, 0.0, 0.0, 1.0);
+        if (textureLoad(sceneMaterial, pixel, 0).a > 0.99) {
+            return vec4f(0.0, 0.0, 0.0, 1.0);
+        }
+        origin = position - normal * (uniforms.bias + position_error(uv, depth, position));
     }
 
     let count = max(uniforms.sampleCount, 1u);

@@ -120,7 +120,10 @@
             fragment_shader:
                 r#"
                     @fragment fn fs_main(@location(0) tex_coord: vec2f) -> @location(0) vec4f {
-                        let material = textureSample(materialTexture_tex, materialTexture_samp, tex_coord).rgb;
+                        let material_texel = textureSample(materialTexture_tex, materialTexture_samp, tex_coord);
+                        let material = material_texel.rgb;
+                        // How much light comes through from behind (leaves): one minus the alpha.
+                        let transmission = 1.0 - material_texel.a;
 
                         let fragment_position = S_UnProject(vec3f(tex_coord, textureSample(depthTexture_tex, depthTexture_samp, tex_coord)), properties.invViewProj);
                         let diffuse_color = textureSample(colorTexture_tex, colorTexture_samp, tex_coord);
@@ -134,7 +137,10 @@
                         ctx.roughness = material.y;
                         ctx.viewVector = normalize(properties.cameraPosition - fragment_position);
 
-                        let lighting = S_PBR_CalculateLight(ctx);
+                        // The light falling on the back of what lets it through, coloured by it as
+                        // what it reflects is.
+                        let through = ctx.albedo / 3.14159265 * ctx.lightColor * transmission * max(-dot(ctx.fragmentNormal, ctx.fragmentToLight), 0.0);
+                        let lighting = S_PBR_CalculateLight(ctx) + through;
 
                         let fragment_z_view_space = abs((properties.viewMatrix * vec4f(fragment_position, 1.0)).z);
 

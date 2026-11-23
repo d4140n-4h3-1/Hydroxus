@@ -49,7 +49,8 @@ struct Material {
     metallicChannel: u32,
     roughnessChannel: u32,
     slot: u32,
-    pad0: u32,
+    // How much light comes through from behind: the material alpha is one minus it.
+    transmission: f32,
 };
 
 struct Resolve {
@@ -208,7 +209,7 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> GBufferOutput {
     output.outMaterial.y = material.roughnessFactor
         * channel(textureSampleGrad(textures[base + 3u], textureSampler, tc, dx, dy), material.roughnessChannel);
     output.outMaterial.z = textureSampleGrad(textures[base + 4u], textureSampler, tc, dx, dy).r;
-    output.outMaterial.w = 1.0;
+    output.outMaterial.w = 1.0 - material.transmission;
     output.outAmbient = vec4f(
         material.emissionStrength * textureSampleGrad(textures[base + 5u], textureSampler, tc, dx, dy).rgb,
         1.0,

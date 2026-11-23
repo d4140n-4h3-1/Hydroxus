@@ -711,6 +711,8 @@ const HISTORY_SHADER: &str = include_str!("shaders/shadow_history.wgsl");
 const SHADER: &str = include_str!("shaders/shadow_rays.wgsl");
 /// Where the shadow rays' shader binds the scene's cutouts from (see [`cutout_wgsl`]).
 const SHADOW_CUTOUT_BINDING: u32 = 5;
+/// Where the shadow rays' pass binds the G-Buffer's material texture (after the cutouts' three).
+const SHADOW_MATERIAL_BINDING: u32 = 8;
 
 /// The shadow rays' shader, with what reads the scene's cutouts.
 fn shadow_rays_source() -> String {
@@ -1231,6 +1233,7 @@ impl WgpuGraphicsServer {
                 cutouts[0].clone(),
                 cutouts[1].clone(),
                 cutouts[2].clone(),
+                texture_entry(SHADOW_MATERIAL_BINDING, non_filtering),
             ],
         });
         let pipeline = mask_pipeline(device, "ShadowRays", &shadow_rays_source(), &layout);
@@ -1424,6 +1427,7 @@ impl ShadowTracer {
         scene: &RayTracedScene,
         depth: &GpuTexture,
         normals: &GpuTexture,
+        materials: &GpuTexture,
         parameters: ShadowRayParameters,
     ) -> Result<Option<GpuTexture>, FrameworkError> {
         let GpuTextureKind::Rectangle { width, height } = depth.kind() else {
@@ -1475,9 +1479,10 @@ impl ShadowTracer {
             None => None,
         };
 
-        let (Some(depth), Some(normals), Some(target)) = (
+        let (Some(depth), Some(normals), Some(materials), Some(target)) = (
             depth.as_any().downcast_ref::<WgpuTexture>(),
             normals.as_any().downcast_ref::<WgpuTexture>(),
+            materials.as_any().downcast_ref::<WgpuTexture>(),
             mask.as_any().downcast_ref::<WgpuTexture>(),
         ) else {
             return Ok(None);
@@ -1577,6 +1582,10 @@ impl ShadowTracer {
                 cutouts[0].clone(),
                 cutouts[1].clone(),
                 cutouts[2].clone(),
+                wgpu::BindGroupEntry {
+                    binding: SHADOW_MATERIAL_BINDING,
+                    resource: wgpu::BindingResource::TextureView(materials.wgpu_view()),
+                },
             ],
         });
 

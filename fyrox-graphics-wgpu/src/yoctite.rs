@@ -1792,8 +1792,10 @@ pub struct MaterialParams {
     /// The material's slot, which its instances are numbered with (see
     /// [`GpuInstance::material`]). Filled in by [`GBufferDrawer::draw`].
     pub slot: u32,
-    /// To a multiple of sixteen bytes.
-    pub _padding: u32,
+    /// How much of the light falling on its back comes through it, 0 to 1: leaves and other thin
+    /// things. Written into the G-Buffer's material alpha as one minus it (the renderer's own
+    /// shaders write 1, nothing through), where the sun's light pass and Candelite read it.
+    pub transmission: f32,
 }
 
 impl Default for MaterialParams {
@@ -1808,7 +1810,7 @@ impl Default for MaterialParams {
             metallic_channel: 0,
             roughness_channel: 0,
             slot: 0,
-            _padding: 0,
+            transmission: 0.0,
         }
     }
 }
