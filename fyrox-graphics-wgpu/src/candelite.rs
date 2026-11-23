@@ -1652,8 +1652,10 @@ pub const CACHE_SPACING: f32 = 2.0;
 pub const CACHE_BUDGET: usize = 256;
 /// How far the cache's probes' rays reach, at most, in meters: past it, the sky.
 pub const CACHE_REACH: f32 = 64.0;
-/// How far a screen probe's ray is traced, in meters, before the cache is asked what lies beyond.
-pub const SCREEN_REACH: f32 = 8.0;
+/// How far a screen probe's (or reflection's) ray is traced, in meters, before the cache is asked
+/// what lies beyond: rays through leaves near by are what cost; 8 m cost the probes 40% more for
+/// light within a level of 255 of the same.
+pub const SCREEN_REACH: f32 = 4.0;
 const CACHE_PROBES: u32 = CACHE_SIZE * CACHE_SIZE * CACHE_SIZE;
 
 /// Directions as octahedral maps, and sampling the world radiance cache: for shaders including
@@ -2109,6 +2111,14 @@ impl RadianceCache {
     }
 }
 
+/// How many rays a screen probe traces a frame (a multiple of 8). 64 cost three times as much
+/// for light within a level of 255 of the same, the probes' history and the frames' anti-aliasing
+/// averaging the rest.
+pub const PROBE_RAYS: u32 = 32;
+/// Over how many frames a screen probe's light is averaged, at most: more than with twice the rays,
+/// to keep it as still.
+pub const PROBE_HISTORY: f32 = 20.0;
+
 /// How many pixels apart screen probes are, each way.
 pub const PROBE_SPACING: u32 = 16;
 /// The format [`ScreenProbes`] draws the light between surfaces in: per pixel, what to light it
@@ -2185,18 +2195,16 @@ fn probes_pcg(v: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
-var<workgroup> gatheredR: array<vec4f, 64>;
-var<workgroup> gatheredG: array<vec4f, 64>;
-var<workgroup> gatheredB: array<vec4f, 64>;
+var<workgroup> gatheredR: array<vec4f, PROBE_RAYS>;
+var<workgroup> gatheredG: array<vec4f, PROBE_RAYS>;
+var<workgroup> gatheredB: array<vec4f, PROBE_RAYS>;
 
-// Over how many frames a probe's light is averaged, at most.
-const PROBE_HISTORY: f32 = 12.0;
 
 // A probe a workgroup, a ray a lane: placed on what is seen at a pixel of its 16 by 16 tile, a
-// different one each frame; its 64 rays spread evenly over the hemisphere about its normal,
+// different one each frame; its PROBE_RAYS rays spread evenly over the hemisphere about its normal,
 // turned each frame; what each brings back projected onto the harmonics; then averaged with what
 // the probe there saw last frame, if it is on the same surface.
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(8, PROBE_ROWS)
 fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) local: vec3u, @builtin(local_invocation_index) lane: u32) {
     let index = group.y * probes.grid.x + group.x;
     let seed = probes_pcg(index * 9781u + probes.frame * 6271u);
@@ -2215,7 +2223,7 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
     if (on_something) {
         let turn = probes_pcg(seed ^ lane);
         let u1 = (f32(local.x) + f32(turn & 0xFFFFu) / 65536.0) / 8.0;
-        let u2 = (f32(local.y) + f32(turn >> 16u) / 65536.0) / 8.0;
+        let u2 = (f32(local.y) + f32(turn >> 16u) / 65536.0) / f32(PROBE_ROWS);
         // Uniform over the hemisphere: up the normal by u1, round it by u2; on a leaf, over the
         // sphere.
         let up = select(u1, u1 * 2.0 - 1.0, leaf);
@@ -2244,7 +2252,7 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
             }
         }
         // Each ray stands for 2 pi / 64 of the hemisphere (4 pi / 64 of the sphere).
-        let basis = vec4f(0.282095, 0.488603 * direction.y, 0.488603 * direction.z, 0.488603 * direction.x) * (select(6.2831853, 12.5663706, leaf) / 64.0);
+        let basis = vec4f(0.282095, 0.488603 * direction.y, 0.488603 * direction.z, 0.488603 * direction.x) * (select(6.2831853, 12.5663706, leaf) / f32(PROBE_RAYS));
         r = basis * light.r;
         g = basis * light.g;
         b = basis * light.b;
@@ -2262,7 +2270,7 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
         current[index] = probe;
         return;
     }
-    for (var i = 0u; i < 64u; i++) {
+    for (var i = 0u; i < PROBE_RAYS; i++) {
         probe.r += gatheredR[i];
         probe.g += gatheredG[i];
         probe.b += gatheredB[i];
@@ -2373,7 +2381,7 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
 
 /// Candelite's final gather: the light between surfaces brought to every pixel, after Lumen's
 /// screen probes. A probe is placed every [`PROBE_SPACING`] pixels each way, on what the screen
-/// sees there (a different pixel of its tile each frame); it traces 64 rays over the hemisphere
+/// sees there (a different pixel of its tile each frame); it traces [`PROBE_RAYS`] rays over the hemisphere
 /// about its normal against the lit cards ([`SurfaceLight`]), and keeps what they bring back as
 /// spherical harmonics, averaged with what the probe there saw last frame if it is on the same
 /// surface. Each pixel is then lit from the probes round it on its surface, at its own normal:
@@ -2456,7 +2464,8 @@ impl ScreenProbes {
             label: Some("CandeliteProbes"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{PROBES_COMMON}\n{CACHE_COMMON}\n{CACHE_SAMPLE}\nconst SCREEN_REACH: f32 = {SCREEN_REACH:?};\n{PROBES_TRACE}"
+                    "enable wgpu_ray_query;\n{LOOKUP_WGSL}\n{PROBES_COMMON}\n{CACHE_COMMON}\n{CACHE_SAMPLE}\nconst SCREEN_REACH: f32 = {SCREEN_REACH:?};\nconst PROBE_RAYS: u32 = {PROBE_RAYS}u;\nconst PROBE_ROWS: u32 = {}u;\nconst PROBE_HISTORY: f32 = {PROBE_HISTORY:?};\n{PROBES_TRACE}",
+                    PROBE_RAYS / 8
                 )
                 .into(),
             ),

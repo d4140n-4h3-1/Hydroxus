@@ -138,7 +138,7 @@ prefixes. The method follows the published description of Lumen cited above.
    Lamps are still to come. Known: a mesh as big as the ground gets coarse cards (its shadows in
    metre-wide blocks), and some flowering bushes are hits no card saw (magenta since phase 2).
 4. **Screen probes** - done (`ScreenProbes`): a probe every 16 pixels each way, placed on what
-   the G-Buffer sees at a pixel of its tile (a different one each frame), traces 64 rays spread
+   the G-Buffer sees at a pixel of its tile (a different one each frame), traces 64 rays (32 since) spread
    evenly over the hemisphere about its normal (turned each frame) against the lit cards, keeps
    what they bring back as L1 spherical harmonics, and is averaged (up to 12 frames) with last
    frame's probe where it reprojects, if that lay on the same surface. Each pixel is lit from its
@@ -156,7 +156,7 @@ prefixes. The method follows the published description of Lumen cited above.
    octahedral map, averaged over frames. The grids move with the eye a cell at a time (slots wrap
    round), slots handed new cells traced first, the rest in a scrambled turn, 256 probes a frame;
    a probe whose rays mostly hit the backs of things is inside something and is not used. Screen
-   probes trace 8 m (`SCREEN_REACH`) and take the light from beyond from the 8 probes round the
+   probes trace 8 m (`SCREEN_REACH`; 4 m since) and take the light from beyond from the 8 probes round the
    ray's end in the finest grid holding it, else trace on. GPU-tested: with the sky put out after
    the cache saw it, open floor still gathers the sky from the cache.
    What made it affordable, and kept frames from stalling: cache rays end at 64 m or 16 cells; a
@@ -194,6 +194,11 @@ whatever the budgets, and went with instances under 1 m (`TRACE_LEAST`, half the
 bounds) left out of what Candelite traces - rays starting near the ground crossing dense patches of
 grass, ferns and small bushes. Walking, the GPU now takes 14-18 ms, and the longest frame a second
 is the 35 ms of two fixed updates, as without Candelite.
+
+Cheaper screen probes (since): 32 rays a probe (`PROBE_RAYS`) averaged over up to 20 frames
+(`PROBE_HISTORY`), traced 4 m (`SCREEN_REACH`) before the radiance cache: walking, the screen
+probes 7.5 ms to 2.6 ms of GPU time, the frame 37.8 to 48.8 FPS; the light within about a level of
+255 of the same, a little more shimmer in deep shade.
 
 Light through leaves (since): a material's `MaterialParams::transmission` - how much of the light
 on its back comes through - is written into the G-Buffer's material alpha as one minus it (the
