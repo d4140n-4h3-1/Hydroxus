@@ -207,6 +207,10 @@ pub struct RenderDataContainer {
     /// for environment maps.
     pub need_recalculate_convolution: bool,
 
+    /// The nodes of the scene's graph the walk for render data visits, kept in step with the
+    /// graph: see [`bundle::GraphRenderNodes`].
+    pub render_nodes: bundle::GraphRenderNodes,
+
     /// Screen space ambient occlusion renderer.
     pub ssao_renderer: ScreenSpaceAmbientOcclusionRenderer,
 
@@ -311,6 +315,7 @@ impl RenderDataContainer {
 
         Ok(Self {
             need_recalculate_convolution: true,
+            render_nodes: Default::default(),
             environment_map_specular_convolution: Default::default(),
             environment_map_irradiance_convolution: EnvironmentMapIrradianceConvolution::new(
                 server, 32,
@@ -1188,6 +1193,7 @@ impl Renderer {
             },
             &mut self.dynamic_surface_cache,
             skipped,
+            Some(&mut render_data.render_nodes),
         );
         drop(taken_over);
         if observer.reflection_probe_data.is_some() {

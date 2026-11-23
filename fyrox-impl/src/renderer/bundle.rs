@@ -72,7 +72,7 @@ use crate::{
         mesh::{
             buffer::{TriangleBufferRefMut, VertexAttributeDescriptor, VertexBufferRefMut},
             surface::SurfaceResource,
-            RenderPath,
+            BatchingMode, Mesh, RenderPath,
         },
         node::{Node, NodeTrait, RdcControlFlow},
         probe::ReflectionProbe,
@@ -892,6 +892,131 @@ impl Default for RenderDataBundleStorageOptions {
     }
 }
 
+/// The nodes of a scene's graph the walk for render data needs, kept in step with the graph's
+/// change journal (see [`Graph::changes_since`]) rather than found by visiting every node every
+/// frame - in a scene of tens of thousands of nodes, most of them drawn by something else or
+/// drawing nothing, that walk took milliseconds. See
+/// [`RenderDataBundleStorage::from_graph_skipping`].
+#[derive(Default, Debug)]
+pub struct GraphRenderNodes {
+    /// How far into the journal they have been kept; [`None`] before the first look.
+    cursor: Option<u64>,
+    /// Nodes of a kind that may give render data: every kind but those known never to.
+    drawable: FxHashSet<Handle<Node>>,
+    lights: FxHashSet<Handle<Node>>,
+    probes: FxHashSet<Handle<Node>>,
+    lod_groups: FxHashSet<Handle<Node>>,
+    /// Meshes batching their descendants statically, which then give no render data of their own.
+    batching: FxHashSet<Handle<Node>>,
+    /// Where the look over a slice of every slot a frame has got to: it catches changes the
+    /// journal does not record (made through reflection).
+    sweep: u32,
+}
+
+impl GraphRenderNodes {
+    /// How many of the graph's slots are looked at again each frame besides those the journal names.
+    const SWEEP: u32 = 256;
+
+    fn classify(&mut self, graph: &Graph, handle: Handle<Node>) {
+        self.drawable.remove(&handle);
+        self.lights.remove(&handle);
+        self.probes.remove(&handle);
+        self.lod_groups.remove(&handle);
+        self.batching.remove(&handle);
+        let Ok(node) = graph.try_get_node(handle) else {
+            return;
+        };
+        let (light, probe) = light_or_probe(node);
+        if light {
+            self.lights.insert(handle);
+        }
+        if probe {
+            self.probes.insert(handle);
+        }
+        if node.lod_group().is_some() {
+            self.lod_groups.insert(handle);
+        }
+        if node
+            .cast::<Mesh>()
+            .is_some_and(|mesh| mesh.batching_mode() == BatchingMode::Static)
+        {
+            self.batching.insert(handle);
+        }
+        if may_draw(node) {
+            self.drawable.insert(handle);
+        }
+    }
+
+    /// Brings them up to date with `graph`: from its journal, or every node afresh when the
+    /// journal no longer reaches back to the last look.
+    pub fn update(&mut self, graph: &Graph) {
+        match self.cursor.and_then(|cursor| graph.changes_since(cursor)) {
+            Some(changes) => {
+                for &handle in changes {
+                    self.classify(graph, handle);
+                }
+                let capacity = graph.capacity();
+                for _ in 0..Self::SWEEP.min(capacity) {
+                    self.sweep = (self.sweep + 1) % capacity.max(1);
+                    let handle = graph.handle_from_index(self.sweep);
+                    if handle.is_some() {
+                        self.classify(graph, handle);
+                    }
+                }
+            }
+            None => {
+                *self = Self::default();
+                let handles: Vec<Handle<Node>> = graph.pair_iter().map(|(handle, _)| handle).collect();
+                for handle in handles {
+                    self.classify(graph, handle);
+                }
+            }
+        }
+        self.cursor = Some(graph.changes_end());
+    }
+}
+
+/// Whether a node is of a kind that may give render data: every kind but the built-in ones that
+/// never do - pivots, physics, cameras, lights, sound, probes - so a kind of the game's own is
+/// always asked.
+fn may_draw(node: &Node) -> bool {
+    use crate::scene::{
+        camera::Camera, collider::Collider, dim2, joint::Joint, pivot::Pivot, rigidbody::RigidBody,
+        sound::{listener::Listener, Sound},
+    };
+    !(node.cast::<Pivot>().is_some()
+        || node.cast::<Collider>().is_some()
+        || node.cast::<RigidBody>().is_some()
+        || node.cast::<Joint>().is_some()
+        || node.cast::<dim2::collider::Collider>().is_some()
+        || node.cast::<dim2::rigidbody::RigidBody>().is_some()
+        || node.cast::<dim2::joint::Joint>().is_some()
+        || node.cast::<Camera>().is_some()
+        || node.cast::<PointLight>().is_some()
+        || node.cast::<SpotLight>().is_some()
+        || node.cast::<DirectionalLight>().is_some()
+        || node.cast::<Sound>().is_some()
+        || node.cast::<Listener>().is_some()
+        || node.cast::<ReflectionProbe>().is_some())
+}
+
+/// Whether a node is, or has a field that is, a [`BaseLight`], and a [`ReflectionProbe`]: asked
+/// once a concrete type (see [`LIGHT_OR_PROBE`]).
+fn light_or_probe(node: &Node) -> (bool, bool) {
+    LIGHT_OR_PROBE.with(|known| {
+        let inner = node.inner_ref();
+        *known
+            .borrow_mut()
+            .entry((inner as &dyn std::any::Any).type_id())
+            .or_insert_with(|| {
+                (
+                    node.self_or_field_ref::<BaseLight>().is_some(),
+                    node.self_or_field_ref::<ReflectionProbe>().is_some(),
+                )
+            })
+    })
+}
+
 thread_local! {
     /// By the concrete type of a node: whether it is or has a field that is a [`BaseLight`], and
     /// a [`ReflectionProbe`]. See [`RenderDataBundleStorage::from_graph_skipping`].
@@ -931,12 +1056,14 @@ impl RenderDataBundleStorage {
             options,
             dynamic_surface_cache,
             None,
+            None,
         )
     }
 
     /// As [`Self::from_graph`], but leaving out the render data of the nodes in `skip` - those
     /// another renderer draws itself (see [`crate::renderer::Renderer::set_taken_over_meshes`]).
-    /// Their children are still visited.
+    /// Their children are still visited. Given `nodes`, kept from frame to frame for this graph,
+    /// only the nodes it lists are visited (see [`GraphRenderNodes`]), not every node of the graph.
     #[allow(clippy::too_many_arguments)]
     pub fn from_graph_skipping(
         graph: &Graph,
@@ -947,9 +1074,15 @@ impl RenderDataBundleStorage {
         options: RenderDataBundleStorageOptions,
         dynamic_surface_cache: &mut DynamicSurfaceCache,
         skip: Option<&FxHashSet<Handle<Node>>>,
+        mut nodes: Option<&mut GraphRenderNodes>,
     ) -> Self {
-        // Aim for the worst-case scenario when every node has unique render data.
-        let capacity = graph.node_count() as usize;
+        if let Some(nodes) = nodes.as_deref_mut() {
+            nodes.update(graph);
+        }
+        // Aim for the worst-case scenario when every node visited has unique render data.
+        let capacity = nodes
+            .as_deref()
+            .map_or(graph.node_count() as usize, |nodes| nodes.drawable.len());
         let mut storage = Self {
             bundle_map: FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher::default()),
             observer_position: observer_position.clone(),
@@ -965,23 +1098,27 @@ impl RenderDataBundleStorage {
         .unwrap_or_default();
 
         let mut lod_filter = vec![true; graph.capacity() as usize];
-        for (node_handle, node) in graph.pair_iter() {
+        let mut lod_hides = false;
+        // The nodes with a level-of-detail group, lights and reflection probes: those listed, or
+        // every node.
+        let first: Vec<Handle<Node>> = match nodes.as_deref() {
+            Some(nodes) => {
+                let mut set: FxHashSet<Handle<Node>> = nodes.lod_groups.clone();
+                set.extend(nodes.lights.iter().copied());
+                set.extend(nodes.probes.iter().copied());
+                set.into_iter().collect()
+            }
+            None => graph.pair_iter().map(|(handle, _)| handle).collect(),
+        };
+        for node_handle in first {
+            let Ok(node) = graph.try_get_node(node_handle) else {
+                continue;
+            };
             // Whether this kind of node is, or has a field that is, a light or a reflection probe:
             // finding out walks its fields by reflection, which for every node of a big scene
             // took milliseconds a frame, yet a type's fields never change - so it is asked once
             // a type.
-            let (may_be_light, may_be_probe) = LIGHT_OR_PROBE.with(|known| {
-                let inner = node.inner_ref();
-                *known
-                    .borrow_mut()
-                    .entry((inner as &dyn std::any::Any).type_id())
-                    .or_insert_with(|| {
-                        (
-                            node.self_or_field_ref::<BaseLight>().is_some(),
-                            node.self_or_field_ref::<ReflectionProbe>().is_some(),
-                        )
-                    })
-            });
+            let (may_be_light, may_be_probe) = light_or_probe(node);
             if let Some(lod_group) = node.lod_group() {
                 for level in lod_group.levels.iter() {
                     for &object in level.objects.iter() {
@@ -995,6 +1132,7 @@ impl RenderDataBundleStorage {
                             let visible = normalized_distance >= level.begin()
                                 && normalized_distance <= level.end();
                             lod_filter[object.index() as usize] = visible;
+                            lod_hides |= !visible;
                         }
                     }
                 }
@@ -1094,7 +1232,40 @@ impl RenderDataBundleStorage {
             }
         }
 
-        iterate_recursive(graph.root(), graph, &lod_filter, skip, &mut ctx);
+        match nodes.as_deref() {
+            None => iterate_recursive(graph.root(), graph, &lod_filter, skip, &mut ctx),
+            Some(nodes) => {
+                // Only the nodes that may give render data; as the walk down from the root would
+                // leave out those hidden by a level of detail, and those below a mesh batching
+                // them statically (unless another renderer draws that mesh), so are they.
+                let skipped = |handle: &Handle<Node>| skip.is_some_and(|skip| skip.contains(handle));
+                for &handle in &nodes.drawable {
+                    if skipped(&handle) || !lod_filter[handle.index() as usize] {
+                        continue;
+                    }
+                    let Ok(node) = graph.try_get_node(handle) else {
+                        continue;
+                    };
+                    if lod_hides || !nodes.batching.is_empty() {
+                        let mut ancestor = node.parent();
+                        let mut hidden = false;
+                        while let Ok(above) = graph.try_get_node(ancestor) {
+                            if !lod_filter[ancestor.index() as usize]
+                                || (nodes.batching.contains(&ancestor) && !skipped(&ancestor))
+                            {
+                                hidden = true;
+                                break;
+                            }
+                            ancestor = above.parent();
+                        }
+                        if hidden {
+                            continue;
+                        }
+                    }
+                    node.collect_render_data(&mut ctx);
+                }
+            }
+        }
 
         storage.sort();
 

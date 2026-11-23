@@ -822,12 +822,14 @@ impl Base {
     /// Sets new lod group.
     #[inline]
     pub fn set_lod_group(&mut self, lod_group: Option<LodGroup>) -> Option<LodGroup> {
+        self.mark_content_changed();
         std::mem::replace(self.lod_group.get_value_mut_and_mark_modified(), lod_group)
     }
 
     /// Extracts lod group, leaving None in the node.
     #[inline]
     pub fn take_lod_group(&mut self) -> Option<LodGroup> {
+        self.mark_content_changed();
         std::mem::take(self.lod_group.get_value_mut_and_mark_modified())
     }
 
@@ -840,6 +842,7 @@ impl Base {
     /// Returns mutable reference to current lod group.
     #[inline]
     pub fn lod_group_mut(&mut self) -> Option<&mut LodGroup> {
+        self.mark_content_changed();
         self.lod_group.get_value_mut_and_mark_modified().as_mut()
     }
 

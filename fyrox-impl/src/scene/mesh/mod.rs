@@ -600,6 +600,7 @@ impl Mesh {
     /// work with meshes that have skin or blend shapes. Such meshes will be drawn in a separate draw
     /// call.
     pub fn set_batching_mode(&mut self, mode: BatchingMode) -> BatchingMode {
+        self.base.mark_content_changed();
         if let BatchingMode::None | BatchingMode::Dynamic = mode {
             // Destroy batched data.
             std::mem::take(&mut self.batch_container);
