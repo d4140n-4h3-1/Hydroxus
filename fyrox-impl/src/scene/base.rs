@@ -285,6 +285,8 @@ pub(crate) enum NodeMessageKind {
     /// What the node is changed, not where: a mesh's surfaces or blend shape weights, say. Only
     /// recorded in the graph's change journal (see [`super::graph::Graph::changes_since`]).
     ContentChanged,
+    /// Only a mesh's blend shape weights: recorded as such.
+    WeightsChanged,
 }
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
@@ -547,6 +549,13 @@ impl Base {
     /// the graph (see [`super::graph::Graph::changes_since`]). Taken in at the next graph update.
     pub fn mark_content_changed(&self) {
         self.notify(self.self_handle, NodeMessageKind::ContentChanged);
+    }
+
+    /// As [`Self::mark_content_changed`], for a change only to a mesh's blend shape weights -
+    /// recorded as such ([`super::graph::NodeChange::Weights`]), which those that care only
+    /// where the weights show can pass over.
+    pub fn mark_weights_changed(&self) {
+        self.notify(self.self_handle, NodeMessageKind::WeightsChanged);
     }
 
     fn notify(&self, node: Handle<Node>, kind: NodeMessageKind) {

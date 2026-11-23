@@ -510,7 +510,7 @@ impl Mesh {
 
     /// Returns a list of blend shapes.
     pub fn blend_shapes_mut(&mut self) -> &mut [BlendShape] {
-        self.base.mark_content_changed();
+        self.base.mark_weights_changed();
         self.blend_shapes.get_value_mut_and_mark_modified()
     }
 

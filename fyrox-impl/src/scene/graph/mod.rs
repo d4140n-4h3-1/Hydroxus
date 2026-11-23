@@ -180,11 +180,26 @@ pub struct Graph {
 /// How many graph updates back the change journal reaches (see [`Graph::changes_since`]).
 pub const JOURNAL_UPDATES: usize = 8;
 
+/// What changed about a node, as the change journal records it (see [`Graph::changes_since`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeChange {
+    /// Added, moved (or an ancestor moved), shown or hidden, enabled or disabled.
+    Placement,
+    /// What it is: see [`crate::scene::base::Base::mark_content_changed`].
+    Content,
+    /// Only its blend shape weights: see [`crate::scene::base::Base::mark_weights_changed`].
+    Weights,
+    /// Taken out of the graph.
+    Removed,
+}
+
 /// The nodes that changed, in the order they did, over the last [`JOURNAL_UPDATES`] updates: see
 /// [`Graph::changes_since`].
 #[derive(Default, Debug)]
 struct ChangeJournal {
     entries: Vec<Handle<Node>>,
+    /// What changed about each.
+    kinds: Vec<NodeChange>,
     /// Where `entries[0]` is, counted from the graph's first change.
     first: u64,
     /// Where each of the last updates started.
@@ -206,8 +221,14 @@ impl ChangeJournal {
         let drop = (keep_from - self.first) as usize;
         if drop > 0 {
             self.entries.drain(..drop);
+            self.kinds.drain(..drop);
             self.first = keep_from;
         }
+    }
+
+    fn push(&mut self, node: Handle<Node>, kind: NodeChange) {
+        self.entries.push(node);
+        self.kinds.push(kind);
     }
 }
 
@@ -500,6 +521,16 @@ impl Graph {
             return None;
         }
         Some(&journal.entries[(cursor - journal.first) as usize..])
+    }
+
+    /// What changed about each node [`Self::changes_since`] gives, in the same order; [`None`]
+    /// when it does.
+    pub fn change_kinds_since(&self, cursor: u64) -> Option<&[NodeChange]> {
+        let journal = &self.journal;
+        if cursor < journal.first || cursor > journal.end() {
+            return None;
+        }
+        Some(&journal.kinds[(cursor - journal.first) as usize..])
     }
 
     /// Where the change journal ends now: see [`Self::changes_since`].
@@ -1377,7 +1408,7 @@ impl Graph {
         let mut visited_flags = vec![Flags::NONE; self.pool.get_capacity() as usize];
         let mut roots = FxHashMap::default();
         // Every node changed, for the change journal (see `Self::changes_since`).
-        let mut changed = Vec::new();
+        let mut changed: Vec<(Handle<Node>, NodeChange)> = Vec::new();
 
         while let Ok(message) = self.message_receiver.try_recv() {
             let message_flag = match message.kind {
@@ -1385,7 +1416,11 @@ impl Graph {
                 NodeMessageKind::VisibilityChanged => Flags::VISIBILITY_CHANGED,
                 NodeMessageKind::EnabledFlagChanged => Flags::ENABLED_FLAG_CHANGED,
                 NodeMessageKind::ContentChanged => {
-                    changed.push(message.node);
+                    changed.push((message.node, NodeChange::Content));
+                    continue;
+                }
+                NodeMessageKind::WeightsChanged => {
+                    changed.push((message.node, NodeChange::Weights));
                     continue;
                 }
             };
@@ -1431,7 +1466,7 @@ impl Graph {
 
             traverse_recursive(self, message.node, &mut |h| {
                 visited_flags[h.index() as usize].insert(message_flag);
-                changed.push(h);
+                changed.push((h, NodeChange::Placement));
 
                 // Remove a descendant from the list of potential roots.
                 if h != message.node {
@@ -1446,7 +1481,9 @@ impl Graph {
             })
         }
 
-        self.journal.entries.extend(changed);
+        for (node, kind) in changed {
+            self.journal.push(node, kind);
+        }
 
         for (node, flags) in roots {
             if flags.contains(Flags::TRANSFORM_CHANGED) {
@@ -2176,7 +2213,7 @@ impl SceneGraph for Graph {
                 self.stack.push(child);
             }
 
-            self.journal.entries.push(handle);
+            self.journal.push(handle, NodeChange::Removed);
 
             // Remove associated entities.
             let mut node = self.pool.free(handle);
@@ -2352,12 +2389,18 @@ mod test {
         assert!(changed.contains(&parent.to_base()) && changed.contains(&child.to_base()));
         assert!(changed.contains(&mesh.to_base()));
         assert_eq!(changed.len(), 3);
+        // And what changed about each: the weights alone, for the mesh.
+        let kinds = graph.change_kinds_since(start).unwrap();
+        let of = |node: Handle<Node>| kinds[changed.iter().position(|&h| h == node).unwrap()];
+        assert_eq!(of(parent.to_base()), super::NodeChange::Placement);
+        assert_eq!(of(mesh.to_base()), super::NodeChange::Weights);
 
         // Taking a node out records it.
         let cursor = graph.changes_end();
         graph.remove_node(child);
         update(&mut graph);
         assert_eq!(graph.changes_since(cursor), Some(&[child.to_base()][..]));
+        assert_eq!(graph.change_kinds_since(cursor), Some(&[super::NodeChange::Removed][..]));
 
         // Past the updates it keeps, an old cursor is told to look at everything afresh.
         for _ in 0..super::JOURNAL_UPDATES + 1 {
