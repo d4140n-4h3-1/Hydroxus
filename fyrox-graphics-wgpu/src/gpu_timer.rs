@@ -41,6 +41,8 @@ pub struct GpuTimer {
     /// Each section's time added up over the frames timed since last asked, and how many.
     totals: RefCell<Vec<(&'static str, f64)>>,
     frames: Cell<u32>,
+    /// Each section's time in the latest frame to come back, kept until the next does.
+    latest: RefCell<Vec<(&'static str, f32)>>,
 }
 
 impl GpuTimer {
@@ -81,6 +83,7 @@ impl GpuTimer {
             period: queue.get_timestamp_period() as f64,
             totals: RefCell::new(Vec::new()),
             frames: Cell::new(0),
+            latest: RefCell::new(Vec::new()),
         })
     }
 
@@ -131,6 +134,7 @@ impl GpuTimer {
     pub fn collect(&self) {
         let mut slots = self.slots.borrow_mut();
         let mut totals = self.totals.borrow_mut();
+        let mut latest = self.latest.borrow_mut();
         for slot in slots.iter_mut().filter(|s| s.busy && s.mapped.load(Ordering::Acquire)) {
             let size = slot.labels.len() as u64 * 8;
             let stamps: Vec<u64> = {
@@ -141,8 +145,10 @@ impl GpuTimer {
             };
             slot.buffer.unmap();
             slot.busy = false;
+            latest.clear();
             for (k, label) in slot.labels.iter().enumerate().skip(1) {
                 let ms = stamps[k].saturating_sub(stamps[k - 1]) as f64 * self.period / 1.0e6;
+                latest.push((label, ms as f32));
                 match totals.iter_mut().find(|(l, _)| l == label) {
                     Some(total) => total.1 += ms,
                     None => totals.push((label, ms)),
@@ -150,6 +156,12 @@ impl GpuTimer {
             }
             self.frames.set(self.frames.get() + 1);
         }
+    }
+
+    /// The time of the section marked `label` in the latest frame whose timestamps have come
+    /// back (a frame or two ago), without disturbing [`Self::timings`]' averages.
+    pub fn latest(&self, label: &str) -> Option<f32> {
+        self.latest.borrow().iter().find(|(l, _)| *l == label).map(|(_, ms)| *ms)
     }
 
     /// Each section's time, averaged over the frames timed since last asked; see

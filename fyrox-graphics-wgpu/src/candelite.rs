@@ -467,6 +467,8 @@ struct Traced {
     _vertices: wgpu::Buffer,
     _indices: wgpu::Buffer,
     cutout: Option<(Vec<[f32; 2]>, Arc<CutoutMask>)>,
+    /// Half the diagonal of its bounds, in its own space.
+    radius: f32,
 }
 
 /// Where a mesh's cutout is, as the lookup reads it: by mesh slot, none wide for a solid mesh.
@@ -481,8 +483,16 @@ struct CutoutRecord {
     height: u32,
 }
 
+/// How big an instance must be to be traced against, in meters, half the diagonal of its bounds:
+/// smaller ones - grass, ferns, small bushes - are left out, as Lumen leaves out small objects.
+/// Rays from the cards, the cache and the screen probes start near the ground, and crossing
+/// their dense patches of cutout leaves some took tens of milliseconds, stalling frames while
+/// walking (8 k instances of Wilderness's 16 k are left; with 0.5 m, still the stalls).
+pub const TRACE_LEAST: f32 = 1.0;
+
 /// What Candelite traces rays against: every mesh of the pool given its triangles, and every
-/// instance placed in the pool, naming its slot (see the module's description).
+/// instance placed in the pool at least [`TRACE_LEAST`] big, naming its slot (see the module's
+/// description).
 pub struct TraceScene {
     meshes: HashMap<u32, Traced>,
     tlas: Option<wgpu::Tlas>,
@@ -493,6 +503,8 @@ pub struct TraceScene {
     /// The meshes' cutouts on the GPU - records by mesh slot, corners, masks - made afresh when
     /// a mesh comes or goes.
     cutouts: Option<[wgpu::Buffer; 3]>,
+    /// How big an instance must be to be traced against: see [`Self::set_least`].
+    least: f32,
 }
 
 impl Default for TraceScene {
@@ -510,6 +522,16 @@ impl TraceScene {
             capacity: 0,
             built: Vec::new(),
             cutouts: None,
+            least: TRACE_LEAST,
+        }
+    }
+
+    /// Leaves out of what is traced against every instance smaller than `meters`, half the
+    /// diagonal of its bounds ([`TRACE_LEAST`] at first; 0 keeps every one).
+    pub fn set_least(&mut self, meters: f32) {
+        if meters != self.least {
+            self.least = meters;
+            self.built.clear();
         }
     }
 
@@ -595,6 +617,10 @@ impl TraceScene {
                 _vertices: vertices,
                 _indices: index_buffer,
                 cutout,
+                radius: {
+                    let b = Bounds::of(positions.iter().copied());
+                    (0..3).map(|i| (b.max[i] - b.min[i]).powi(2)).sum::<f32>().sqrt() * 0.5
+                },
             },
         );
         self.built.clear();
@@ -665,9 +691,17 @@ impl TraceScene {
     /// Places a copy of its mesh for every instance placed in `pool` whose mesh it has, built
     /// into `encoder` if anything changed since last time. Whether there is anything to trace.
     pub fn update(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, pool: &GeometryPool) -> bool {
+        // Instances too small to matter to the light between surfaces are left out (see
+        // TRACE_LEAST).
         let placed: Vec<(u32, u32, [f32; 12])> = pool
             .placed()
-            .filter(|(_, record)| self.meshes.contains_key(&record.mesh))
+            .filter(|(_, record)| {
+                self.meshes.get(&record.mesh).is_some_and(|traced| {
+                    let t = record.transform;
+                    let scale = (t[0] * t[0] + t[4] * t[4] + t[8] * t[8]).sqrt();
+                    traced.radius * scale >= self.least
+                })
+            })
             .map(|(slot, record)| (slot, record.mesh, record.transform))
             .collect();
         if placed.is_empty() {
@@ -1032,7 +1066,8 @@ pub const LIT_FULL: f32 = 8.0;
 /// The most a lit card is halved.
 pub const LIT_COARSEST: u32 = 5;
 /// How many texels of the radiance atlas are lit a frame, at most: those of cards new to it
-/// first, then the rest in turn.
+/// first, then the rest in turn. [`SurfaceLight::set_budget`] lowers it: a texel's rays cost ten
+/// times as much among crowns as over open ground.
 pub const LIGHT_BUDGET: u32 = 1 << 17;
 /// How many frames apart the instances' lit cards are handed out again, at most; sooner when the
 /// eye has moved [`LIT_MOVE`] meters.
@@ -1207,6 +1242,12 @@ pub struct SurfaceLight {
     frame: u32,
     handed_out: Option<([f32; 3], u32)>,
     full: bool,
+    /// How many texels are lit a frame: see [`Self::set_budget`].
+    budget: u32,
+    /// How far into the first fresh run, and into the run in turn, lighting has got, if they
+    /// were too big to finish in a frame.
+    fresh_partial: Option<(u32, u32)>,
+    turn_partial: Option<(u32, u32)>,
 }
 
 impl SurfaceLight {
@@ -1285,6 +1326,9 @@ impl SurfaceLight {
             frame: 0,
             handed_out: None,
             full: false,
+            budget: LIGHT_BUDGET,
+            fresh_partial: None,
+            turn_partial: None,
         })
     }
 
@@ -1450,38 +1494,36 @@ impl SurfaceLight {
             self.full |= self.hand_out(pool, cache, eye);
             self.handed_out = Some((eye, self.frame));
         }
-        // New runs first, then the rest in turn, to the budget.
-        let mut chosen: Vec<u32> = Vec::new();
-        let mut texels = 0u32;
-        let size = |s: &Self, first: u32| (0..6).map(|f| s.lit_cards[(first + f) as usize].tile).map(|t| t[2] * t[3]).sum::<u32>();
-        while let Some(&first) = self.fresh.front() {
-            let cost = size(self, first);
-            if texels + cost > LIGHT_BUDGET && !chosen.is_empty() {
+        // New runs first, then the rest in turn, texel by texel to the budget exactly - a run too
+        // big for what is left of it (the ground's, say, hundreds of thousands of texels) is
+        // carried on with next frame - a lit card and a texel of its tile each.
+        let budget = self.budget as usize;
+        let mut blocks: Vec<[u32; 2]> = Vec::with_capacity(budget);
+        while blocks.len() < budget {
+            let Some(&first) = self.fresh.front() else {
                 break;
+            };
+            let from = self.fresh_partial.filter(|(f, _)| *f == first).map_or(0, |(_, at)| at);
+            match self.texels_of(first, from, budget, &mut blocks) {
+                None => {
+                    self.fresh.pop_front();
+                    self.fresh_partial = None;
+                }
+                Some(at) => self.fresh_partial = Some((first, at)),
             }
-            self.fresh.pop_front();
-            chosen.push(first);
-            texels += cost;
         }
         let mut looked = 0;
-        while looked < self.runs.len() && texels < LIGHT_BUDGET {
+        while blocks.len() < budget && looked < self.runs.len() {
             self.cursor %= self.runs.len();
             let first = self.runs[self.cursor];
-            self.cursor += 1;
-            looked += 1;
-            if chosen.contains(&first) {
-                continue;
-            }
-            texels += size(self, first);
-            chosen.push(first);
-        }
-        // Every texel of them, a lit card and a texel of its tile each.
-        let mut blocks: Vec<[u32; 2]> = Vec::with_capacity(texels as usize);
-        for first in chosen {
-            for face in 0..6 {
-                let card = first + face;
-                let tile = self.lit_cards[card as usize].tile;
-                blocks.extend((0..tile[2] * tile[3]).map(|t| [card, t]));
+            let from = self.turn_partial.filter(|(f, _)| *f == first).map_or(0, |(_, at)| at);
+            match self.texels_of(first, from, budget, &mut blocks) {
+                None => {
+                    self.cursor += 1;
+                    looked += 1;
+                    self.turn_partial = None;
+                }
+                Some(at) => self.turn_partial = Some((first, at)),
             }
         }
         if blocks.is_empty() {
@@ -1546,6 +1588,41 @@ impl SurfaceLight {
         pass.set_bind_group(1, &group, &[]);
         let groups = (blocks.len() as u32).div_ceil(64);
         pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+    }
+
+    /// Adds the texels of the run of lit cards from `first` to `blocks`, from its `from`th on,
+    /// until `blocks` holds `budget`: [`None`] if the run was finished, else how far it got.
+    fn texels_of(&self, first: u32, from: u32, budget: usize, blocks: &mut Vec<[u32; 2]>) -> Option<u32> {
+        let mut at = 0u32;
+        for face in 0..6 {
+            let card = first + face;
+            let tile = self.lit_cards[card as usize].tile;
+            let count = tile[2] * tile[3];
+            if from >= at + count {
+                at += count;
+                continue;
+            }
+            let start = from.max(at) - at;
+            let room = (budget - blocks.len()) as u32;
+            let take = (count - start).min(room);
+            blocks.extend((start..start + take).map(|t| [card, t]));
+            if take < count - start {
+                return Some(at + start + take);
+            }
+            at += count;
+        }
+        None
+    }
+
+    /// How many texels each [`Self::update`] lights, at most (1 to [`LIGHT_BUDGET`]): to keep
+    /// its time on the GPU steady, from what the last frames' took.
+    pub fn set_budget(&mut self, texels: u32) {
+        self.budget = texels.clamp(1, LIGHT_BUDGET);
+    }
+
+    /// How many texels each [`Self::update`] lights, at most.
+    pub fn budget(&self) -> u32 {
+        self.budget
     }
 
     /// Whether the atlas has run out of room for every instance in reach.
@@ -1787,6 +1864,8 @@ pub struct RadianceCache {
     cursor: u32,
     frame: u32,
     levels: Option<wgpu::Buffer>,
+    /// How many probes are traced a frame: see [`Self::set_budget`].
+    budget: usize,
 }
 
 impl RadianceCache {
@@ -1864,7 +1943,20 @@ impl RadianceCache {
             cursor: 0,
             frame: 0,
             levels: None,
+            budget: CACHE_BUDGET,
         })
+    }
+
+    /// How many probes each [`Self::update`] traces, at most (1 to [`CACHE_BUDGET`]): to keep
+    /// its time on the GPU steady, from what the last frames' took - a probe among the crowns
+    /// costs many times one in the open.
+    pub fn set_budget(&mut self, probes: usize) {
+        self.budget = probes.clamp(1, CACHE_BUDGET);
+    }
+
+    /// How many probes each [`Self::update`] traces, at most.
+    pub fn budget(&self) -> usize {
+        self.budget
     }
 
     /// Each grid's spacing, in meters.
@@ -1935,8 +2027,8 @@ impl RadianceCache {
             }
             self.origins[level as usize] = Some(origin);
         }
-        let mut jobs: Vec<u32> = Vec::with_capacity(CACHE_BUDGET);
-        while jobs.len() < CACHE_BUDGET {
+        let mut jobs: Vec<u32> = Vec::with_capacity(self.budget);
+        while jobs.len() < self.budget {
             let Some(slot) = self.waiting.pop_front() else {
                 break;
             };
@@ -1944,7 +2036,7 @@ impl RadianceCache {
             jobs.push(slot);
         }
         let total = CACHE_LEVELS * CACHE_PROBES;
-        while jobs.len() < CACHE_BUDGET {
+        while jobs.len() < self.budget {
             // In a scrambled order (an odd multiplier, the slots a power of two): probes next to
             // each other cost alike - a slab of them inside the crowns, say - and are spread
             // over many frames rather than taken together.
@@ -3726,6 +3818,8 @@ mod test {
         let mut pool = GeometryPool::new(&device, 1 << 10);
         let mut cache = SurfaceCache::new(&device, 256);
         let mut scene = TraceScene::new();
+        // Its box is under a meter across: traced all the same.
+        scene.set_least(0.0);
         let mut captures = Vec::new();
         // A box turned a quarter about up (its -x face towards +z) 10 m down -z; and a sheet
         // facing up, 3 m overhead, seen from below.

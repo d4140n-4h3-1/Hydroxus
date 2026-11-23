@@ -183,6 +183,18 @@ prefixes. The method follows the published description of Lumen cited above.
    it costs 0.05 ms: the forest has almost nothing smoother than 0.4, so what shows is shaded
    surfaces no longer reflecting the flat ambient colour.
 
+Walking without stalls (since): measured a frame at a time (`WgpuGraphicsServer::gpu_latest`),
+walking into the wood with Candelite took the GPU 22-39 ms a frame, and single frames 40-80 ms.
+The cards' lighting and the radiance cache now each keep to a time - fyrox-gfx steers their budgets
+(`SurfaceLight::set_budget`, `RadianceCache::set_budget`) towards 2.5 ms and 1 ms from the latest
+frame timed - and the cards' texels are handed out to the budget exactly, a run of cards too big for
+what is left carried on next frame (the ground's alone is hundreds of thousands of texels). The
+single long frames were none of these: they came with the instances streaming in round the walker,
+whatever the budgets, and went with instances under 1 m (`TRACE_LEAST`, half the diagonal of their
+bounds) left out of what Candelite traces - rays starting near the ground crossing dense patches of
+grass, ferns and small bushes. Walking, the GPU now takes 14-18 ms, and the longest frame a second
+is the 35 ms of two fixed updates, as without Candelite.
+
 Light through leaves (since): a material's `MaterialParams::transmission` - how much of the light
 on its back comes through - is written into the G-Buffer's material alpha as one minus it (the
 engine's own shaders write 1). The sun's light pass adds that share of the light on a leaf's back

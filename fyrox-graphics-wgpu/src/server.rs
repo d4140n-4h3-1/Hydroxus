@@ -691,6 +691,13 @@ impl WgpuGraphicsServer {
         }
     }
 
+    /// How long the section marked `label` took on the GPU in the latest frame timed (a frame or
+    /// two ago); [`None`] where the GPU cannot time itself, or nothing has come back yet. For
+    /// work that steers its own cost by it.
+    pub fn gpu_latest(&self, label: &str) -> Option<f32> {
+        self.gpu_timer.as_ref()?.latest(label)
+    }
+
     /// Submits the frame encoder, taken from [`Self::frame_encoder`].
     pub fn submit_frame_encoder(&self, encoder: wgpu::CommandEncoder) {
         self.state.queue.submit(std::iter::once(encoder.finish()));
