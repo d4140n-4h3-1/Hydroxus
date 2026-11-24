@@ -641,6 +641,8 @@ pub struct GBufferPassContext<'a, 'b> {
     pub scene_handle: Handle<Scene>,
     /// A camera from the scene that is used as "eyes".
     pub observer: &'b Observer,
+    /// The lights this frame is lit with: those in the observer's view, enabled and visible.
+    pub light_sources: &'b [bundle::LightSource],
 }
 
 /// A trait for custom scene rendering pass. It could be used to add your own rendering techniques.

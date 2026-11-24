@@ -797,6 +797,17 @@ struct CandeliteLitCard {
 @group(0) @binding(12) var<storage, read> candeliteRadiance: array<vec2u>;
 const CANDELITE_RADIANCE_WIDTH: u32 = 2048u;
 
+// The lamps (see `Lamp`): where each is and how far it reaches (w), its light as a white surface
+// squarely facing it from close by gives off (linear, its colour times its intensity over pi),
+// and, for a spot, which way it shines with the cosines of the edge (w) and of the bright middle
+// (light.w) of its cone; a lamp that reaches nowhere is none.
+struct CandeliteLamp {
+    position: vec4f,
+    light: vec4f,
+    direction: vec4f,
+};
+@group(0) @binding(14) var<storage, read> candeliteLamps: array<CandeliteLamp>;
+
 // The atlas's diffuse colour is stored as the G-Buffer stores it, in sRGB: light works in linear.
 fn candelite_linear(c: vec3f) -> vec3f {
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3f(2.4)), step(vec3f(0.04045), c));
@@ -1027,22 +1038,63 @@ fn candelite_blocked(origin: vec3f, direction: vec3f, reach: f32) -> bool {
 // where it is (hit lighting) - the sun, if a shadow ray reaches it, and half the sky; nothing if
 // no card saw anything there. A ray that hit nothing sees the sky. `toward_sun` is a unit vector;
 // `sun` the light a white surface facing the sun gives off; `sky` the sky's radiance.
+//
+// The lamps' light is not kept on the cards, but worked out where the ray hit, every time: a
+// flashlight moves with the view, and light kept on the cards - relit a budget of texels a frame
+// - would trail it. (The light that bounces once off what a lamp lights, gathered on the cards, is
+// kept, and trails a little.)
 fn candelite_hit_light(hit: SurfaceHit, toward_sun: vec3f, sun: vec3f, sky: vec3f) -> vec3f {
     if (!hit.hit) {
         return sky;
     }
     if (hit.lit) {
-        return hit.radiance;
+        return hit.radiance + candelite_linear(hit.diffuse) * candelite_lamps_on(hit.position, hit.normal);
     }
     if (!hit.seen) {
         return vec3f(0.0);
     }
-    var light = sky * 0.5;
+    var light = sky * 0.5 + candelite_lamps_on(hit.position, hit.normal);
     let facing = dot(hit.normal, toward_sun);
     if (facing > 0.0 && !candelite_blocked(hit.position + hit.normal * 0.05 + toward_sun * 0.15, toward_sun, 1.0e4)) {
         light += sun * facing;
     }
     return candelite_linear(hit.diffuse) * light;
+}
+
+// The lamps' light falling on a white surface at `position` facing `normal`, where a shadow ray
+// reaches the lamp: falling off with distance and, for a spot, toward the edge of its cone, as
+// the renderer lights with them.
+fn candelite_lamps_on(position: vec3f, normal: vec3f) -> vec3f {
+    var light = vec3f(0.0);
+    let count = arrayLength(&candeliteLamps);
+    for (var i = 0u; i < count; i++) {
+        let lamp = candeliteLamps[i];
+        let reach = lamp.position.w;
+        let offset = lamp.position.xyz - position;
+        let distance = length(offset);
+        if (reach <= 0.0 || distance >= reach || distance < 1.0e-4) {
+            continue;
+        }
+        let toward = offset / distance;
+        let facing = dot(normal, toward);
+        if (facing <= 0.0) {
+            continue;
+        }
+        var cone = 1.0;
+        if (lamp.direction.w > -1.5) {
+            cone = smoothstep(lamp.direction.w, lamp.light.w, dot(-toward, lamp.direction.xyz));
+            if (cone <= 0.0) {
+                continue;
+            }
+        }
+        let falloff = clamp(1.0 - distance * distance / (reach * reach), 0.0, 1.0);
+        let origin = position + normal * 0.05;
+        if (candelite_blocked(origin, toward, max(distance - 0.1, 0.0))) {
+            continue;
+        }
+        light += lamp.light.rgb * (falloff * cone * facing);
+    }
+    return light;
 }
 "#;
 
@@ -1100,6 +1152,46 @@ pub struct Sunlight {
     pub sun: [f32; 3],
     /// The sky's radiance, the same all over, linear.
     pub sky: [f32; 3],
+}
+
+/// A lamp Candelite lights with, besides the sun: a point light, or a spot light. Its light is
+/// worked out where a ray hits, not kept on the cards (see `candelite_hit_light`), so a lamp that
+/// moves - a flashlight - is lit where it is now. See [`SurfaceLight::set_lamps`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Lamp {
+    /// Where it is, in the world.
+    pub position: [f32; 3],
+    /// How far it reaches, in meters: its light falls off as the renderer's does, to nothing there.
+    pub reach: f32,
+    /// The light a white surface squarely facing it from close by gives off, linear: as with
+    /// [`Sunlight::sun`], its colour times its intensity over pi.
+    pub light: [f32; 3],
+    /// For a spot light: which way it shines (a unit vector), and the cosines of half its cone
+    /// with the soft edge and of half its bright middle.
+    pub spot: Option<([f32; 3], f32, f32)>,
+}
+
+/// The most lamps Candelite lights with: those nearest the eye.
+pub const MOST_LAMPS: usize = 8;
+
+/// A [`Lamp`] as the GPU reads it (`CandeliteLamp`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuLamp {
+    position: [f32; 4],
+    light: [f32; 4],
+    direction: [f32; 4],
+}
+
+impl GpuLamp {
+    fn of(lamp: &Lamp) -> Self {
+        let (direction, edge, middle) = lamp.spot.unwrap_or(([0.0, -1.0, 0.0], -2.0, -2.0));
+        Self {
+            position: [lamp.position[0], lamp.position[1], lamp.position[2], lamp.reach],
+            light: [lamp.light[0], lamp.light[1], lamp.light[2], middle],
+            direction: [direction[0], direction[1], direction[2], edge],
+        }
+    }
 }
 
 /// An instance's lit cards.
@@ -1231,6 +1323,9 @@ pub struct SurfaceLight {
     /// The lit cards and each slot's first, on the GPU, made afresh when they change.
     gpu: Option<(wgpu::Buffer, wgpu::Buffer)>,
     changed: bool,
+    /// The lamps, and on the GPU, made afresh when they change.
+    lamps: Vec<GpuLamp>,
+    gpu_lamps: Option<wgpu::Buffer>,
     /// Runs never lit yet, by their first, lit before the rest.
     fresh: std::collections::VecDeque<u32>,
     /// Every run, by its first, and the next to light in turn.
@@ -1326,6 +1421,8 @@ impl SurfaceLight {
             frame: 0,
             handed_out: None,
             full: false,
+            lamps: Vec::new(),
+            gpu_lamps: None,
             budget: LIGHT_BUDGET,
             fresh_partial: None,
             turn_partial: None,
@@ -1452,6 +1549,27 @@ impl SurfaceLight {
         &self.radiance
     }
 
+    /// The lamps to light with from now on, besides the sun: the [`MOST_LAMPS`] first.
+    pub fn set_lamps(&mut self, lamps: &[Lamp]) {
+        let lamps: Vec<GpuLamp> = lamps.iter().take(MOST_LAMPS).map(GpuLamp::of).collect();
+        if lamps != self.lamps {
+            self.lamps = lamps;
+            self.gpu_lamps = None;
+        }
+    }
+
+    fn lamp_buffer(&mut self, device: &wgpu::Device) -> &wgpu::Buffer {
+        self.gpu_lamps.get_or_insert_with(|| {
+            // None is one that reaches nowhere: a binding cannot be empty.
+            let none = [GpuLamp::default()];
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("CandeliteLamps"),
+                contents: bytemuck::cast_slice(if self.lamps.is_empty() { &none } else { &self.lamps }),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        })
+    }
+
     fn buffers(&mut self, device: &wgpu::Device) -> (&wgpu::Buffer, &wgpu::Buffer) {
         if self.changed || self.gpu.is_none() {
             let make = |label, contents: &[u8]| {
@@ -1530,8 +1648,10 @@ impl SurfaceLight {
             return;
         }
         self.buffers(device);
+        self.lamp_buffer(device);
         let (lit_cards, instance_lit) = self.gpu.as_ref().expect("made above");
-        let Some(lookup) = lookup_group_with(device, &self.lookup_layout, scene, pool, cache, [lit_cards, instance_lit, &self.radiance]) else {
+        let lamps = self.gpu_lamps.as_ref().expect("made above");
+        let Some(lookup) = lookup_group_with(device, &self.lookup_layout, scene, pool, cache, [lit_cards, instance_lit, &self.radiance, lamps]) else {
             return;
         };
         #[repr(C)]
@@ -3583,6 +3703,7 @@ fn lookup_layout_with(device: &wgpu::Device, visibility: wgpu::ShaderStages, rad
             storage(11),
             storage_as(12, !radiance_writable),
             texture(13, unfiltered),
+            storage(14),
         ],
     })
 }
@@ -3598,8 +3719,10 @@ pub fn lookup_group(
     light: &mut SurfaceLight,
 ) -> Option<wgpu::BindGroup> {
     light.buffers(device);
+    light.lamp_buffer(device);
     let (lit_cards, instance_lit) = light.gpu.as_ref().expect("made above");
-    lookup_group_with(device, layout, scene, pool, cache, [lit_cards, instance_lit, &light.radiance])
+    let lamps = light.gpu_lamps.as_ref().expect("made above");
+    lookup_group_with(device, layout, scene, pool, cache, [lit_cards, instance_lit, &light.radiance, lamps])
 }
 
 /// As [`lookup_group`], with the lit cards, each slot's first and the radiance atlas given.
@@ -3609,7 +3732,7 @@ fn lookup_group_with(
     scene: &mut TraceScene,
     pool: &GeometryPool,
     cache: &mut SurfaceCache,
-    [lit_cards, instance_lit, radiance]: [&wgpu::Buffer; 3],
+    [lit_cards, instance_lit, radiance, lamps]: [&wgpu::Buffer; 4],
 ) -> Option<wgpu::BindGroup> {
     scene.cutout_buffers(device);
     let tlas = scene.tlas.as_ref()?;
@@ -3681,6 +3804,10 @@ fn lookup_group_with(
             wgpu::BindGroupEntry {
                 binding: 13,
                 resource: wgpu::BindingResource::TextureView(&material),
+            },
+            wgpu::BindGroupEntry {
+                binding: 14,
+                resource: lamps.as_entire_binding(),
             },
         ],
     }))
@@ -4201,6 +4328,121 @@ mod test {
         let middle = seen[(SIZE / 2 * SIZE + SIZE / 2) as usize].to_le_bytes();
         let expected = lit.map(|c| (c / (1.0 + c) * 255.0).round() as u8);
         assert!((0..3).all(|i| middle[i].abs_diff(expected[i]) <= 3), "seen {middle:?}, lit {expected:?}");
+    }
+
+    #[test]
+    fn a_lamp_lights_what_rays_hit_where_it_is_now() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray tracing: skipped");
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .expect("device");
+
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        let mut captures = Vec::new();
+        let shifted = |t: [f32; 3]| [1.0, 0.0, 0.0, t[0], 0.0, 1.0, 0.0, t[1], 0.0, 0.0, 1.0, t[2]];
+        // A floor 4 m square facing up, its colour orange; and over its left half, 1 m up, a slab
+        // shading it from a sun straight overhead.
+        for (min, max, top_only, at, slot) in [
+            ([-2.0, 0.0, -2.0], [2.0, 0.0, 2.0], true, [0.0; 3], 0),
+            ([-2.5, 1.0, -2.5], [0.0, 1.2, 2.5], false, [0.0; 3], 1),
+        ] {
+            let (vertices, indices) = boxed(min, max, top_only);
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let first = pool.mesh(mesh).unwrap().first_cluster;
+            let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+            captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
+            scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+            pool.add_instance(&device, &queue, mesh, shifted(at), slot);
+        }
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let material = |slot, colour: [f32; 4]| ResolvedMaterial {
+            slot,
+            params: MaterialParams {
+                diffuse_color: colour,
+                ..Default::default()
+            },
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        };
+        let materials = [material(0, [1.0, 0.5, 0.25, 1.0]), material(1, [0.2, 0.2, 0.2, 1.0])];
+        let mut drawer = GBufferDrawer::new(&device);
+        let mut light = SurfaceLight::new(&device).expect("can trace");
+        // No sun and no sky: only a lamp, half a meter over the floor's right half.
+        let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [0.0; 3], sky: [0.0; 3] };
+        let lamp = Lamp { position: [1.0, 0.5, 0.0], reach: 4.0, light: [1.0; 3], spot: None };
+        light.set_lamps(&[lamp]);
+        let eye = [1.0, 3.0, 0.0];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+        assert!(scene.update(&device, &mut encoder, &pool));
+        queue.submit([encoder.finish()]);
+        for _ in 0..8 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            light.update(&device, &mut encoder, &mut scene, &pool, &mut cache, eye, &sunlight);
+            queue.submit([encoder.finish()]);
+        }
+        const SIZE: u32 = 32;
+        let view = SurfaceView::new(&device).expect("can trace");
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        // Looking straight down from 3 m over the floor's right half, 90 degrees across: the
+        // middle sees the floor right under the lamp.
+        let inverse = [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 0.0], [eye[0], eye[1] - 1.0, eye[2], 1.0]];
+        let mut middle = |light: &mut SurfaceLight| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            view.record(&device, &mut encoder, &mut scene, &pool, &mut cache, light, &sunlight, inverse, eye, ViewShows::Lit, &target);
+            queue.submit([encoder.finish()]);
+            let seen = texels(&device, &queue, &target, wgpu::TextureAspect::All, 4);
+            let m = seen[(SIZE / 2 * SIZE + SIZE / 2) as usize].to_le_bytes();
+            [m[0], m[1], m[2]]
+        };
+        // The floor's orange (linear 1, 0.214, 0.051) under the lamp's light, falling off a little
+        // over half a meter of its four, brought into range.
+        let falloff = 1.0 - 0.25 / 16.0;
+        let expected = [1.0f32, 0.214, 0.051].map(|c| {
+            let c = c * falloff;
+            (c / (1.0 + c) * 255.0).round() as u8
+        });
+        let lit = middle(&mut light);
+        assert!((0..3).all(|i| lit[i].abs_diff(expected[i]) <= 4), "lit {lit:?}, expected {expected:?}");
+
+        // A spot pointed up, away from the floor, lights none of it; nor a lamp moved out of
+        // reach - at once, the cards not relit.
+        light.set_lamps(&[Lamp { spot: Some(([0.0, 1.0, 0.0], 0.8, 0.9)), ..lamp }]);
+        let away = middle(&mut light);
+        assert!(away[0] < lit[0] / 8, "spot pointed away: {away:?}, lit {lit:?}");
+        light.set_lamps(&[Lamp { position: [1.0, 10.0, 0.0], ..lamp }]);
+        let gone = middle(&mut light);
+        assert!(gone[0] < lit[0] / 8, "lamp out of reach: {gone:?}, lit {lit:?}");
+        // A spot pointed down at it lights it as the lamp did.
+        light.set_lamps(&[Lamp { spot: Some(([0.0, -1.0, 0.0], 0.8, 0.9)), ..lamp }]);
+        let down = middle(&mut light);
+        assert!((0..3).all(|i| down[i].abs_diff(lit[i]) <= 2), "spot pointed down: {down:?}, lit {lit:?}");
     }
 
     #[test]

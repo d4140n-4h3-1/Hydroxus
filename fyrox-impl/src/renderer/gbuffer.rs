@@ -269,6 +269,7 @@ impl GBuffer {
                 scene,
                 scene_handle,
                 observer,
+                light_sources: &bundle_storage.light_sources,
             })?;
         }
         server.gpu_mark("G-buffer: custom passes (Yoctite)");

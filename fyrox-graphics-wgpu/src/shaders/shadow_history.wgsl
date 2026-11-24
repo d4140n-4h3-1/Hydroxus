@@ -10,6 +10,12 @@
 // The history keeps, beside each pixel's shadow, how far its surface lay from the frame before's
 // near plane. A pixel whose place in the frame before was not that far off - off the screen, or a
 // different surface then, as when something nearer moved away - starts again from this frame.
+//
+// A light that moved since the frame before - a flashlight in a walking hand - has moved its
+// shadows too, and the history holds them where they were: averaged over ten frames, they trailed
+// the light. Then the history is held to the range this frame's shadow takes in the 3x3 pixels
+// round each one: where this frame is wholly lit or wholly shadowed, the old shadow goes at once;
+// in soft edges, where the rays differ from pixel to pixel, there is still room to average.
 
 struct Uniforms {
     inverseViewProjection: mat4x4f,
@@ -19,6 +25,8 @@ struct Uniforms {
     flipV: u32,
     // How much of this frame goes in; 1 starts again from it.
     blend: f32,
+    // Whether the light moved since the frame before.
+    moved: u32,
 };
 
 @group(0) @binding(0) var current: texture_2d<f32>;
@@ -90,5 +98,19 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     if (weight <= 0.0) {
         return vec4f(now, range);
     }
-    return vec4f(mix(sum / weight, now, uniforms.blend), range);
+    var then = sum / weight;
+    if (uniforms.moved != 0u) {
+        let currentSize = vec2i(textureDimensions(current));
+        var lo = now;
+        var hi = now;
+        for (var y = -1; y <= 1; y++) {
+            for (var x = -1; x <= 1; x++) {
+                let near = textureLoad(current, clamp(pixel + vec2i(x, y), vec2i(0), currentSize - 1), 0).rgb;
+                lo = min(lo, near);
+                hi = max(hi, near);
+            }
+        }
+        then = clamp(then, lo, hi);
+    }
+    return vec4f(mix(then, now, uniforms.blend), range);
 }

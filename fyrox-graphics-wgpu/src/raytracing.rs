@@ -701,7 +701,24 @@ struct ShadowHistory {
     inverse_view_projection: [[f32; 4]; 4],
     /// Whether the latest holds a frame's shadows yet.
     valid: bool,
+    /// Where the light was, or which way it shone, for the latest.
+    light: Option<[f32; 3]>,
 }
+
+impl ShadowRayLight {
+    /// Where the light is, or which way the sun's light runs: whatever moves its shadows.
+    fn placement(&self) -> [f32; 3] {
+        match *self {
+            ShadowRayLight::Directional { direction, .. } => direction,
+            ShadowRayLight::Positional { position, .. } => position,
+        }
+    }
+}
+
+/// How far a light must move between frames, in meters (or, for the sun, in the length of the
+/// change of its unit direction), for its shadows of the frames before to be held to this frame's
+/// (see `shaders/shadow_history.wgsl`).
+const LIGHT_MOVED: f32 = 1.0e-5;
 
 /// How much of each frame's shadows goes into their average over frames: about the last ten
 /// frames count.
@@ -1349,7 +1366,15 @@ impl ShadowTracer {
             screen_size: [f32; 2],
             flip_v: u32,
             blend: f32,
+            moved: u32,
+            _pad: [u32; 3],
         }
+        let placement = parameters.light.placement();
+        let moved = history.light.is_some_and(|was| {
+            let d = [placement[0] - was[0], placement[1] - was[1], placement[2] - was[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() > LIGHT_MOVED
+        });
+        history.light = Some(placement);
         let uniforms = Uniforms {
             inverse_view_projection: inverse,
             previous_view_projection: history.view_projection,
@@ -1357,6 +1382,8 @@ impl ShadowTracer {
             screen_size: [width as f32, height as f32],
             flip_v: parameters.flip_v as u32,
             blend: if history.valid { HISTORY_BLEND } else { 1.0 },
+            moved: moved as u32,
+            _pad: [0; 3],
         };
         let device = &server.state.device;
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
