@@ -2121,6 +2121,10 @@ pub const PROBE_HISTORY: f32 = 20.0;
 
 /// How many pixels apart screen probes are, each way.
 pub const PROBE_SPACING: u32 = 16;
+/// The format the screen probes keep each pixel's gathered light in from frame to frame, with how
+/// far its surface was from the eye.
+const GATHERED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
 /// The format [`ScreenProbes`] draws the light between surfaces in: per pixel, what to light it
 /// with in place of the ambient colour - its diffuse colour times this is the light it gives off.
 pub const PROBES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -2133,6 +2137,8 @@ struct Probes {
     towardSun: vec4f,
     sun: vec4f,
     sky: vec4f,
+    // Where the middle of the near plane was last frame, as `probes_unproject` puts this frame's.
+    previousEye: vec4f,
     size: vec2u,
     grid: vec2u,
     frame: u32,
@@ -2301,6 +2307,20 @@ fn trace(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) loca
 
 const PROBES_GATHER: &str = r#"
 @group(1) @binding(3) var<storage, read> current: array<Probe>;
+// Last frame's light at each pixel, and how far its surface was from the eye (0 for the sky).
+@group(1) @binding(6) var gathered: texture_2d<f32>;
+
+struct Gathered {
+    // The light, for the renderer.
+    @location(0) light: vec4f,
+    // The same, and how far its surface is from the eye: next frame's history.
+    @location(1) history: vec4f,
+};
+
+// How much of this frame's light goes into a pixel's, where it has history: the rest is what it
+// had. Measured on the gathered light of a still view in dense forest, frame to frame it changed
+// by 9% unaveraged, 3.5% at 0.15, 1.7% at this.
+const GATHER_NEW: f32 = 0.08;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
@@ -2311,16 +2331,9 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
 
 // Each pixel lit from the probes round it: the four nearest, each by how near it is, and only
 // as far as it lies on the pixel's surface and faces its way; if none does, any of the nine
-// round it facing its way; if none, the sky.
-@fragment
-fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
-    let pixel = vec2u(at.xy);
-    let depth = textureLoad(sceneDepth, pixel, 0);
-    if (depth >= 1.0) {
-        return vec4f(probes.sky.rgb, 1.0);
-    }
-    let p = probes_unproject(at.xy, depth);
-    let n = probes_normal(pixel);
+// round it facing its way; if none, the sky. Then averaged with what the same place had last
+// frame (see `fs_main`).
+fn probes_gather(at: vec4f, p: vec3f, n: vec3f, pixel: vec2u, lo: ptr<function, vec3f>, hi: ptr<function, vec3f>) -> vec3f {
     let through = probes_through(pixel);
     let eye = probes_unproject(vec2f(probes.size) * 0.5, 0.0);
     let slack = 0.05 + 0.02 * length(p - eye);
@@ -2343,8 +2356,13 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
         let plane = exp(-abs(dot(probe.position.xyz - p, n)) / slack);
         let facing = pow(max(dot(probe.normal.xyz, n), 0.0), 4.0);
         let w = near * plane * facing;
-        sum += probes_irradiance(probe, n) * w;
+        let e = probes_irradiance(probe, n);
+        sum += e * w;
         weight += w;
+        if (w > 1.0e-6) {
+            *lo = min(*lo, e);
+            *hi = max(*hi, e);
+        }
         if (probe.position.w > 1.5) {
             behind += probes_irradiance(probe, -n) * w;
             behind_weight += w;
@@ -2359,8 +2377,11 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
                     continue;
                 }
                 let w = max(dot(probe.normal.xyz, n), 0.0) + 1.0e-3;
-                sum += probes_irradiance(probe, n) * w;
+                let e = probes_irradiance(probe, n);
+                sum += e * w;
                 weight += w;
+                *lo = min(*lo, e);
+                *hi = max(*hi, e);
                 if (probe.position.w > 1.5) {
                     behind += probes_irradiance(probe, -n) * w;
                     behind_weight += w;
@@ -2369,13 +2390,77 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
         }
     }
     if (weight <= 0.0) {
-        return vec4f(probes.sky.rgb, 1.0);
+        *lo = probes.sky.rgb;
+        *hi = probes.sky.rgb;
+        return probes.sky.rgb;
     }
     var light = sum / weight;
     if (through > 0.01 && behind_weight > 1.0e-6) {
-        light += behind / behind_weight * through;
+        let back = behind / behind_weight * through;
+        light += back;
+        *lo += back;
+        *hi += back;
     }
-    return vec4f(light, 1.0);
+    return light;
+}
+
+// The light between surfaces at each pixel (see `probes_gather`), averaged over frames: blended
+// with what the same place had last frame, found through last frame's view - taken from the four
+// texels round it, those that held the same surface (as far from the eye as this place was, within
+// depth's precision), weighted bilinearly among themselves. Each frame's probes lie on different
+// pixels of their tiles, and in foliage - leaf, then what is behind it - which probes a pixel takes
+// its light from changes from frame to frame: unaveraged, it flickered. What it had is held within
+// reach of what the probes round it give now, so it does not trail far behind a change.
+@fragment
+fn fs_main(@builtin(position) at: vec4f) -> Gathered {
+    let pixel = vec2u(at.xy);
+    let depth = textureLoad(sceneDepth, pixel, 0);
+    if (depth >= 1.0) {
+        return Gathered(vec4f(probes.sky.rgb, 1.0), vec4f(probes.sky.rgb, 0.0));
+    }
+    let p = probes_unproject(at.xy, depth);
+    let n = probes_normal(pixel);
+    var lo = vec3f(1.0e9);
+    var hi = vec3f(0.0);
+    let now = probes_gather(at, p, n, pixel, &lo, &hi);
+    let eye = probes_unproject(vec2f(probes.size) * 0.5, 0.0);
+    let range = length(p - eye);
+    var light = now;
+    let before = probes.previousViewProjection * vec4f(p, 1.0);
+    if (before.w > 0.0) {
+        let ndc = before.xy / before.w;
+        let then = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * vec2f(probes.size) - 0.5;
+        let expected = length(p - probes.previousEye.xyz);
+        let corner = vec2i(floor(then));
+        let f = then - floor(then);
+        var sum = vec3f(0.0);
+        var weight = 0.0;
+        for (var k = 0; k < 4; k++) {
+            let offset = vec2i(k & 1, k >> 1);
+            let texel = corner + offset;
+            if (any(texel < vec2i(0)) || any(texel >= vec2i(probes.size))) {
+                continue;
+            }
+            let had = textureLoad(gathered, texel, 0);
+            if (abs(had.a - expected) > 0.02 * expected + 0.05) {
+                continue;
+            }
+            let w = select(1.0 - f.x, f.x, offset.x == 1) * select(1.0 - f.y, f.y, offset.y == 1) + 1.0e-4;
+            sum += had.rgb * w;
+            weight += w;
+        }
+        if (weight > 0.0) {
+            var had = sum / weight;
+            if (all(lo <= hi)) {
+                // Loosely: the probes round it are noisy too, and held tight to them the history
+                // took on their noise.
+                let margin = (hi - lo) + hi * 0.5 + vec3f(0.01);
+                had = clamp(had, max(lo - margin, vec3f(0.0)), hi + margin);
+            }
+            light = mix(had, now, GATHER_NEW);
+        }
+    }
+    return Gathered(vec4f(light, 1.0), vec4f(light, range));
 }
 "#;
 
@@ -2396,6 +2481,11 @@ pub struct ScreenProbes {
     cache_layout: wgpu::BindGroupLayout,
     /// This frame's probes and last frame's, swapped each frame, with the grid they were for.
     buffers: Option<([wgpu::Buffer; 2], [u32; 2])>,
+    /// The light gathered at each pixel last frame and this, with how far each pixel's surface
+    /// was from the eye (see `PROBES_GATHER`), swapped each frame; with the size they are for.
+    gathered: Option<([wgpu::Texture; 2], [u32; 2])>,
+    /// Where the middle of the near plane was last frame.
+    previous_eye: Option<[f32; 3]>,
     previous_view_projection: Option<[[f32; 4]; 4]>,
     frame: u32,
 }
@@ -2457,7 +2547,14 @@ impl ScreenProbes {
         });
         let gather_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("CandeliteProbeGather"),
-            entries: &[entry(0, uniform), entry(1, depth), entry(2, normal), entry(3, storage(true)), entry(5, normal)],
+            entries: &[
+                entry(0, uniform),
+                entry(1, depth),
+                entry(2, normal),
+                entry(3, storage(true)),
+                entry(5, normal),
+                entry(6, normal),
+            ],
         });
         let cache_layout = cache_sample_layout(device);
         let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2504,7 +2601,7 @@ impl ScreenProbes {
             fragment: Some(wgpu::FragmentState {
                 module: &gather_module,
                 entry_point: Some("fs_main"),
-                targets: &[Some(PROBES_FORMAT.into())],
+                targets: &[Some(PROBES_FORMAT.into()), Some(GATHERED_FORMAT.into())],
                 compilation_options: Default::default(),
             }),
             primitive: Default::default(),
@@ -2514,6 +2611,8 @@ impl ScreenProbes {
             cache: None,
         });
         Some(Self {
+            gathered: None,
+            previous_eye: None,
             lookup_layout,
             trace_layout,
             gather_layout,
@@ -2559,6 +2658,22 @@ impl ScreenProbes {
             self.buffers = Some(([make(), make()], grid));
             self.previous_view_projection = None;
         }
+        if self.gathered.as_ref().is_none_or(|(_, s)| *s != size) {
+            let make = || {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("CandeliteGathered"),
+                    size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: GATHERED_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            };
+            self.gathered = Some(([make(), make()], size));
+            self.previous_view_projection = None;
+        }
         self.frame = self.frame.wrapping_add(1);
         let Some(lookup) = lookup_group(device, &self.lookup_layout, scene, pool, cache, light) else {
             return;
@@ -2575,6 +2690,7 @@ impl ScreenProbes {
             toward_sun: [f32; 4],
             sun: [f32; 4],
             sky: [f32; 4],
+            previous_eye: [f32; 4],
             size: [u32; 2],
             grid: [u32; 2],
             frame: u32,
@@ -2590,6 +2706,7 @@ impl ScreenProbes {
                 toward_sun: four(sunlight.toward_sun),
                 sun: four(sunlight.sun),
                 sky: four(sunlight.sky),
+                previous_eye: four(self.previous_eye.unwrap_or([0.0; 3])),
                 size,
                 grid,
                 frame: self.frame,
@@ -2616,6 +2733,9 @@ impl ScreenProbes {
                 common(5, wgpu::BindingResource::TextureView(&material)),
             ],
         });
+        let ([had, gathering], _) = self.gathered.as_ref().expect("made above");
+        let had = had.create_view(&Default::default());
+        let gathering = gathering.create_view(&Default::default());
         let gather_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("CandeliteProbeGather"),
             layout: &self.gather_layout,
@@ -2625,6 +2745,7 @@ impl ScreenProbes {
                 common(2, wgpu::BindingResource::TextureView(&normal)),
                 common(3, current.as_entire_binding()),
                 common(5, wgpu::BindingResource::TextureView(&material)),
+                common(6, wgpu::BindingResource::TextureView(&had)),
             ],
         });
         {
@@ -2645,17 +2766,20 @@ impl ScreenProbes {
         });
         let view = frame.target.create_view(&Default::default());
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("CandeliteProbeGather"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+            let attachment = |view| {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
-                })],
+                })
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("CandeliteProbeGather"),
+                color_attachments: &[attachment(&view), attachment(&gathering)],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
@@ -2666,11 +2790,18 @@ impl ScreenProbes {
             pass.set_bind_group(1, &gather_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        // This frame's probes are next frame's history.
+        // This frame's probes, and the light gathered, are next frame's history.
         if let Some((buffers, _)) = self.buffers.as_mut() {
             buffers.swap(0, 1);
         }
+        if let Some((textures, _)) = self.gathered.as_mut() {
+            textures.swap(0, 1);
+        }
         self.previous_view_projection = Some(frame.view_projection);
+        // The middle of the near plane, as the shaders' `probes_unproject` puts it.
+        let m = frame.inverse_view_projection;
+        let eye = (0..4).map(|r| -m[2][r] + m[3][r]).collect::<Vec<f32>>();
+        self.previous_eye = Some([eye[0] / eye[3], eye[1] / eye[3], eye[2] / eye[3]]);
     }
 }
 
@@ -4329,7 +4460,8 @@ mod test {
         // all round, and it is lit by the sky above and, through it, the sky below - twice as much
         // in the open; under the slab, it still has the sky below.
         fill(&material, &[0, 255, 255, 0]);
-        let [_, _, open_leaf, shaded_leaf] = reflect(&mut reflections, &mut scene, &mut cache, &mut light, 12);
+        // Given time to settle: each pixel's light is averaged over frames.
+        let [_, _, open_leaf, shaded_leaf] = reflect(&mut reflections, &mut scene, &mut cache, &mut light, 40);
         assert!(open_leaf > 1.8 && open_leaf < 2.1, "leaf in the open {open_leaf}, open {open}");
         assert!(shaded_leaf > 0.9 && shaded_leaf < shaded + 1.25, "leaf under the slab {shaded_leaf}, shaded {shaded}");
         fill(&material, &[0, 255, 255, 255]);
