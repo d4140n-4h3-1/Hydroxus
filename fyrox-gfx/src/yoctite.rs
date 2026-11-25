@@ -5,11 +5,11 @@
 //! data, so the thousand copies of a tree share one - on threads of its own, so a scene full of
 //! new meshes does not stop the frame while they build; until a mesh's surfaces are built, the
 //! renderer draws it as it would without Yoctite. Its vertices and clusters go into the pool
-//! (`fyrox_graphics_wgpu::yoctite::GeometryPool`), and each mesh node's surfaces are placed in
+//! (`yoctite_wgpu::GeometryPool`), and each mesh node's surfaces are placed in
 //! it as instances, which move with their nodes and go when they do. Each frame, the clusters to
 //! draw are chosen - instances out of the view left out, then for each the cut through its
 //! clusters whose error looks no bigger than a pixel - on the GPU
-//! (`fyrox_graphics_wgpu::yoctite::Culler`), without the CPU seeing the list.
+//! (`yoctite_wgpu::Culler`), without the CPU seeing the list.
 //!
 //! [`Mode::Render`] draws them into the G-Buffer, a draw for each material, in place of the
 //! renderer's own draw of those meshes (`Renderer::set_taken_over_meshes`): lit, shadowed,
@@ -24,7 +24,7 @@
 //!
 //! With Candelite's surface view ([`YoctitePass::show_candelite`]), each mesh it uploads is also
 //! given Candelite's cards, captured into its surface cache, and its triangles to trace against
-//! (`fyrox_graphics_wgpu::candelite`); and over the frame is laid what a ray from the eye through
+//! (the `candelite` crate); and over the frame is laid what a ray from the eye through
 //! each pixel finds on the cards - magenta where it hit something no card saw.
 //!
 //! [`Mode::View`] instead lays the clusters over the frame, each in a colour of its own: to see
@@ -70,15 +70,11 @@ use fyrox::{
         Scene,
     },
 };
-use fyrox_graphics_wgpu::{
-    candelite::{self, Bounds, Lamp, ProbeFrame, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows},
-    server::WgpuGraphicsServer,
-    texture::WgpuTexture,
-    yoctite::{
-        resolve_materials, Capture,
-        ClusterView, CullParameters, Culler, GBufferDrawer, GeometryPool, InstanceId, MaterialParams, MeshId,
-        Morphs, PoolVertex, YoctiteMaterial,
-    },
+use candelite::{self, Bounds, Lamp, ProbeFrame, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight, SurfaceView, Sunlight, TraceScene, ViewShows};
+use fyrox_graphics_wgpu::{server::WgpuGraphicsServer, texture::WgpuTexture};
+use yoctite_wgpu::{
+    resolve_materials, Capture, ClusterView, CullParameters, Culler, GBufferDrawer, GeometryPool,
+    InstanceId, MaterialParams, MeshId, Morphs, PoolVertex, YoctiteMaterial,
 };
 use std::{
     any::TypeId,
@@ -391,7 +387,7 @@ struct Candelite {
     scene: TraceScene,
     pending: Vec<Capture>,
     view: Option<SurfaceView>,
-    /// The light on the cards: see `fyrox_graphics_wgpu::candelite::SurfaceLight`.
+    /// The light on the cards: see `candelite::SurfaceLight`.
     light: Option<SurfaceLight>,
     /// The screen probes, and the light between surfaces they gather, for the renderer to light
     /// with: see [`YoctitePass::light_with_candelite`].

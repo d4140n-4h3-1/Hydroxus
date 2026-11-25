@@ -72,7 +72,6 @@
 pub mod area_lights;
 /// Generic GPU buffer implementation (uniform, vertex, index, pixel read/write).
 pub mod buffer;
-pub mod candelite;
 
 mod depth_copy;
 /// Texture format helpers and binding offset constants.
@@ -98,5 +97,3 @@ pub mod server;
 /// Texture creation, upload, and format mapping.
 pub mod texture;
 pub mod vertex_depth;
-/// Yoctite's geometry on the GPU: every mesh's clusters, and every instance of them.
-pub mod yoctite;

@@ -332,8 +332,9 @@ impl WgpuGraphicsServer {
         if ray_tracing {
             required_features |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
         }
-        // Yoctite's software rasterizer (`yoctite`): 64-bit atomics to keep each pixel's nearest
-        // triangle, and arrays of textures indexed per pixel to shade them all in one pass.
+        // Yoctite's software rasterizer (the `yoctite-wgpu` crate): 64-bit atomics to keep each
+        // pixel's nearest triangle, and arrays of textures indexed per pixel to shade them all in
+        // one pass.
         let software_raster = wgpu::Features::SHADER_INT64
             | wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX
             | wgpu::Features::TEXTURE_BINDING_ARRAY

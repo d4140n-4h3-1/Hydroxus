@@ -6,8 +6,10 @@ published descriptions (Karis et al., "A Deep Dive into Nanite Virtualized Geome
 2021; Wright et al., "Lumen: Real-time Global Illumination in Unreal Engine 5", SIGGRAPH 2022).
 No Unreal code is used.
 
-Like the ray-traced shadows, both are built directly on wgpu inside `fyrox-graphics-wgpu`, behind
-hooks in the renderer, with the existing path as the fallback where the hardware cannot.
+Like the ray-traced shadows, both are built directly on wgpu, on top of `fyrox-graphics-wgpu`, behind
+hooks in the renderer, with the existing path as the fallback where the hardware cannot. They live
+in their own repository, [yoctite-candelite](https://github.com/d4140n-4h3-1/yoctite-candelite)
+(crates `yoctite`, `yoctite-wgpu` and `candelite`); `fyrox-gfx` turns them on.
 
 Target hardware: AMD RX 7600 (RDNA3, RADV). wgpu 30 features used: `MULTI_DRAW_INDIRECT_COUNT`,
 `SHADER_INT64_ATOMIC_MIN_MAX` / `TEXTURE_INT64_ATOMIC` (software raster), `EXPERIMENTAL_RAY_QUERY`
@@ -52,7 +54,7 @@ What each one buys:
    where each went, so it is never added up level on level. In Wilderness, 6.6 M triangles drawn
    became 3.4 M, and a tree builds in 20-70 ms, off the frame (fyrox-gfx builds on threads of
    its own).
-2. **Geometry pool** - done (`fyrox_graphics_wgpu::yoctite::GeometryPool`): every cluster of
+2. **Geometry pool** - done (`yoctite_wgpu::GeometryPool`): every cluster of
    every mesh in shared GPU buffers, plus an instance buffer, uploaded once and updated as
    instances come and go; `ClusterView` draws clusters from it in one instanced draw, and
    fyrox-gfx's `GraphicsEffects::with_yoctite_view` shows the scene's meshes as their clusters.
@@ -102,7 +104,7 @@ of detail (`GeometryPool::add_morphing_mesh`).
 Named for the candela, the unit of luminous intensity, as Yoctite is for the smallest of
 prefixes. The method follows the published description of Lumen cited above.
 
-1. **Surface cache** - captured (`fyrox_graphics_wgpu::candelite::SurfaceCache`): each mesh of
+1. **Surface cache** - captured (`candelite::SurfaceCache`): each mesh of
    Yoctite's pool is given six cards, the faces of its bounds looking in, each a tile of a shared
    atlas at 8 texels a meter (4 to 256 a side, packed in shelves); what each card sees - the
    G-buffer's diffuse colour, normal, emission, material and decal layer, and how far in the

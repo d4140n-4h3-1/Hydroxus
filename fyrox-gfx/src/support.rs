@@ -6,10 +6,8 @@
 //! Yoctite leaves every mesh to the renderer (and Candelite with it); one that cannot run
 //! Candelite lights the scene with its flat ambient colour.
 
-use fyrox_graphics_wgpu::{
-    candelite::{self, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight},
-    yoctite::{Culler, GBufferDrawer, GeometryPool},
-};
+use candelite::{self, RadianceCache, Reflections, ScreenProbes, SurfaceCache, SurfaceLight};
+use yoctite_wgpu::{Culler, GBufferDrawer, GeometryPool};
 use std::{
     future::Future,
     panic::{self, AssertUnwindSafe},
@@ -163,7 +161,7 @@ mod tests {
     /// What the renderer asks for (`fyrox_graphics_wgpu::server`), where the card has it.
     fn as_the_renderer_asks() -> wgpu::Features {
         wgpu::Features::EXPERIMENTAL_RAY_QUERY
-            | fyrox_graphics_wgpu::yoctite::SOFTWARE_FEATURES
+            | yoctite_wgpu::SOFTWARE_FEATURES
             | wgpu::Features::TIMESTAMP_QUERY
             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
     }

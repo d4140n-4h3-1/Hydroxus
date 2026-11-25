@@ -24,7 +24,6 @@ members = [
     "fyrox-material",
     "fyrox-graphics-gl",
     "fyrox-graphics-wgpu",
-    "yoctite",
     "fyrox-gfx"]
 resolver = "2"
 
@@ -49,3 +48,10 @@ inherits = "dev"
 strip = "symbols"
 debug = false
 opt-level = 3
+
+# yoctite-candelite (Yoctite and Candelite, used by fyrox-gfx) depends on this engine through its
+# GitHub URL. Inside this workspace, that URL means the crates right here, so there is one engine.
+[patch."https://github.com/d4140n-4h3-1/Hydroxus.git"]
+fyrox-core = { path = "fyrox-core" }
+fyrox-graphics = { path = "fyrox-graphics" }
+fyrox-graphics-wgpu = { path = "fyrox-graphics-wgpu" }
