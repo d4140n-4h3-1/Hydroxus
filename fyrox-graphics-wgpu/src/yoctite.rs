@@ -242,19 +242,29 @@ pub struct PoolBuffer<T> {
     /// How many `T`s it has room for.
     capacity: u32,
     ranges: RangeAllocator,
+    /// The most `T`s it can hold: as many as the device can bind at once, or make a buffer of.
+    limit: u32,
     label: &'static str,
     usage: wgpu::BufferUsages,
     _of: PhantomData<T>,
 }
 
+/// The largest storage buffer `device` can bind, in bytes: past it a bind group cannot be made.
+pub fn storage_binding_limit(device: &wgpu::Device) -> u64 {
+    let limits = device.limits();
+    (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size)
+}
+
 impl<T: bytemuck::Pod> PoolBuffer<T> {
     fn new(device: &wgpu::Device, label: &'static str, capacity: u32, usage: wgpu::BufferUsages) -> Self {
-        let capacity = capacity.max(1);
+        let limit = (storage_binding_limit(device) / std::mem::size_of::<T>() as u64).min(u32::MAX as u64) as u32;
+        let capacity = capacity.clamp(1, limit.max(1));
         let usage = usage | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
         Self {
             buffer: Self::create(device, label, capacity, usage),
             capacity,
             ranges: RangeAllocator::default(),
+            limit,
             label,
             usage,
             _of: PhantomData,
@@ -270,12 +280,18 @@ impl<T: bytemuck::Pod> PoolBuffer<T> {
         })
     }
 
-    /// Room for `count` more, by where it starts, making the buffer bigger if it has to.
-    fn allocate(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, count: u32) -> u32 {
+    /// Room for `count` more, by where it starts, making the buffer bigger if it has to; none
+    /// if that would take it past what the device can bind (see [`storage_binding_limit`]).
+    fn allocate(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, count: u32) -> Option<u32> {
         let start = self.ranges.allocate(count);
         let needed = self.ranges.high_water();
+        if needed > self.limit {
+            // Given back, which takes the high water back down to where it was.
+            self.ranges.free(start, count);
+            return None;
+        }
         if needed > self.capacity {
-            let capacity = needed.max(self.capacity * 2);
+            let capacity = needed.max(self.capacity.saturating_mul(2)).min(self.limit);
             let bigger = Self::create(device, self.label, capacity, self.usage);
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("YoctitePoolGrow"),
@@ -291,7 +307,7 @@ impl<T: bytemuck::Pod> PoolBuffer<T> {
             self.buffer = bigger;
             self.capacity = capacity;
         }
-        start
+        Some(start)
     }
 
     fn write(&self, queue: &wgpu::Queue, start: u32, items: &[T]) {
@@ -328,6 +344,11 @@ impl<T: bytemuck::Pod> PoolBuffer<T> {
     /// How many `T`s it has room for.
     pub fn capacity(&self) -> u32 {
         self.capacity
+    }
+
+    /// The most `T`s it can ever hold on this device.
+    pub fn limit(&self) -> u32 {
+        self.limit
     }
 }
 
@@ -416,14 +437,15 @@ impl GeometryPool {
     }
 
     /// Uploads a mesh: its `vertices`, and its clusters at every level of detail, `dag`, whose
-    /// clusters index those vertices.
+    /// clusters index those vertices. None if the pool cannot hold it on this device, nothing of
+    /// it taken: the mesh is left for the caller to draw some other way.
     pub fn add_mesh(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         dag: &ClusterDag,
         vertices: &[PoolVertex],
-    ) -> MeshId {
+    ) -> Option<MeshId> {
         self.add_morphing_mesh(device, queue, dag, vertices, None)
     }
 
@@ -438,7 +460,7 @@ impl GeometryPool {
         dag: &ClusterDag,
         vertices: &[PoolVertex],
         morphs: Option<Morphs>,
-    ) -> MeshId {
+    ) -> Option<MeshId> {
         let morphs = morphs.filter(|m| {
             let fits = m.offsets.len() == vertices.len() * m.targets as usize;
             if !fits {
@@ -451,7 +473,65 @@ impl GeometryPool {
             }
             m.targets > 0 && fits
         });
+        // The morph targets' offsets, packed as half floats, three words to a vertex and target.
+        let morph_words: Option<(Vec<u32>, u32)> = morphs.map(|m| {
+            let words: Vec<u32> = m
+                .offsets
+                .iter()
+                .flat_map(|o| {
+                    let half = |v: f32| half::f16::from_f32(v).to_bits() as u32;
+                    [
+                        half(o[0]) | half(o[1]) << 16,
+                        half(o[2]) | half(o[3]) << 16,
+                        half(o[4]) | half(o[5]) << 16,
+                    ]
+                })
+                .collect();
+            (words, m.targets)
+        });
+        let vertex_total: u32 = dag.clusters.iter().map(|c| c.vertices.len() as u32).sum();
+        let triangle_total: u32 = dag.clusters.iter().map(|c| c.triangles.len() as u32).sum();
+
+        // Room in every buffer first, before anything is written: if any of it is past what the
+        // device can bind, what was taken is given back and the mesh is not uploaded.
         let first_vertex = self.vertices.allocate(device, queue, vertices.len() as u32);
+        let morph_start = morph_words
+            .as_ref()
+            .map(|(words, _)| self.vertices.allocate(device, queue, slots_for(words.len() as u32)));
+        let first_cluster_vertex = self.cluster_vertices.allocate(device, queue, vertex_total);
+        let first_triangle = self.triangles.allocate(device, queue, triangle_total);
+        let first_cluster = self.clusters.allocate(device, queue, dag.clusters.len() as u32);
+        let mesh = self.meshes.allocate(device, queue, 1);
+        let (
+            Some(first_vertex),
+            Some(first_cluster_vertex),
+            Some(first_triangle),
+            Some(first_cluster),
+            Some(mesh),
+            None | Some(Some(_)),
+        ) = (first_vertex, first_cluster_vertex, first_triangle, first_cluster, mesh, morph_start)
+        else {
+            // Given back last taken first, so each buffer's high water goes back to where it was.
+            if let Some(mesh) = mesh {
+                self.meshes.free(mesh, 1);
+            }
+            if let Some(start) = first_cluster {
+                self.clusters.free(start, dag.clusters.len() as u32);
+            }
+            if let Some(start) = first_triangle {
+                self.triangles.free(start, triangle_total);
+            }
+            if let Some(start) = first_cluster_vertex {
+                self.cluster_vertices.free(start, vertex_total);
+            }
+            if let (Some(Some(start)), Some((words, _))) = (morph_start, &morph_words) {
+                self.vertices.free(start, slots_for(words.len() as u32));
+            }
+            if let Some(start) = first_vertex {
+                self.vertices.free(start, vertices.len() as u32);
+            }
+            return None;
+        };
         self.vertices.write(queue, first_vertex, vertices);
 
         // How far each vertex can be moved, every target at its most.
@@ -469,31 +549,11 @@ impl GeometryPool {
                 .collect(),
             None => Vec::new(),
         };
-        let morph_place = morphs.map(|m| {
-            let words: Vec<u32> = m
-                .offsets
-                .iter()
-                .flat_map(|o| {
-                    let half = |v: f32| half::f16::from_f32(v).to_bits() as u32;
-                    [
-                        half(o[0]) | half(o[1]) << 16,
-                        half(o[2]) | half(o[3]) << 16,
-                        half(o[4]) | half(o[5]) << 16,
-                    ]
-                })
-                .collect();
-            let slots = slots_for(words.len() as u32);
-            let start = self.vertices.allocate(device, queue, slots);
+        let morph_place = morph_words.map(|(words, targets)| {
+            let start = morph_start.flatten().expect("room taken above");
             self.vertices.write_bytes(queue, start as u64 * VERTEX_BYTES, bytemuck::cast_slice(&words));
-            (start, slots, m.targets)
+            (start, slots_for(words.len() as u32), targets)
         });
-
-        let vertex_total: u32 = dag.clusters.iter().map(|c| c.vertices.len() as u32).sum();
-        let triangle_total: u32 = dag.clusters.iter().map(|c| c.triangles.len() as u32).sum();
-        let first_cluster_vertex = self.cluster_vertices.allocate(device, queue, vertex_total);
-        let first_triangle = self.triangles.allocate(device, queue, triangle_total);
-        let first_cluster = self.clusters.allocate(device, queue, dag.clusters.len() as u32);
-        let mesh = self.meshes.allocate(device, queue, 1);
 
         let mut cluster_vertices = Vec::with_capacity(vertex_total as usize);
         let mut triangles = Vec::with_capacity(triangle_total as usize);
@@ -556,7 +616,7 @@ impl GeometryPool {
             triangles: (first_triangle, triangle_total),
             morphs: morph_place,
         });
-        MeshId(mesh)
+        Some(MeshId(mesh))
     }
 
     /// Takes a mesh out, giving back its room. Its instances have to be removed first, or they
@@ -591,21 +651,28 @@ impl GeometryPool {
         mesh: MeshId,
         transform: [f32; 12],
         material: u32,
-    ) -> InstanceId {
-        let slot = self.instances.allocate(device, queue, 1);
+    ) -> Option<InstanceId> {
+        let slot = self.instances.allocate(device, queue, 1)?;
         // A copy of a mesh that bends gets a block of its own: the mesh's morphs, where to find
         // them, and its weights, all at nothing to begin with.
         let place = self.places.get(mesh.0 as usize).copied().flatten();
-        let block = place.and_then(|p| p.morphs.map(|m| (p.record.first_vertex, m))).map(|(first, (start, _, targets))| {
-            let slots = slots_for(MORPH_HEADER + targets);
-            let at = self.vertices.allocate(device, queue, slots);
-            let mut words = vec![0u32; (slots * VERTEX_FLOATS) as usize];
-            words[0] = first;
-            words[1] = start * VERTEX_FLOATS;
-            words[2] = targets;
-            self.vertices.write_bytes(queue, at as u64 * VERTEX_BYTES, bytemuck::cast_slice(&words));
-            Block { at, slots, words }
-        });
+        let block = match place.and_then(|p| p.morphs.map(|m| (p.record.first_vertex, m))) {
+            Some((first, (start, _, targets))) => {
+                let slots = slots_for(MORPH_HEADER + targets);
+                // No room for its block: no instance either.
+                let Some(at) = self.vertices.allocate(device, queue, slots) else {
+                    self.instances.free(slot, 1);
+                    return None;
+                };
+                let mut words = vec![0u32; (slots * VERTEX_FLOATS) as usize];
+                words[0] = first;
+                words[1] = start * VERTEX_FLOATS;
+                words[2] = targets;
+                self.vertices.write_bytes(queue, at as u64 * VERTEX_BYTES, bytemuck::cast_slice(&words));
+                Some(Block { at, slots, words })
+            }
+            None => None,
+        };
         let record = GpuInstance {
             transform,
             mesh: mesh.0,
@@ -620,7 +687,7 @@ impl GeometryPool {
         }
         self.placed[slot as usize] = Some(record);
         self.blocks[slot as usize] = block;
-        InstanceId(slot)
+        Some(InstanceId(slot))
     }
 
     /// Sets the weights an instance of a mesh that bends gives its morph targets, in order; past
@@ -1576,8 +1643,11 @@ impl Culler {
                 // Room for what it chose, and some to spare, from the next culling on: in the
                 // first phase's lists, and in the clusters put aside.
                 let needed = counts[1].max(counts[4]).max(counts[8]);
-                if needed > self.capacity {
-                    let wanted = (needed as u64 * 5 / 4).next_power_of_two().min(u32::MAX as u64 / 2) as u32;
+                // No more than the device can bind: past that, what does not fit is left out as
+                // it is when the lists overflow, rather than the lists made too big to bind.
+                let most = (storage_binding_limit(device) / LIST_BYTES).min(u32::MAX as u64 / 2) as u32;
+                if needed > self.capacity && self.capacity < most {
+                    let wanted = (needed as u64 * 5 / 4).next_power_of_two().min(most as u64) as u32;
                     self.set_capacity(device, wanted);
                 }
                 self.stats = Some(stats);
@@ -3213,8 +3283,8 @@ mod test {
         let mut pool = GeometryPool::new(&device, 1 << 12);
         let (vertices_a, dag_a) = hill(40, 6.0);
         let (vertices_b, dag_b) = hill(24, 2.0);
-        let a = pool.add_mesh(&device, &queue, &dag_a, &vertices_a);
-        let b = pool.add_mesh(&device, &queue, &dag_b, &vertices_b);
+        let a = pool.add_mesh(&device, &queue, &dag_a, &vertices_a).unwrap();
+        let b = pool.add_mesh(&device, &queue, &dag_b, &vertices_b).unwrap();
         let mut seed = 7u32;
         let mut random = || {
             seed ^= seed << 13;
@@ -3228,7 +3298,7 @@ mod test {
                 let mesh = if (x + z) % 3 == 0 { b } else { a };
                 let at = [x as f32 * 50.0 - 750.0, random() * 4.0, z as f32 * 50.0 - 750.0];
                 let material = ((x * 7 + z) % MATERIALS as usize) as u32;
-                instances.push(pool.add_instance(&device, &queue, mesh, placed(random() * std::f32::consts::TAU, 0.5 + random() * 1.5, at), material));
+                instances.push(pool.add_instance(&device, &queue, mesh, placed(random() * std::f32::consts::TAU, 0.5 + random() * 1.5, at), material).unwrap());
             }
         }
         // Some slots freed, which the culling has to pass over.
@@ -3308,6 +3378,55 @@ mod test {
         assert!(compared > 1000);
     }
 
+    /// A device that can bind no more than `bytes` of a storage buffer, as small GPUs and
+    /// software renderers cannot (128 MB, say): the pool refuses what would not fit rather than
+    /// growing past it, and gives back what it took for it.
+    fn device_binding_at_most(bytes: u64) -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let mut limits = adapter.limits();
+        limits.max_storage_buffer_binding_size = (limits.max_storage_buffer_binding_size as u64).min(bytes) as _;
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: limits,
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    #[test]
+    fn what_the_device_cannot_bind_is_refused_and_given_back() {
+        let Some((device, queue)) = device_binding_at_most(256 << 10) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut pool = GeometryPool::new(&device, 1 << 12);
+        let (small_vertices, small_dag) = hill(10, 1.0);
+        let (big_vertices, big_dag) = hill(200, 6.0);
+        assert!(
+            big_vertices.len() as u64 * VERTEX_BYTES > 256 << 10,
+            "the big mesh has to be past the limit"
+        );
+        let before = pool.stats();
+        assert_eq!(pool.add_mesh(&device, &queue, &big_dag, &big_vertices), None, "too big to bind");
+        let after = pool.stats();
+        assert_eq!((before.meshes, before.vertices, before.clusters), (after.meshes, after.vertices, after.clusters));
+        assert_eq!(pool.vertices.ranges.high_water(), 0, "the room it took given back");
+        // What does fit still goes in, and is drawn from.
+        let small = pool.add_mesh(&device, &queue, &small_dag, &small_vertices).expect("fits");
+        assert!(pool.add_instance(&device, &queue, small, placed(0.0, 1.0, [0.0; 3]), 0).is_some());
+        // Every buffer can still be bound: none has grown past what the device binds.
+        for buffer in [
+            pool.vertices.buffer(),
+            pool.cluster_vertices.buffer(),
+            pool.triangles.buffer(),
+            pool.clusters.buffer(),
+            pool.meshes.buffer(),
+            pool.instances.buffer(),
+        ] {
+            assert!(buffer.size() <= 256 << 10, "{} bytes", buffer.size());
+        }
+    }
+
     #[test]
     fn a_list_too_small_is_made_bigger() {
         let Some((device, queue)) = device() else {
@@ -3316,9 +3435,9 @@ mod test {
         };
         let mut pool = GeometryPool::new(&device, 1 << 12);
         let (vertices, dag) = hill(40, 6.0);
-        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
         for i in 0..50 {
-            pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [i as f32 * 45.0, 0.0, -60.0]), 0);
+            pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [i as f32 * 45.0, 0.0, -60.0]), 0).unwrap();
         }
         let mut culler = Culler::new(&device);
         culler.set_capacity(&device, 10);
@@ -3444,9 +3563,9 @@ mod test {
         // whose diffuse texture is see-through all over.
         let mut pool = GeometryPool::new(&device, 1 << 12);
         let (vertices, dag) = hill(16, 0.0);
-        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
-        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0);
-        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [0.0, 0.0, 0.0]), 1);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
+        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0).unwrap();
+        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [0.0, 0.0, 0.0]), 1).unwrap();
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
         let clear = swatch(&device, &queue, [255, 255, 255, 0]);
@@ -3601,9 +3720,9 @@ mod test {
         // view - the floor in a colour of its own.
         let mut pool = GeometryPool::new(&device, 1 << 12);
         let (vertices, dag) = hill(16, 0.0);
-        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
-        let floor = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-8.0, 0.0, -8.0]), 0);
-        let roof = pool.add_instance(&device, &queue, mesh, placed(0.0, 4.0, [-32.0, 20.0, -32.0]), 1);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
+        let floor = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-8.0, 0.0, -8.0]), 0).unwrap();
+        let roof = pool.add_instance(&device, &queue, mesh, placed(0.0, 4.0, [-32.0, 20.0, -32.0]), 1).unwrap();
         let white = swatch(&device, &queue, [255; 4]);
         let red = swatch(&device, &queue, [255, 0, 0, 255]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
@@ -3773,7 +3892,7 @@ mod test {
         let mut pool = GeometryPool::new(&device, 16);
         // Something not bending first, so the bending mesh is not at the start of the buffer.
         let (still, still_dag) = hill(10, 1.0);
-        pool.add_mesh(&device, &queue, &still_dag, &still);
+        pool.add_mesh(&device, &queue, &still_dag, &still).unwrap();
         let (vertices, dag) = hill(20, 3.0);
         let targets = 2;
         let offsets: Vec<[f32; 6]> = (0..vertices.len())
@@ -3789,11 +3908,11 @@ mod test {
                 offsets: &offsets,
                 most_weight: 2.0,
             }),
-        );
-        let instance = pool.add_instance(&device, &queue, mesh, [0.0; 12], 0);
-        let unbent = pool.add_instance(&device, &queue, MeshId(0), [0.0; 12], 0);
+        ).unwrap();
+        let instance = pool.add_instance(&device, &queue, mesh, [0.0; 12], 0).unwrap();
+        let unbent = pool.add_instance(&device, &queue, MeshId(0), [0.0; 12], 0).unwrap();
         // Two more right after it, set out of order: written with it in one run.
-        let next: Vec<InstanceId> = (0..2).map(|_| pool.add_instance(&device, &queue, mesh, [0.0; 12], 0)).collect();
+        let next: Vec<InstanceId> = (0..2).map(|_| pool.add_instance(&device, &queue, mesh, [0.0; 12], 0).unwrap()).collect();
         pool.set_weights(next[1], &[3.0, 4.0]);
         pool.set_weights(instance, &[0.5, -0.25, 9.0]);
         pool.set_weights(next[0], &[1.0, 2.0]);
@@ -3878,8 +3997,8 @@ mod test {
             &dag,
             &vertices,
             Some(Morphs { targets: 1, offsets: &offsets, most_weight: 1.0 }),
-        );
-        let instance = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0);
+        ).unwrap();
+        let instance = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0).unwrap();
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
         let materials = [ResolvedMaterial {
@@ -3986,11 +4105,11 @@ mod test {
             &dag,
             &vertices,
             Some(Morphs { targets: 1, offsets: &offsets, most_weight: 1.0 }),
-        );
-        let instance = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0);
+        ).unwrap();
+        let instance = pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-16.0, 0.0, 0.0]), 0).unwrap();
         // And one below the middle whose diffuse texture is see-through all over: left out by the
         // alpha test, in software as in hardware.
-        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-8.0, 0.0, 16.0]), 1);
+        pool.add_instance(&device, &queue, mesh, placed(0.0, 1.0, [-8.0, 0.0, 16.0]), 1).unwrap();
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
         let clear = swatch(&device, &queue, [255, 255, 255, 0]);
@@ -4085,29 +4204,29 @@ mod test {
         let mut pool = GeometryPool::new(&device, 16);
         let (vertices_a, dag_a) = hill(40, 6.0);
         let (vertices_b, dag_b) = hill(24, 2.0);
-        let a = pool.add_mesh(&device, &queue, &dag_a, &vertices_a);
-        let b = pool.add_mesh(&device, &queue, &dag_b, &vertices_b);
+        let a = pool.add_mesh(&device, &queue, &dag_a, &vertices_a).unwrap();
+        let b = pool.add_mesh(&device, &queue, &dag_b, &vertices_b).unwrap();
         check_mesh(&device, &queue, &pool, a, &vertices_a, &dag_a);
         check_mesh(&device, &queue, &pool, b, &vertices_b, &dag_b);
 
         // Taken out, and its room used again by another, without disturbing the rest.
         pool.remove_mesh(&queue, a);
         let (vertices_c, dag_c) = hill(30, 4.0);
-        let c = pool.add_mesh(&device, &queue, &dag_c, &vertices_c);
+        let c = pool.add_mesh(&device, &queue, &dag_c, &vertices_c).unwrap();
         assert_eq!(c, a, "the freed slot");
         assert_eq!(pool.mesh(c).unwrap().first_vertex, 0, "the freed vertices");
         check_mesh(&device, &queue, &pool, b, &vertices_b, &dag_b);
         check_mesh(&device, &queue, &pool, c, &vertices_c, &dag_c);
 
         let at = |x: f32| [1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        let instances: Vec<InstanceId> = (0..2000).map(|i| pool.add_instance(&device, &queue, if i % 2 == 0 { b } else { c }, at(i as f32), 0)).collect();
+        let instances: Vec<InstanceId> = (0..2000).map(|i| pool.add_instance(&device, &queue, if i % 2 == 0 { b } else { c }, at(i as f32), 0).unwrap()).collect();
         pool.move_instance(&queue, instances[7], at(-1.0));
         pool.remove_instance(&queue, instances[3]);
         let gpu: Vec<GpuInstance> = read(&device, &queue, pool.instances.buffer(), pool.instance_slots());
         assert_eq!(gpu[7].transform[3], -1.0);
         assert_eq!(gpu[3].flags, 0, "a removed instance is marked free");
         assert_eq!((gpu[8].mesh, gpu[8].flags, gpu[8].transform[3]), (b.0, INSTANCE_ALIVE, 8.0));
-        assert_eq!(pool.add_instance(&device, &queue, b, at(0.0), 0), instances[3], "its slot reused");
+        assert_eq!(pool.add_instance(&device, &queue, b, at(0.0), 0).unwrap(), instances[3], "its slot reused");
 
         let stats = pool.stats();
         assert_eq!((stats.meshes, stats.instances), (2, 2000));

@@ -4001,7 +4001,7 @@ mod test {
             let (vertices, indices) = boxed(min, max, top_only);
             let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
             let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
-            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
             let first = pool.mesh(mesh).unwrap().first_cluster;
             let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
             captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, 0).expect("room"));
@@ -4099,12 +4099,12 @@ mod test {
             let (vertices, indices) = boxed(min, max, top_only);
             let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
             let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
-            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
             let first = pool.mesh(mesh).unwrap().first_cluster;
             let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
             captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, 0).expect("room"));
             scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
-            pool.add_instance(&device, &queue, mesh, transform, 0);
+            pool.add_instance(&device, &queue, mesh, transform, 0).unwrap();
         }
         // A blue card 5 m out, in front of the box: drawn on its left half, see-through on its
         // right (its texture's alpha), traced as a cutout.
@@ -4120,12 +4120,12 @@ mod test {
         let positions: Vec<[f32; 3]> = card.iter().map(|v| v.position).collect();
         let uvs: Vec<[f32; 2]> = card.iter().map(|v| v.uv).collect();
         let dag = yoctite::build(&yoctite::Mesh::new(&positions, &card_indices), Default::default());
-        let mesh = pool.add_mesh(&device, &queue, &dag, &card);
+        let mesh = pool.add_mesh(&device, &queue, &dag, &card).unwrap();
         let first = pool.mesh(mesh).unwrap().first_cluster;
         captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &[first], 1).expect("room"));
         let mask = Arc::new(CutoutMask::new(2, 1, |x, _| x == 0));
         scene.add_mesh(&device, &queue, mesh, &positions, &card_indices, Some((&uvs, mask)));
-        pool.add_instance(&device, &queue, mesh, shifted([0.0, 0.0, -5.0]), 1);
+        pool.add_instance(&device, &queue, mesh, shifted([0.0, 0.0, -5.0]), 1).unwrap();
 
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
@@ -4238,12 +4238,12 @@ mod test {
             let (vertices, indices) = boxed(min, max, top_only);
             let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
             let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
-            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
             let first = pool.mesh(mesh).unwrap().first_cluster;
             let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
             captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
             scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
-            pool.add_instance(&device, &queue, mesh, shifted(at), slot);
+            pool.add_instance(&device, &queue, mesh, shifted(at), slot).unwrap();
         }
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
@@ -4363,12 +4363,12 @@ mod test {
             let (vertices, indices) = boxed(min, max, top_only);
             let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
             let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
-            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
             let first = pool.mesh(mesh).unwrap().first_cluster;
             let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
             captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
             scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
-            pool.add_instance(&device, &queue, mesh, shifted(at), slot);
+            pool.add_instance(&device, &queue, mesh, shifted(at), slot).unwrap();
         }
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
@@ -4475,12 +4475,12 @@ mod test {
             let (vertices, indices) = boxed(min, max, top_only);
             let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
             let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
-            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
             let first = pool.mesh(mesh).unwrap().first_cluster;
             let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
             captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
             scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
-            pool.add_instance(&device, &queue, mesh, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], slot);
+            pool.add_instance(&device, &queue, mesh, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], slot).unwrap();
         }
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
@@ -4568,12 +4568,12 @@ mod test {
             let (vertices, indices) = boxed(min, max, top_only);
             let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
             let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
-            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices).unwrap();
             let first = pool.mesh(mesh).unwrap().first_cluster;
             let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
             captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, slot).expect("room"));
             scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
-            pool.add_instance(&device, &queue, mesh, shifted([0.0; 3]), slot);
+            pool.add_instance(&device, &queue, mesh, shifted([0.0; 3]), slot).unwrap();
         }
         let white = swatch(&device, &queue, [255; 4]);
         let flat = swatch(&device, &queue, [128, 128, 255, 255]);
