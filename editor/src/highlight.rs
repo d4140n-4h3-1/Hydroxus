@@ -167,6 +167,7 @@ impl SceneRenderPass for HighlightRenderPass {
                     renderer_resources: ctx.renderer_resources,
                     ambient_light: Default::default(),
                     scene_depth: Some(ctx.depth_texture),
+                    scene_color: None,
                     viewport: ctx.observer.viewport,
                     uniform_memory_allocator: ctx.uniform_memory_allocator,
                     resource_manager: ctx.resource_manager,

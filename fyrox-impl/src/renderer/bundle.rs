@@ -143,6 +143,7 @@ pub struct BundleRenderContext<'a> {
     // TODO: Add depth pre-pass to remove Option here. Current architecture allows only forward
     // renderer to have access to depth buffer that is available from G-Buffer.
     pub scene_depth: Option<&'a GpuTexture>,
+    pub scene_color: Option<&'a GpuTexture>,
     pub renderer_resources: &'a RendererResources,
 }
 
@@ -608,6 +609,15 @@ impl RenderDataBundle {
                             &render_context.renderer_resources.black_dummy
                         },
                         &render_context.renderer_resources.nearest_clamp_sampler,
+                        resource_definition.binding,
+                    ));
+                }
+                "fyrox_sceneColor" => {
+                    material_bindings.push(ResourceBinding::texture(
+                        render_context
+                            .scene_color
+                            .unwrap_or(&render_context.renderer_resources.black_dummy),
+                        &render_context.renderer_resources.linear_clamp_sampler,
                         resource_definition.binding,
                     ));
                 }

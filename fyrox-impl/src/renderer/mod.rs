@@ -220,6 +220,9 @@ pub struct RenderDataContainer {
     /// Intermediate high dynamic range frame buffer.
     pub hdr_scene_framebuffer: GpuFrameBuffer,
 
+    // Allocated on demand for forward materials that sample the opaque scene.
+    opaque_color_framebuffer: Option<GpuFrameBuffer>,
+
     /// Final frame of the container. Tone mapped + gamma corrected.
     pub ldr_scene_framebuffer: GpuFrameBuffer,
 
@@ -324,6 +327,7 @@ impl RenderDataContainer {
             gbuffer: GBuffer::new(server, width, height)?,
             hdr_renderer: HighDynamicRangeRenderer::new(width, height, server)?,
             hdr_scene_framebuffer,
+            opaque_color_framebuffer: None,
             ldr_scene_framebuffer,
             ldr_temp_framebuffer: [
                 make_ldr_temp_frame_buffer(server, width, height, depth_stencil.clone())?,
@@ -348,6 +352,30 @@ impl RenderDataContainer {
             true,
             true,
         );
+    }
+
+    fn capture_opaque_color(
+        snapshot: &mut Option<GpuFrameBuffer>,
+        scene: &GpuFrameBuffer,
+        width: i32,
+        height: i32,
+        server: &dyn GraphicsServer,
+    ) -> Result<GpuTexture, FrameworkError> {
+        if snapshot.is_none() {
+            let color = server.create_2d_render_target(
+                "ObserverOpaqueColor",
+                PixelKind::RGB10A2,
+                width as usize,
+                height as usize,
+            )?;
+            *snapshot =
+                Some(server.create_frame_buffer(None, vec![Attachment::color(color)])?);
+        }
+        let snapshot = snapshot.as_ref().unwrap();
+        scene.blit_to(
+            snapshot, 0, 0, width, height, 0, 0, width, height, true, false, false,
+        );
+        Ok(snapshot.color_attachments()[0].texture.clone())
     }
 
     /// Returns high-dynamic range frame buffer texture.
@@ -1316,6 +1344,47 @@ impl Renderer {
         server.gpu_mark("Fog");
         {
             let _debug_scope = server.begin_scope("ForwardRendering");
+            let needs_opaque_color = bundle_storage.bundles.iter().any(|bundle| {
+                if bundle.render_path != RenderPath::Forward {
+                    return false;
+                }
+                let material = bundle.material.state();
+                let Some(material) = material.data_ref() else {
+                    return false;
+                };
+                let shader = material.shader().state();
+                let requests_snapshot = shader.data_ref().is_some_and(|shader| {
+                    shader
+                        .definition
+                        .resources
+                        .iter()
+                        .any(|resource| resource.name.as_str() == "fyrox_sceneColor")
+                });
+                // Materials with explicit weights can opt out of the copy.
+                requests_snapshot
+                    && material.property_group_ref("properties").is_none_or(|properties| {
+                        let refraction = properties
+                            .property_ref("sceneColorWeight")
+                            .and_then(|weight| weight.as_float());
+                        let reflection = properties
+                            .property_ref("reflectionWeight")
+                            .and_then(|weight| weight.as_float());
+                        (refraction.is_none() && reflection.is_none())
+                            || refraction.unwrap_or(0.0) > 0.0
+                            || reflection.unwrap_or(0.0) > 0.0
+                    })
+            });
+            let opaque_color = if needs_opaque_color {
+                Some(RenderDataContainer::capture_opaque_color(
+                    &mut render_data.opaque_color_framebuffer,
+                    &render_data.hdr_scene_framebuffer,
+                    render_data.gbuffer.width,
+                    render_data.gbuffer.height,
+                    server,
+                )?)
+            } else {
+                None
+            };
 
             render_data.statistics += bundle_storage.render_to_frame_buffer(
                 server,
@@ -1335,6 +1404,7 @@ impl Renderer {
                     renderer_resources: &self.renderer_resources,
                     ambient_light: scene.rendering_options.ambient_lighting_color,
                     scene_depth: Some(depth),
+                    scene_color: opaque_color.as_ref(),
                 },
             )?;
         }

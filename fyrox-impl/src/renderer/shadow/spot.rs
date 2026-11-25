@@ -177,6 +177,7 @@ impl SpotShadowMapRenderer {
                 renderer_resources,
                 ambient_light: Color::WHITE, // TODO
                 scene_depth: None,
+                scene_color: None,
             },
         )?;
 

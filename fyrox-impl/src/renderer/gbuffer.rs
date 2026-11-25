@@ -252,6 +252,7 @@ impl GBuffer {
                 renderer_resources,
                 ambient_light: Color::WHITE, // TODO
                 scene_depth: None,           // TODO. Add z-pre-pass.
+                scene_color: None,
             },
         )?;
 
