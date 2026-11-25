@@ -197,7 +197,8 @@ fn mask_key(texture: u64, alpha: u8) -> u64 {
 }
 
 /// Which texels of `texture` the renderer draws, with every alpha first multiplied by `alpha`:
-/// [`None`] if it draws them all, or if its texels cannot be read here (a compressed format).
+/// [`None`] if it draws them all, or if its texels cannot be read here (a compressed format, or a
+/// render target, whose texels are only ever on the GPU).
 fn cutout_mask(texture: &fyrox::resource::texture::Texture, alpha: f32) -> Option<CutoutMask> {
     use fyrox::resource::texture::{TextureKind, TexturePixelKind};
     let TextureKind::Rectangle { width, height } = texture.kind() else {
@@ -210,10 +211,14 @@ fn cutout_mask(texture: &fyrox::resource::texture::Texture, alpha: f32) -> Optio
         TexturePixelKind::RGBA16 => (8, 6, true),
         _ => return None,
     };
-    let data = texture.mip_level_data(0);
-    if width == 0 || height == 0 || data.len() < width as usize * height as usize * stride {
+    // The first mip level is at the start of the texture's bytes. A render target has none on the
+    // CPU, so its length is checked here before slicing: `mip_level_data` would panic on it.
+    let size = width as usize * height as usize * stride;
+    let data = texture.data();
+    if width == 0 || height == 0 || data.len() < size {
         return None;
     }
+    let data = &data[..size];
     let drawn = |x: u32, y: u32| {
         let i = (y as usize * width as usize + x as usize) * stride + at;
         let texel = if wide {
@@ -1635,6 +1640,15 @@ mod tests {
     #[test]
     fn a_texture_drawn_all_over_is_traced_solid() {
         assert!(cutout_mask(&texture(4, |_, _| 255), 1.0).is_none());
+    }
+
+    #[test]
+    fn a_render_target_is_traced_solid() {
+        // A camera's picture shown on a screen (Maze's race monitors): its texels are only on the
+        // GPU, so there is nothing to read, and it must not panic trying.
+        use fyrox::resource::texture::{TextureResource, TextureResourceExtension};
+        let picture = TextureResource::new_render_target(512, 288);
+        assert!(cutout_mask(&picture.data_ref(), 1.0).is_none());
     }
 
     #[test]
