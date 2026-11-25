@@ -1,0 +1,31 @@
+[package]
+name = "fyrox-gfx"
+version = "0.1.0"
+edition = "2021"
+description = "Graphics improvements for Fyrox that live outside the engine core: refractive glass, and more to come."
+license = "MIT"
+
+[dependencies]
+# The wind offsets of meshes that bend are kept as half floats (Yoctite, traced shadows).
+half = "2.2.1"
+# No default features: the game using this crate decides between OpenGL and wgpu (Vulkan).
+fyrox = { version = "2.0.0-rc.1", path = "../fyrox", default-features = false }
+
+# Ray tracing lives in the wgpu backend, because that is where the device and the acceleration
+# structures are. Games on OpenGL simply do not enable this feature.
+fyrox-graphics-wgpu = { version = "2.0.0-rc.1", path = "../fyrox-graphics-wgpu", optional = true }
+# Yoctite's clusters and levels of detail, for the cluster view.
+yoctite = { version = "0.1.0", path = "../yoctite", optional = true }
+# The engine's own wgpu, to ask the card what it can do before Yoctite and Candelite start.
+wgpu = { version = "30.0.0", optional = true }
+
+[features]
+raytracing = ["dep:fyrox-graphics-wgpu", "dep:yoctite", "dep:wgpu", "fyrox/backend_wgpu"]
+
+[dev-dependencies]
+fyrox = { version = "2.0.0-rc.1", path = "../fyrox", default-features = false, features = ["backend_wgpu"] }
+fyrox-graphics-wgpu = { version = "2.0.0-rc.1", path = "../fyrox-graphics-wgpu" }
+
+[[example]]
+name = "glass"
+required-features = []

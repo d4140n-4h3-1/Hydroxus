@@ -43,8 +43,9 @@ the [API docs](https://docs.rs/fyrox/) and the
 
 ## Used by
 
-- [fyrox-gfx](https://github.com/d4140n-4h3-1/fyrox-gfx): graphics effects - traced shadows,
-  area lights, glass, reflections, anti-aliasing - as render passes.
+- [fyrox-gfx](fyrox-gfx): graphics effects - traced shadows, area lights, glass, reflections,
+  anti-aliasing - as render passes. Part of this workspace; games add it with
+  `fyrox-gfx = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan" }`.
 - [MazeGame](https://github.com/d4140n-4h3-1/MazeGame): the game it was made for, and its
   [web build](https://github.com/d4140n-4h3-1/MazeGame-web).
 
