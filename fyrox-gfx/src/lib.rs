@@ -197,6 +197,14 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     distance_blur_switch: Switch,
+    /// Whether Yoctite draws the scene, and whether Candelite lights it, as the game says (see
+    /// [`Self::yoctite_switch`] and [`Self::candelite_switch`]).
+    #[visit(skip)]
+    #[reflect(hidden)]
+    yoctite_switch: Switch,
+    #[visit(skip)]
+    #[reflect(hidden)]
+    candelite_switch: Switch,
 }
 
 impl Default for GraphicsEffects {
@@ -235,6 +243,8 @@ impl Default for GraphicsEffects {
             reflection_switch: Switch::default(),
             distance_blur: None,
             distance_blur_switch: Switch::default(),
+            yoctite_switch: Switch::default(),
+            candelite_switch: Switch::default(),
         }
     }
 }
@@ -265,6 +275,24 @@ impl GraphicsEffects {
     /// [`Self::with_distance_blur`]): on until the game turns it off.
     pub fn distance_blur_switch(&self) -> Switch {
         self.distance_blur_switch.clone()
+    }
+
+    /// The switch for Yoctite, if it draws the scene (see [`Self::with_yoctite`]): on until the
+    /// game turns it off. Off, its geometry is let go and the renderer draws every mesh itself,
+    /// lit with the scene's flat ambient colour - Candelite, which lights Yoctite's geometry, off
+    /// with it; on again, every mesh is uploaded to it afresh. Where Yoctite cannot run, it does
+    /// nothing.
+    pub fn yoctite_switch(&self) -> Switch {
+        self.yoctite_switch.clone()
+    }
+
+    /// The switch for Candelite's global illumination, if it lights the frame (see
+    /// [`Self::with_candelite`]): on until the game turns it off. Off, its cards and traced
+    /// scenes are let go and the scene is lit with its flat ambient colour, Yoctite still drawing
+    /// it; on again, every mesh is given its cards afresh. Where Candelite cannot run, it does
+    /// nothing.
+    pub fn candelite_switch(&self) -> Switch {
+        self.candelite_switch.clone()
     }
 
     /// Blurs what is far off, more the further (see [`distance_blur`]). Off by default.
@@ -548,6 +576,7 @@ impl Plugin for GraphicsEffects {
                     set
                 });
                 let mut pass = yoctite::YoctitePass::new(TypeId::of::<Self>(), mode, taken_over);
+                pass.follow_yoctite_switch(self.yoctite_switch.clone());
                 if candelite && self.candelite_light {
                     pass.show_candelite_light();
                 } else if candelite && self.candelite_view {
@@ -559,6 +588,7 @@ impl Plugin for GraphicsEffects {
                     graphics_context.renderer.set_indirect_diffuse(Some(indirect.clone()));
                     graphics_context.renderer.set_indirect_specular(Some(specular.clone()));
                     pass.light_with_candelite(indirect, specular);
+                    pass.follow_candelite_switch(self.candelite_switch.clone());
                 }
                 let pass = Rc::new(RefCell::new(pass));
                 graphics_context.renderer.add_render_pass(pass);

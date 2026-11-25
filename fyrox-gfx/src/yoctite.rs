@@ -438,6 +438,12 @@ pub struct YoctitePass {
     candelite_overlay: bool,
     candelite_shows: ViewShows,
     indirect: Option<(fyrox::renderer::IndirectDiffuse, fyrox::renderer::IndirectSpecular)>,
+    /// The game's switches for Yoctite and for Candelite, if it has them, and whether each was on
+    /// as of the last frame (see [`Self::follow_switches`]).
+    yoctite_switch: Option<crate::Switch>,
+    yoctite_on: bool,
+    candelite_switch: Option<crate::Switch>,
+    candelite_on: bool,
 }
 
 impl YoctitePass {
@@ -457,6 +463,54 @@ impl YoctitePass {
             candelite_overlay: false,
             candelite_shows: ViewShows::Shaded,
             indirect: None,
+            yoctite_switch: None,
+            yoctite_on: true,
+            candelite_switch: None,
+            candelite_on: true,
+        }
+    }
+
+    /// Lets the game switch Yoctite off, and on again, while it runs.
+    pub fn follow_yoctite_switch(&mut self, switch: crate::Switch) {
+        self.yoctite_switch = Some(switch);
+    }
+
+    /// Lets the game switch Candelite off, and on again, while it runs.
+    pub fn follow_candelite_switch(&mut self, switch: crate::Switch) {
+        self.candelite_switch = Some(switch);
+    }
+
+    /// Follows the game's switches, if one was flipped since the last frame. Candelite is on only
+    /// while Yoctite is: it lights and traces Yoctite's geometry.
+    ///
+    /// Yoctite off, every scene is let go - its geometry, and Candelite's cards and traced scene -
+    /// and the renderer draws every mesh itself again, lit with its flat ambient colour. Candelite
+    /// off, its cards and traced scenes are let go, and the light it gathered taken back from the
+    /// renderer. Either on again, the scenes start again: a mesh is given its cards as it is
+    /// uploaded, so every mesh is uploaded again (its clusters kept by the builder), the renderer
+    /// drawing them meanwhile.
+    fn follow_switches(&mut self) {
+        let yoctite = self.yoctite_switch.as_ref().is_none_or(crate::Switch::is_enabled);
+        let candelite = yoctite && self.candelite_switch.as_ref().is_none_or(crate::Switch::is_enabled);
+        if yoctite == self.yoctite_on && candelite == self.candelite_on {
+            return;
+        }
+        let restart = yoctite != self.yoctite_on || candelite;
+        self.yoctite_on = yoctite;
+        self.candelite_on = candelite;
+        if let Some((indirect, specular)) = &self.indirect {
+            indirect.borrow_mut().clear();
+            specular.borrow_mut().clear();
+        }
+        if restart {
+            if let Some(taken_over) = &self.taken_over {
+                taken_over.borrow_mut().clear();
+            }
+            self.scenes.clear();
+        } else {
+            for scene in self.scenes.values_mut() {
+                scene.candelite = None;
+            }
         }
     }
 
@@ -1250,12 +1304,16 @@ impl SceneRenderPass for YoctitePass {
         let Some(server) = ctx.server.as_any().downcast_ref::<WgpuGraphicsServer>() else {
             return Ok(Default::default());
         };
+        self.follow_switches();
+        if !self.yoctite_on {
+            return Ok(Default::default());
+        }
         let started = Instant::now();
         let builder = self.builder.get_or_insert_with(Builder::new);
         builder.collect();
         let scene = self.scenes.entry(ctx.scene_handle).or_default();
         let meshes = scene.built.len();
-        let changed = scene.sync(server, &ctx.scene.graph, self.mode, builder, self.candelite);
+        let changed = scene.sync(server, &ctx.scene.graph, self.mode, builder, self.candelite && self.candelite_on);
         // From the next frame on the renderer leaves these out: this one, it drew them already,
         // which drawing them again changes nothing of.
         if let (true, Some(taken_over)) = (changed, &self.taken_over) {
@@ -1349,6 +1407,9 @@ impl SceneRenderPass for YoctitePass {
     }
 
     fn on_hdr_render(&mut self, ctx: SceneRenderPassContext) -> Result<RenderPassStatistics, FrameworkError> {
+        if !self.yoctite_on {
+            return Ok(Default::default());
+        }
         let Mode::View { on_gpu } = self.mode else {
             return self.candelite_view(ctx);
         };
