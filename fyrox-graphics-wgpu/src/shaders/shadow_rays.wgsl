@@ -24,7 +24,7 @@ enable wgpu_ray_query;
 // A real light has a size, and a shadow's edge is soft where only part of it is hidden. The rays
 // spread over a disk the size of the light - or, for the sun, over the cone its disk fills in the
 // sky - and the pixel gets the share of them that got through. The spread is turned a little from
-// pixel to pixel in a 4x4 pattern, and with one ray reaches out a different way too, so that
+// traced pixel to traced pixel in a 4x4 pattern, and with one ray reaches out a different way too, so that
 // neighboring pixels test different parts of the light and a small blur afterwards averages them
 // into a smooth edge. Where the frames are averaged after (temporal anti-aliasing), the pattern
 // turns from frame to frame as well, so one ray a pixel covers the whole light over a few frames:
@@ -220,12 +220,18 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let count = max(uniforms.sampleCount, 1u);
     let t = tangent(toLight);
     let b = cross(toLight, t);
-    let rotation = fract(pattern_rotation(pixel) + uniforms.turn);
+    // The pattern runs over the mask's own pixels - the ones traced - not the screen's. At half
+    // resolution the traced pixels of a frame all sit at the same place in their 2x2 blocks, and
+    // by the screen's pixels they took only 4 of the 16 turns, all within a quarter of the light:
+    // every ray of a frame leant to one side of the lamp, the turn from frame to frame swung it
+    // round, and the shadows' edges changed angle from frame to frame.
+    let cell = vec2i(fragCoord.xy);
+    let rotation = fract(pattern_rotation(cell) + uniforms.turn);
     // With one ray, how far out it goes varies too - over the 4x4 block, in another order than
     // the turn, and from frame to frame - or every ray would keep to one ring round the middle.
     var out = 0.5;
     if (count == 1u) {
-        out = fract(pattern_rotation(vec2i(pixel.y + 2, pixel.x + 1)) + 1.0 / 32.0 + uniforms.reachOut);
+        out = fract(pattern_rotation(vec2i(cell.y + 2, cell.x + 1)) + 1.0 / 32.0 + uniforms.reachOut);
     }
     var lit = vec3f(0.0);
     for (var i = 0u; i < count; i++) {
