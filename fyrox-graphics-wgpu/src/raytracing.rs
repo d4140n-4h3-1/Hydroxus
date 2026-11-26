@@ -1680,9 +1680,10 @@ impl ShadowTracer {
                 mask_size: [mask_width as i32, mask_height as i32],
                 offset: [offset[0] as i32, offset[1] as i32],
                 scale: scale as i32,
-                // Soft edges are averaged over the 4x4 turns of the pattern, 5x5 pixels; at half
-                // resolution 3x3 traced ones reach about as far, the turns over the frames
-                // averaged after. Hard edges are only filled in, from the traced pixels nearest.
+                // Soft edges are averaged over 5x5 pixels; at half resolution over 3x3 traced
+                // ones, which reach about as far and hold the whole 3x3 pattern of rays over the
+                // light (see `pattern` in shadow_rays.wgsl), the turns over the frames averaged
+                // after. Hard edges are only filled in, from the traced pixels nearest.
                 radius: if soft && scale == 1 { 2 } else { 1 },
                 _padding: [0; 2],
             };

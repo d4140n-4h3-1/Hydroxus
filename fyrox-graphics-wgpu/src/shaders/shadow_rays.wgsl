@@ -24,7 +24,7 @@ enable wgpu_ray_query;
 // A real light has a size, and a shadow's edge is soft where only part of it is hidden. The rays
 // spread over a disk the size of the light - or, for the sun, over the cone its disk fills in the
 // sky - and the pixel gets the share of them that got through. The spread is turned a little from
-// traced pixel to traced pixel in a 4x4 pattern, and with one ray reaches out a different way too, so that
+// traced pixel to traced pixel in a 3x3 pattern (see `pattern`), and with one ray reaches out a different way too, so that
 // neighboring pixels test different parts of the light and a small blur afterwards averages them
 // into a smooth edge. Where the frames are averaged after (temporal anti-aliasing), the pattern
 // turns from frame to frame as well, so one ray a pixel covers the whole light over a few frames:
@@ -122,16 +122,19 @@ fn tangent(n: vec3f) -> vec3f {
     return vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
 }
 
-// How far to turn the sample pattern at this pixel, as a fraction of a full turn: every pixel of a
-// 4x4 block gets a different one.
-fn pattern_rotation(pixel: vec2i) -> f32 {
-    var bayer = array<f32, 16>(
-        0.0, 8.0, 2.0, 10.0,
-        12.0, 4.0, 14.0, 6.0,
-        3.0, 11.0, 1.0, 9.0,
-        15.0, 7.0, 13.0, 5.0
-    );
-    return bayer[(pixel.y & 3) * 4 + (pixel.x & 3)] / 16.0;
+// Where on the light the ray of this traced pixel goes, before the turn of the frame: how far
+// round, as a fraction of a full turn, and which of three rings, each a third of the disk's area.
+//
+// Every 3x3 traced pixels - what the blur averages - hold the nine of a pattern repeating every 3:
+// three rings, one for each column, and on each ring three rays a third of a turn apart, one for
+// each row, each ring turned a ninth of a turn from the last. Three rays a third of a turn apart
+// cancel out, whatever ring they are on and however the frame turns them, so no frame's rays lean
+// to any side of the light. With a 4x4 pattern of turns instead, the 3x3 of it the blur took did
+// not cancel out: each frame's shadows leant a little to one side, and as the turn from frame to
+// frame swung it round their edges changed angle, or, averaged over frames, jittered.
+fn pattern(cell: vec2i) -> vec2f {
+    let c = vec2f(vec2i(cell.x % 3, cell.y % 3));
+    return vec2f(c.x / 9.0 + c.y / 3.0, c.x);
 }
 
 // Sample `i` of `count` on a unit disk spanned by `t` and `b`, spread evenly by the golden angle,
@@ -220,18 +223,23 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let count = max(uniforms.sampleCount, 1u);
     let t = tangent(toLight);
     let b = cross(toLight, t);
-    // The pattern runs over the mask's own pixels - the ones traced - not the screen's. At half
+    // The pattern runs over the mask's own pixels - the ones traced - not the screen's: at half
     // resolution the traced pixels of a frame all sit at the same place in their 2x2 blocks, and
-    // by the screen's pixels they took only 4 of the 16 turns, all within a quarter of the light:
-    // every ray of a frame leant to one side of the lamp, the turn from frame to frame swung it
-    // round, and the shadows' edges changed angle from frame to frame.
-    let cell = vec2i(fragCoord.xy);
-    let rotation = fract(pattern_rotation(cell) + uniforms.turn);
-    // With one ray, how far out it goes varies too - over the 4x4 block, in another order than
-    // the turn, and from frame to frame - or every ray would keep to one ring round the middle.
+    // by the screen's pixels they took only a few of its places.
+    let place = pattern(vec2i(fragCoord.xy));
+    let rotation = fract(place.x + uniforms.turn);
+    // With one ray, how far out it goes varies too - by the pattern's rings, and within each from
+    // frame to frame - or every ray would keep to one ring round the middle. Within the three rings
+    // the frame's rays go s, 1 - s and halfway out, in turn: so many out as in, every frame, and
+    // the nine spread as far over the light every frame. Moved out together, a frame's rays spread
+    // wider or narrower than the last, and the shadows' soft edges with them.
     var out = 0.5;
     if (count == 1u) {
-        out = fract(pattern_rotation(vec2i(cell.y + 2, cell.x + 1)) + 1.0 / 32.0 + uniforms.reachOut);
+        let ring = u32(place.y);
+        let reach = uniforms.reachOut;
+        let which = (ring + u32(uniforms.turn * 3.0)) % 3u;
+        let within = select(select(0.5, 1.0 - reach, which == 1u), reach, which == 0u);
+        out = (place.y + within) / 3.0;
     }
     var lit = vec3f(0.0);
     for (var i = 0u; i < count; i++) {
