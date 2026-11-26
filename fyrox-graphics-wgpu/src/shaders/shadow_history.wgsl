@@ -13,14 +13,20 @@
 //
 // Shadows move without the view moving: a flashlight in a walking hand, a droid walking past a
 // lamp, a lamp's reach coming onto the screen as you walk up to it (outside it the mask is lit).
-// Averaged over ten frames, they trailed and faded in. So the history is always held to the range
-// this frame's shadow takes in the 5x5 traced pixels round each one: where this frame is wholly
-// lit or wholly shadowed, the old shadow goes at once; in soft edges, where the rays differ from
-// pixel to pixel, there is still room to average. The range is taken over traced pixels, a stride
-// apart at half resolution, and wider than the blur reaches: over the 3x3 screen pixels round
-// each, mostly filled in from the same one or two traced ones, it was as narrow as one frame's
-// noise, and held to it the shadows stayed as grainy as one ray a pixel. (Held only when the light moved, a droid's shadow under a
-// lamp that stood still smeared behind it.)
+// Averaged over ten frames, they trailed and faded in. So the history is always held to what this
+// frame's shadow is in the 5x5 traced pixels round each one - traced ones, a stride apart at half
+// resolution, and wider than the blur reaches: where this frame is wholly lit or wholly shadowed,
+// the old shadow goes at once; in soft edges, where the rays differ from pixel to pixel, there is
+// still room to average.
+//
+// Held to their whole range, from wholly lit to wholly shadowed anywhere within a few pixels of an
+// edge, nothing was held back there: a droid walking by left a ghost of where its shadow had been.
+// Held to the 3x3 screen pixels round each, mostly filled in from the same one or two traced ones,
+// it was as narrow as one frame's noise, and the shadows stayed as grainy as one ray a pixel. So
+// the history is held within the range to the 5x5's mean give or take three quarters of how far
+// they spread (variance clipping): where they are mostly lit, a shadow gone from there is cut
+// back; in a soft edge, whose mean over the 25 is close to its average over the frames, there is
+// as much room as its noise.
 
 struct Uniforms {
     inverseViewProjection: mat4x4f,
@@ -33,6 +39,9 @@ struct Uniforms {
     // How many screen pixels apart the traced ones are: 2 at half resolution.
     stride: u32,
 };
+
+// How many times the spread of this frame's 5x5 round a pixel its history may be off their mean.
+const HELD = 0.75;
 
 @group(0) @binding(0) var current: texture_2d<f32>;
 @group(0) @binding(1) var history: texture_2d<f32>;
@@ -106,14 +115,22 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let currentSize = vec2i(textureDimensions(current));
     var lo = now;
     var hi = now;
+    var sum1 = vec3f(0.0);
+    var sum2 = vec3f(0.0);
     let stride = i32(uniforms.stride);
     for (var y = -2; y <= 2; y++) {
         for (var x = -2; x <= 2; x++) {
             let near = textureLoad(current, clamp(pixel + vec2i(x, y) * stride, vec2i(0), currentSize - 1), 0).rgb;
             lo = min(lo, near);
             hi = max(hi, near);
+            sum1 += near;
+            sum2 += near * near;
         }
     }
+    let mean = sum1 / 25.0;
+    let spread = sqrt(max(sum2 / 25.0 - mean * mean, vec3f(0.0)));
+    lo = max(lo, mean - HELD * spread);
+    hi = min(hi, mean + HELD * spread);
     let then = clamp(sum / weight, lo, hi);
     return vec4f(mix(then, now, uniforms.blend), range);
 }

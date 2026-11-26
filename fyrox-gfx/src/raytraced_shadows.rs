@@ -112,8 +112,10 @@ pub struct RayTracedShadows {
     /// How far off a surface a ray starts, in meters, so it does not shadow itself.
     pub bias: f32,
     /// Rays per pixel, spread over the light's size: soft edges for a light with a size, smoother
-    /// the more rays, each costing as much again. With temporal anti-aliasing one is enough: the
-    /// rays turn over the light from frame to frame, and the frames are averaged.
+    /// the more rays. The rays turn over the light from frame to frame, and the frames are
+    /// averaged; but the average is held close to each frame's own shadows, so a moving shadow
+    /// leaves no ghost, and with one ray a frame's shadows are as noisy as that holds them to: two
+    /// halve it, for little more than one costs (the rest of tracing a light costs as much).
     pub samples: u32,
     /// The radius of the glowing part of a point light, in meters. Bigger is softer.
     pub point_light_size: f32,
@@ -133,7 +135,7 @@ impl Default for RayTracedShadows {
         Self {
             reach: 200.0,
             bias: 0.02,
-            samples: 1,
+            samples: 2,
             point_light_size: 0.15,
             spot_light_size: 0.03,
             sun_angular_radius: 1.0,

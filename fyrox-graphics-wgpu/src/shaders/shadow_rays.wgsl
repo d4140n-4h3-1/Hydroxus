@@ -228,19 +228,17 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     // by the screen's pixels they took only a few of its places.
     let place = pattern(vec2i(fragCoord.xy));
     let rotation = fract(place.x + uniforms.turn);
-    // With one ray, how far out it goes varies too - by the pattern's rings, and within each from
+    // How far out each ray goes varies too - by the pattern's rings, and within each from
     // frame to frame - or every ray would keep to one ring round the middle. Within the three rings
     // the frame's rays go s, 1 - s and halfway out, in turn: so many out as in, every frame, and
     // the nine spread as far over the light every frame. Moved out together, a frame's rays spread
     // wider or narrower than the last, and the shadows' soft edges with them.
-    var out = 0.5;
-    if (count == 1u) {
-        let ring = u32(place.y);
-        let reach = uniforms.reachOut;
-        let which = (ring + u32(uniforms.turn * 3.0)) % 3u;
-        let within = select(select(0.5, 1.0 - reach, which == 1u), reach, which == 0u);
-        out = (place.y + within) / 3.0;
-    }
+    // With more than one ray, the same within each ray's share of the disk.
+    let ring = u32(place.y);
+    let reach = uniforms.reachOut;
+    let which = (ring + u32(uniforms.turn * 3.0)) % 3u;
+    let within = select(select(0.5, 1.0 - reach, which == 1u), reach, which == 0u);
+    let out = (place.y + within) / 3.0;
     var lit = vec3f(0.0);
     for (var i = 0u; i < count; i++) {
         var spread = vec3f(0.0);
