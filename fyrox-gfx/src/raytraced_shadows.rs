@@ -1515,6 +1515,7 @@ impl LightShadowTracer for TracedLightShadows {
                 samples: self.settings.samples,
                 frame: self.turn_over_frames.then_some(self.frame as u32),
                 half_resolution: self.settings.half_resolution,
+                light_key: (u64::from(ctx.light.handle.generation()) << 32) | u64::from(ctx.light.handle.index()),
             },
         )
     }

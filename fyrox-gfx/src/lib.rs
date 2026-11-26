@@ -121,6 +121,8 @@ pub struct GraphicsEffects {
     /// [`Self::with_candelite_light_view`].
     #[cfg(feature = "raytracing")]
     candelite_light: bool,
+    /// What Candelite's light is multiplied by: see [`Self::with_candelite_strength`].
+    candelite_strength: f32,
     /// Whether Candelite lights the frame: see [`Self::with_candelite`].
     #[cfg(feature = "raytracing")]
     candelite: bool,
@@ -218,6 +220,7 @@ impl Default for GraphicsEffects {
             candelite_light: false,
             #[cfg(feature = "raytracing")]
             candelite: false,
+            candelite_strength: 1.0,
             refraction: None,
             soft_shadows: Some(SoftShadows::default()),
             anti_aliasing: Some(AntiAliasing::default()),
@@ -325,6 +328,17 @@ impl GraphicsEffects {
     pub fn with_candelite(mut self) -> Self {
         self.yoctite = Some(yoctite::Mode::Render);
         self.candelite = true;
+        self
+    }
+
+    /// Multiplies the light between surfaces Candelite lights the frame with by `strength` (1, as
+    /// it is, by default). Its light is as the scene's lamps and surfaces call for; but lamps set
+    /// for a renderer with no light between surfaces at all light pale, closed places - a white
+    /// corridor with a lamp every few meters - far brighter with it, filling in their shadows.
+    /// Below 1, the scene keeps the look it was made with.
+    #[cfg(feature = "raytracing")]
+    pub fn with_candelite_strength(mut self, strength: f32) -> Self {
+        self.candelite_strength = strength;
         self
     }
 
@@ -588,6 +602,7 @@ impl Plugin for GraphicsEffects {
                     graphics_context.renderer.set_indirect_diffuse(Some(indirect.clone()));
                     graphics_context.renderer.set_indirect_specular(Some(specular.clone()));
                     pass.light_with_candelite(indirect, specular);
+                    pass.set_candelite_strength(self.candelite_strength);
                     pass.follow_candelite_switch(self.candelite_switch.clone());
                 }
                 let pass = Rc::new(RefCell::new(pass));

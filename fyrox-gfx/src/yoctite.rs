@@ -437,6 +437,9 @@ pub struct YoctitePass {
     candelite: bool,
     candelite_overlay: bool,
     candelite_shows: ViewShows,
+    /// What the light Candelite gives the renderer is multiplied by: see
+    /// [`Self::set_candelite_strength`].
+    candelite_strength: f32,
     indirect: Option<(fyrox::renderer::IndirectDiffuse, fyrox::renderer::IndirectSpecular)>,
     /// The game's switches for Yoctite and for Candelite, if it has them, and whether each was on
     /// as of the last frame (see [`Self::follow_switches`]).
@@ -462,6 +465,7 @@ impl YoctitePass {
             candelite: false,
             candelite_overlay: false,
             candelite_shows: ViewShows::Shaded,
+            candelite_strength: 1.0,
             indirect: None,
             yoctite_switch: None,
             yoctite_on: true,
@@ -548,6 +552,12 @@ impl YoctitePass {
     pub fn light_with_candelite(&mut self, indirect: fyrox::renderer::IndirectDiffuse, specular: fyrox::renderer::IndirectSpecular) {
         self.candelite = true;
         self.indirect = Some((indirect, specular));
+    }
+
+    /// Multiplies the light between surfaces Candelite gives the renderer by `strength` (1, as
+    /// it is, by default): see `candelite::ScreenProbes::set_strength`.
+    pub fn set_candelite_strength(&mut self, strength: f32) {
+        self.candelite_strength = strength;
     }
 
     /// As [`Self::show_candelite`], and lights the cards - the sun with traced shadows, and the
@@ -1371,7 +1381,7 @@ impl SceneRenderPass for YoctitePass {
             *server.frame_encoder.borrow_mut() = Some(encoder);
             // The light between surfaces, for the renderer to light the frame with.
             if let Some((indirect, specular)) = &self.indirect {
-                if let Err(err) = gather(server, candelite, pool, &ctx, indirect, specular) {
+                if let Err(err) = gather(server, candelite, pool, &ctx, indirect, specular, self.candelite_strength) {
                     Log::err(format!("Candelite could not light the frame: {err:?}"));
                     candelite_failed = true;
                 }
@@ -1674,6 +1684,7 @@ fn gather(
     ctx: &GBufferPassContext,
     indirect: &fyrox::renderer::IndirectDiffuse,
     specular: &fyrox::renderer::IndirectSpecular,
+    strength: f32,
 ) -> Result<(), FrameworkError> {
     let device = &server.state.device;
     let (Some(light), Some(depth_attachment)) = (candelite.light.as_mut(), ctx.framebuffer.depth_attachment()) else {
@@ -1770,6 +1781,7 @@ fn gather(
         inverse_view_projection: columns(&inverse),
         target: wgpu_target.wgpu_texture(),
     };
+    probes.set_strength(strength);
     probes.record(device, &mut encoder, &mut candelite.scene, pool, &mut candelite.cache, light, radiance, &sunlight, &frame);
     server.gpu_mark_in(&mut encoder, "Candelite: screen probes");
     reflections.record(

@@ -669,6 +669,9 @@ pub struct ShadowRayParameters {
     /// rest from the traced ones on the same surface. With [`Self::frame`], a different pixel of
     /// each block is traced every frame, and the averaged frames come to the whole picture.
     pub half_resolution: bool,
+    /// Which light this is, the same from frame to frame: with [`Self::frame`], its shadows of
+    /// the frames before are kept under it.
+    pub light_key: u64,
 }
 
 /// The passes that trace the rays and smooth the result, kept between frames so their pipelines
@@ -684,12 +687,24 @@ pub struct ShadowTracer {
     history_pipeline: wgpu::RenderPipeline,
     history_layout: wgpu::BindGroupLayout,
     history_sampler: wgpu::Sampler,
-    /// Each light's shadows over the frames before, by the order the lights are traced in a
-    /// frame; the frame those were counted in, and how many traced so far in it.
-    histories: Vec<ShadowHistory>,
+    /// Each light's shadows over the frames before, by its key and how many times it was traced
+    /// before in the frame (once for each view it is seen in); the frame those were counted in,
+    /// and how many times each light was traced so far in it.
+    ///
+    /// Told apart by the order the lights were traced in a frame, a light took over the history of
+    /// whichever light was traced before it in the frame before - and as lights came into view
+    /// and went out of it, walking through a maze lit lamp after lamp, every light's shadows were
+    /// blended with another's, and jittered and trailed until they settled.
+    histories: HashMap<(u64, u32), ShadowHistory>,
+    /// Histories of lights gone out of view, their textures kept for the next to come into it.
+    spare: Vec<ShadowHistory>,
     frame: Option<u32>,
-    traced: usize,
+    traced: HashMap<u64, u32>,
 }
+
+/// How many frames a light's shadows over the frames before are kept for while it is not traced:
+/// a lamp out of view for a moment comes back as it was.
+const HISTORY_KEPT_FRAMES: u32 = 8;
 
 /// A light's shadows averaged over the frames before (see `shaders/shadow_history.wgsl`): two
 /// textures, one read while the other is written, and the view the latest was seen through.
@@ -703,6 +718,8 @@ struct ShadowHistory {
     valid: bool,
     /// Where the light was, or which way it shone, for the latest.
     light: Option<[f32; 3]>,
+    /// The frame it was last traced in.
+    used: u32,
 }
 
 impl ShadowRayLight {
@@ -1309,9 +1326,10 @@ impl WgpuGraphicsServer {
             history_pipeline,
             history_layout,
             history_sampler,
-            histories: Vec::new(),
+            histories: HashMap::new(),
+            spare: Vec::new(),
             frame: None,
-            traced: 0,
+            traced: HashMap::new(),
         })
     }
 }
@@ -1333,14 +1351,28 @@ impl ShadowTracer {
     ) -> Result<GpuTexture, FrameworkError> {
         if self.frame != Some(frame) {
             self.frame = Some(frame);
-            self.traced = 0;
+            self.traced.clear();
+            // Lights not traced for a while give their textures up for others.
+            let gone: Vec<(u64, u32)> = self
+                .histories
+                .iter()
+                .filter(|(_, history)| frame.wrapping_sub(history.used) > HISTORY_KEPT_FRAMES)
+                .map(|(&key, _)| key)
+                .collect();
+            for key in gone {
+                if let Some(mut history) = self.histories.remove(&key) {
+                    history.valid = false;
+                    history.light = None;
+                    self.spare.push(history);
+                }
+            }
         }
-        let index = self.traced;
-        self.traced += 1;
-        if self.histories.len() <= index {
-            self.histories.resize_with(index + 1, Default::default);
-        }
-        let history = &mut self.histories[index];
+        let seen = self.traced.entry(parameters.light_key).or_insert(0);
+        let key = (parameters.light_key, *seen);
+        *seen += 1;
+        let spare = &mut self.spare;
+        let history = self.histories.entry(key).or_insert_with(|| spare.pop().unwrap_or_default());
+        history.used = frame;
         let write = 1 - history.latest;
         let sized = |texture: &Option<GpuTexture>| {
             texture.as_ref().is_some_and(|t| {
