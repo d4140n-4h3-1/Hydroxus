@@ -1517,6 +1517,28 @@ mod tests {
     use fyrox::core::algebra::Perspective3;
 
     #[test]
+    fn lamps_fade_out_as_they_near_being_left_out() {
+        let lamp = |distance: f32| (distance, Lamp { position: [distance, 0.0, 0.0], reach: 10.0, light: [1.0; 3], spot: None });
+        // Two more than Candelite lights with, a meter apart, out of order.
+        let n = candelite::MOST_LAMPS + 2;
+        let lamps: Vec<_> = (0..n).rev().map(|i| lamp(i as f32)).collect();
+        let kept = faded(lamps);
+        assert_eq!(kept.len(), candelite::MOST_LAMPS, "no more than it lights with");
+        assert!(kept.windows(2).all(|w| w[0].position[0] < w[1].position[0]), "nearest first");
+        // The nearest left out is MOST_LAMPS meters off: those LAMP_FADE or more nearer, whole;
+        // those nearer it, dimmer the nearer, to nothing at it.
+        let cut = candelite::MOST_LAMPS as f32;
+        for lamp in &kept {
+            let expected = ((cut - lamp.position[0]) / LAMP_FADE).clamp(0.0, 1.0);
+            assert!((lamp.light[0] - expected).abs() < 1.0e-6, "lamp at {}: {:?}", lamp.position[0], lamp.light);
+        }
+        assert_eq!(kept[0].light, [1.0; 3]);
+        // With no more than it lights with, none is left out, and none fades.
+        let few = faded((0..3).map(|i| lamp(i as f32)).collect());
+        assert!(few.iter().all(|lamp| lamp.light == [1.0; 3]));
+    }
+
+    #[test]
     fn spheres_in_and_out_of_view() {
         // Looking down -z, as OpenGL's cameras do.
         let projection = Perspective3::new(1.0, 1.0, 0.1, 100.0).to_homogeneous();
@@ -1554,10 +1576,11 @@ mod tests {
 /// The lamps Candelite lights with besides the sun: the point and spot lights the frame is lit
 /// with, nearest `eye` first (it lights with [`candelite::MOST_LAMPS`]), each as the renderer
 /// lights with it - its colour linear times its intensity over pi, falling off to nothing at its
-/// reach, a spot's along its -y within its cone.
+/// reach, a spot's along its -y within its cone - faded out as it nears being left out (see
+/// [`faded`]).
 fn lamps_of(lights: &[fyrox::renderer::bundle::LightSource], eye: [f32; 3]) -> Vec<Lamp> {
     use fyrox::renderer::bundle::LightSourceKind;
-    let mut lamps: Vec<(f32, Lamp)> = lights
+    let lamps: Vec<(f32, Lamp)> = lights
         .iter()
         .filter_map(|source| {
             let light = linear(source.color).map(|c| c * source.intensity / std::f32::consts::PI);
@@ -1577,8 +1600,30 @@ fn lamps_of(lights: &[fyrox::renderer::bundle::LightSource], eye: [f32; 3]) -> V
             Some((distance, Lamp { position, reach, light, spot }))
         })
         .collect();
+    faded(lamps)
+}
+
+/// Over how many meters a lamp fades out as it nears being left out of the lamps Candelite lights
+/// with: see [`faded`].
+const LAMP_FADE: f32 = 3.0;
+
+/// `lamps`, each with how far it is from the eye, nearest first and no more than Candelite lights
+/// with ([`candelite::MOST_LAMPS`]), each faded by how near it is to being left out: to nothing
+/// as it comes within [`LAMP_FADE`] of the nearest lamp left out. Cut off sharply, a lamp left
+/// out switched the light bounced off what it lit off at once, and one let in on - whole patches
+/// of a corridor flickering as the view went past lamp after lamp of a maze. Faded, the light
+/// passes from one lamp to the next as the view moves.
+fn faded(mut lamps: Vec<(f32, Lamp)>) -> Vec<Lamp> {
     lamps.sort_by(|a, b| a.0.total_cmp(&b.0));
-    lamps.into_iter().map(|(_, lamp)| lamp).collect()
+    let cut = lamps.get(candelite::MOST_LAMPS).map_or(f32::INFINITY, |(distance, _)| *distance);
+    lamps.truncate(candelite::MOST_LAMPS);
+    lamps
+        .into_iter()
+        .map(|(distance, lamp)| {
+            let fade = ((cut - distance) / LAMP_FADE).clamp(0.0, 1.0);
+            Lamp { light: lamp.light.map(|c| c * fade), ..lamp }
+        })
+        .collect()
 }
 
 /// An sRGB colour, linear.
@@ -1593,12 +1638,15 @@ fn linear(c: fyrox::core::color::Color) -> [f32; 3] {
     })
 }
 
-/// The light Candelite lights with: the scene's first directional light - its up vector towards
-/// the sun, as the renderer lights with it, its colour linear times its intensity over pi, as the
-/// renderer's diffuse lighting gives off - and the sky, its ambient lighting colour, linear.
+/// The light Candelite lights with: the scene's first directional light that is on - its up
+/// vector towards the sun, as the renderer lights with it, its colour linear times its intensity
+/// over pi, as the renderer's diffuse lighting gives off - and the sky, its ambient lighting
+/// colour, linear.
 fn sunlight_of(scene: &Scene) -> Sunlight {
     let sky = linear(scene.rendering_options.ambient_lighting_color);
-    match scene.graph.linear_iter().find_map(|node| node.cast::<DirectionalLight>()) {
+    // Only a sun that is on: a game hides its sun at night, and the renderer does not light with it.
+    let on = |node: &&fyrox::scene::node::Node| node.global_visibility() && node.is_globally_enabled();
+    match scene.graph.linear_iter().filter(on).find_map(|node| node.cast::<DirectionalLight>()) {
         Some(sun) => {
             let base: &BaseLight = sun.base_light_ref();
             let toward = sun.up_vector().try_normalize(f32::EPSILON).unwrap_or_else(Vector3::y);
