@@ -184,6 +184,11 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     shadow_switch: ShadowSwitch,
+    /// Whether traced shadows may be traced at half resolution: see
+    /// [`Self::half_resolution_shadows_switch`].
+    #[visit(skip)]
+    #[reflect(hidden)]
+    half_resolution_switch: Switch,
     #[visit(skip)]
     #[reflect(hidden)]
     shadows_before_off: Option<[bool; 3]>,
@@ -242,6 +247,7 @@ impl Default for GraphicsEffects {
             area_light_pass: None,
             shadows_traced: false,
             shadow_switch: ShadowSwitch::default(),
+            half_resolution_switch: Switch::default(),
             shadows_before_off: None,
             reflection_switch: Switch::default(),
             distance_blur: None,
@@ -266,6 +272,14 @@ impl GraphicsEffects {
     /// was.
     pub fn shadow_switch(&self) -> Switch {
         self.shadow_switch.clone()
+    }
+
+    /// The switch for tracing shadows at half resolution, where [`RayTracedShadows::half_resolution`]
+    /// asks for it: on until the game turns it off. Off, every pixel is traced every frame - edges
+    /// as sharp moving as still, at about four times the rays - for places with few lamps; on, for
+    /// places with many, or a sun over all of it.
+    pub fn half_resolution_shadows_switch(&self) -> Switch {
+        self.half_resolution_switch.clone()
     }
 
     /// The switch for reflections, if there are any (see [`Self::with_reflections`]), on until
@@ -513,6 +527,7 @@ impl Plugin for GraphicsEffects {
                             shadows,
                             traced_scene,
                             self.shadow_switch.clone(),
+                            self.half_resolution_switch.clone(),
                             temporal,
                         ),
                     )));

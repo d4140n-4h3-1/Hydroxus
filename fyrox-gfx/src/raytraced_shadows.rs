@@ -743,6 +743,8 @@ pub struct TracedLightShadows {
     scene: SharedScene,
     /// Whether to trace at all.
     switch: crate::Switch,
+    /// Whether [`RayTracedShadows::half_resolution`] holds, or every pixel is traced.
+    half_resolution: crate::Switch,
     /// Which scene it traces.
     scene_handle: Option<Handle<Scene>>,
     /// Each shape's geometry, built once, and posed geometry refitted every frame.
@@ -852,6 +854,7 @@ impl TracedLightShadows {
         settings: RayTracedShadows,
         scene: SharedScene,
         switch: crate::Switch,
+        half_resolution: crate::Switch,
         turn_over_frames: bool,
     ) -> Self {
         Self {
@@ -860,6 +863,7 @@ impl TracedLightShadows {
             tracer: None,
             scene,
             switch,
+            half_resolution,
             scene_handle: None,
             geometry: Default::default(),
             places: Default::default(),
@@ -1516,7 +1520,7 @@ impl LightShadowTracer for TracedLightShadows {
                 scissor,
                 samples: self.settings.samples,
                 frame: self.turn_over_frames.then_some(self.frame as u32),
-                half_resolution: self.settings.half_resolution,
+                half_resolution: self.settings.half_resolution && self.half_resolution.is_enabled(),
                 light_key: (u64::from(ctx.light.handle.generation()) << 32) | u64::from(ctx.light.handle.index()),
             },
         )
