@@ -14,9 +14,12 @@
 // Shadows move without the view moving: a flashlight in a walking hand, a droid walking past a
 // lamp, a lamp's reach coming onto the screen as you walk up to it (outside it the mask is lit).
 // Averaged over ten frames, they trailed and faded in. So the history is always held to the range
-// this frame's shadow takes in the 3x3 pixels round each one: where this frame is wholly lit or
-// wholly shadowed, the old shadow goes at once; in soft edges, where the rays differ from pixel to
-// pixel, there is still room to average. (Held only when the light moved, a droid's shadow under a
+// this frame's shadow takes in the 5x5 traced pixels round each one: where this frame is wholly
+// lit or wholly shadowed, the old shadow goes at once; in soft edges, where the rays differ from
+// pixel to pixel, there is still room to average. The range is taken over traced pixels, a stride
+// apart at half resolution, and wider than the blur reaches: over the 3x3 screen pixels round
+// each, mostly filled in from the same one or two traced ones, it was as narrow as one frame's
+// noise, and held to it the shadows stayed as grainy as one ray a pixel. (Held only when the light moved, a droid's shadow under a
 // lamp that stood still smeared behind it.)
 
 struct Uniforms {
@@ -27,6 +30,8 @@ struct Uniforms {
     flipV: u32,
     // How much of this frame goes in; 1 starts again from it.
     blend: f32,
+    // How many screen pixels apart the traced ones are: 2 at half resolution.
+    stride: u32,
 };
 
 @group(0) @binding(0) var current: texture_2d<f32>;
@@ -101,9 +106,10 @@ fn fs_main(@builtin(position) fragCoord: vec4f) -> @location(0) vec4f {
     let currentSize = vec2i(textureDimensions(current));
     var lo = now;
     var hi = now;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            let near = textureLoad(current, clamp(pixel + vec2i(x, y), vec2i(0), currentSize - 1), 0).rgb;
+    let stride = i32(uniforms.stride);
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
+            let near = textureLoad(current, clamp(pixel + vec2i(x, y) * stride, vec2i(0), currentSize - 1), 0).rgb;
             lo = min(lo, near);
             hi = max(hi, near);
         }

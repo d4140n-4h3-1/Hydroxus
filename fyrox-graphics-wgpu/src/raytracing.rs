@@ -1380,6 +1380,8 @@ impl ShadowTracer {
             screen_size: [f32; 2],
             flip_v: u32,
             blend: f32,
+            stride: u32,
+            _pad: [u32; 3],
         }
         let uniforms = Uniforms {
             inverse_view_projection: inverse,
@@ -1388,6 +1390,8 @@ impl ShadowTracer {
             screen_size: [width as f32, height as f32],
             flip_v: parameters.flip_v as u32,
             blend: if history.valid { HISTORY_BLEND } else { 1.0 },
+            stride: if parameters.half_resolution { 2 } else { 1 },
+            _pad: [0; 3],
         };
         let device = &server.state.device;
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
