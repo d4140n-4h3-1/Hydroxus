@@ -49,6 +49,7 @@ use std::{
     hash::Hash,
     path::{Path, PathBuf},
 };
+pub mod calendar;
 pub mod color;
 pub mod color_gradient;
 pub mod dyntype;
