@@ -191,7 +191,35 @@ const MASK_LIMIT: u32 = 1024;
 
 /// The cutout masks made so far, by texture and the diffuse colour's alpha (see [`mask_key`]):
 /// [`None`] for a texture with every texel drawn, which is traced solid.
-pub(crate) type Masks = FxHashMap<u64, Option<Arc<CutoutMask>>>;
+///
+/// Each held with a [`Pin`] on its texture: a texture's key is made from where it is in memory, so
+/// a texture made after another was let go - as a game making its textures anew, a season's each
+/// day, does all the time - could otherwise be given the other's mask.
+pub(crate) type Masks = FxHashMap<u64, (Option<Arc<CutoutMask>>, Pin)>;
+
+/// A weak hold on a resource, which keeps what it is made in from being given to another while
+/// it is held, and so its key - which is where it is in memory - from being another's; but not
+/// the resource itself, whose data goes once nothing else holds it. For a cache keyed by
+/// resources' keys, so that it is never asked about another resource made where one it holds
+/// was (and, once [`Self::gone`], to let it go).
+#[derive(Clone, Debug)]
+pub(crate) struct Pin(std::sync::Weak<fyrox::core::parking_lot::Mutex<fyrox::asset::untyped::ResourceHeader>>);
+
+impl Pin {
+    pub(crate) fn of<T: fyrox::asset::TypedResourceData>(resource: &fyrox::asset::Resource<T>) -> Self {
+        Self(Arc::downgrade(&resource.clone().into_untyped().0))
+    }
+
+    /// Whether nothing holds the resource any more.
+    pub(crate) fn gone(&self) -> bool {
+        self.0.strong_count() == 0
+    }
+}
+
+/// Lets go of the masks of textures nothing holds any more.
+pub(crate) fn prune(masks: &mut Masks) {
+    masks.retain(|_, (_, pin)| !pin.gone());
+}
 
 /// The key a mask of `texture`, with diffuse alpha `alpha`, is kept under.
 fn mask_key(texture: u64, alpha: u8) -> u64 {
@@ -254,7 +282,7 @@ pub(crate) fn material_mask(material: &MaterialResource, masks: &mut Masks) -> O
     let material = material.state();
     let material = material.data_ref()?;
     let key = cutout(&material, masks)?;
-    masks.get(&key).cloned().flatten()
+    masks.get(&key).and_then(|(mask, _)| mask.clone())
 }
 
 /// The key of `material`'s cutout mask in `masks` (made and kept there the first time), if its
@@ -266,14 +294,15 @@ pub(crate) fn cutout(material: &fyrox::material::Material, masks: &mut Masks) ->
         _ => 255,
     };
     let key = mask_key(texture.key(), alpha);
-    if let Some(mask) = masks.get(&key) {
+    if let Some((mask, _)) = masks.get(&key) {
         return mask.is_some().then_some(key);
     }
+    let pin = Pin::of(&texture);
     let state = texture.state();
     let texture = state.data_ref()?;
     let mask = cutout_mask(&texture, alpha as f32 / 255.0).map(Arc::new);
     let is_cutout = mask.is_some();
-    masks.insert(key, mask);
+    masks.insert(key, (mask, pin));
     is_cutout.then_some(key)
 }
 
@@ -958,6 +987,7 @@ impl LightShadowTracer for TracedLightShadows {
         // and how far it has moved, in meters, since it was last bent.
         let mut new_bent = 0;
         let mut what_blocks: FxHashMap<u64, Option<Blocks>> = FxHashMap::default();
+        prune(&mut self.masks);
         self.frame += 1;
         let frame = self.frame;
 
@@ -1296,7 +1326,7 @@ impl LightShadowTracer for TracedLightShadows {
             let indices = triangles(surface, vertices.len() / 3);
             let updatable = matches!(shape, Shape::Posed(..));
             let mask = match how {
-                Blocks::Cutout(key) => self.masks.get(&key).cloned().flatten(),
+                Blocks::Cutout(key) => self.masks.get(&key).and_then(|(mask, _)| mask.clone()),
                 _ => None,
             };
             let geometry = match (how, mask) {
@@ -1538,6 +1568,19 @@ fn matrix_to_array(matrix: &Matrix4<f32>) -> [[f32; 4]; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_resource_is_made_with_the_key_of_one_pinned() {
+        use fyrox::resource::texture::TextureResource;
+        let texture = |size| fyrox::asset::Resource::new_embedded(texture(size, |_, _| 255));
+        let first: TextureResource = texture(4);
+        let (key, pin) = (first.key(), Pin::of(&first));
+        drop(first);
+        assert!(pin.gone());
+        for _ in 0..1000 {
+            assert_ne!(texture(4).key(), key, "a texture made where the pinned one was");
+        }
+    }
 
     /// A `size` by `size` RGBA texture, its alpha `alpha(x, y)`.
     fn texture(size: u32, alpha: impl Fn(u32, u32) -> u8) -> fyrox::resource::texture::Texture {

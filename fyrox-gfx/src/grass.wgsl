@@ -7,9 +7,10 @@
 // six triangles - its texture one of the game's cards. Which card, where in its cell it stands,
 // which way it faces, how big and how it is shaded all come of a hash of its cell, so the same
 // clumps grow there every frame. The ground's height, how thick the grass is, and how damp the
-// ground (where the bank grass grows) come from the game's map of the field. A clump not drawn -
-// past the radius, out of view, where no grass grows, or thinned out with distance - has its
-// vertices put outside the clip volume, and no triangle of it is drawn.
+// ground (where the bank grass grows) come from the game's map of the field, and how deep snow
+// lies on it. A clump not drawn - past the radius, out of view, where no grass grows, thinned out
+// with distance, or under the snow whole - has its vertices put outside the clip volume, and no
+// triangle of it is drawn.
 //
 // The wind bends the cards' tops along it, their bases still, in gusts that run over the field.
 
@@ -139,7 +140,13 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     let grow = 1.0 + frame.shape.w * smoothstep(radius * frame.shape.z, radius, distance);
     let scale = mix(frame.shape.x, frame.shape.y, unit(h0 >> 9u)) * grow;
     let size = frame.sizes[card].xy * scale;
-    let root = vec3f(root_xz.x, sample(heights, root_xz).r, root_xz.y);
+    // r: the ground's height; g: how deep snow lies on it. A clump the snow covers whole is not
+    // drawn.
+    let ground_at = sample(heights, root_xz);
+    if (size.y <= ground_at.g) {
+        return outside();
+    }
+    let root = vec3f(root_xz.x, ground_at.r, root_xz.y);
     // Out of view: its middle off the screen by more than the clump's size, give or take.
     let middle = frame.viewProjection * vec4f(root + vec3f(0.0, 0.5 * size.y, 0.0), 1.0);
     let slack = middle.w * 0.1 + size.x;

@@ -114,6 +114,9 @@ pub enum Mode {
 struct Built {
     mesh: MeshId,
     dag: Arc<ClusterDag>,
+    /// Its surface data, held so that while it is in the pool no other surface can be made where
+    /// the data was, with its key (see `raytraced_shadows::Pin`).
+    _data: Pin,
 }
 
 /// A mesh node's surface placed in the pool.
@@ -267,7 +270,9 @@ struct Builder {
     jobs: mpsc::Sender<Job>,
     done: mpsc::Receiver<Done>,
     /// Each surface built, or [`None`] while it builds.
-    dags: FxHashMap<u64, Option<Arc<ClusterDag>>>,
+    /// Each with a hold on its surface's data, so that none made after it was let go is given its
+    /// clusters (see `raytraced_shadows::Pin`).
+    dags: FxHashMap<u64, (Option<Arc<ClusterDag>>, Pin)>,
     /// Since it last had nothing to build: how many surfaces it built, of how many triangles,
     /// how long building them took the threads between them, and when it started.
     batch: (usize, usize, f64, Option<Instant>),
@@ -325,13 +330,15 @@ impl Builder {
     /// Takes in what the threads have built since last time.
     fn collect(&mut self) {
         while let Ok(done) = self.done.try_recv() {
-            self.dags.insert(done.key, Some(Arc::new(done.dag)));
+            if let Some((dag, _)) = self.dags.get_mut(&done.key) {
+                *dag = Some(Arc::new(done.dag));
+            }
             self.batch.0 += 1;
             self.batch.1 += done.triangles;
             self.batch.2 += done.seconds;
         }
         if let (count @ 1.., triangles, seconds, Some(started)) = self.batch {
-            if self.dags.values().all(Option::is_some) {
+            if self.dags.values().all(|(dag, _)| dag.is_some()) {
                 Log::info(format!(
                     "Yoctite: built {count} surfaces ({triangles} triangles) in {:.2} s, {seconds:.2} s of building \
                      on {} threads",
@@ -347,14 +354,14 @@ impl Builder {
     /// still building are kept.
     fn forget_unused<'a>(&mut self, scenes: impl Iterator<Item = &'a SceneMeshes>) {
         let used: FxHashSet<u64> = scenes.flat_map(|scene| scene.built.keys().copied()).collect();
-        self.dags.retain(|key, dag| dag.is_none() || used.contains(key));
+        self.dags.retain(|key, (dag, pin)| (dag.is_none() && !pin.gone()) || used.contains(key));
     }
 
     /// `surface`'s clusters, if they are built; if not, set building.
     fn dag(&mut self, surface: &Surface) -> Option<Arc<ClusterDag>> {
         let key = surface.data().key();
         match self.dags.entry(key) {
-            Entry::Occupied(built) => built.get().clone(),
+            Entry::Occupied(built) => built.get().0.clone(),
             Entry::Vacant(place) => {
                 let (vertices, indices) = read_surface(surface);
                 let job = Job {
@@ -364,7 +371,7 @@ impl Builder {
                     indices,
                 };
                 if self.jobs.send(job).is_ok() {
-                    place.insert(None);
+                    place.insert((None, Pin::of(&surface.data())));
                     self.batch.3.get_or_insert_with(Instant::now);
                 }
                 None
@@ -447,6 +454,7 @@ const CACHE_MS: f32 = 1.0;
 const CACHE_LEAST: usize = 32;
 
 use crate::support::ATLAS_SIZE;
+use crate::raytraced_shadows::Pin;
 
 /// Yoctite in the renderer: see the module's description. [`crate::GraphicsEffects::with_yoctite`]
 /// and [`crate::GraphicsEffects::with_yoctite_view`] add it.
@@ -1063,7 +1071,7 @@ impl SceneMeshes {
                                 most_weight: MOST_WEIGHT,
                             }),
                         );
-                        place.insert(Built { mesh, dag }).mesh
+                        place.insert(Built { mesh, dag, _data: Pin::of(&surface.data()) }).mesh
                     }
                 };
                 let (material, slot) = if rendering {
@@ -1186,9 +1194,9 @@ impl SceneMeshes {
                     }
                 }
             }
-            // The masks of textures swapped out, which no mesh is traced with any more: a game
-            // swapping them daily would otherwise keep every one it ever made.
-            candelite.masks.retain(|_, mask| mask.as_ref().is_none_or(|mask| Arc::strong_count(mask) > 1));
+            // The masks of textures swapped out and let go: a game swapping them daily would
+            // otherwise keep every one it ever made.
+            crate::raytraced_shadows::prune(&mut candelite.masks);
         }
         changed
     }
@@ -1394,6 +1402,7 @@ impl SceneRenderPass for YoctitePass {
         }
         let scene = self.scenes.get_mut(&ctx.scene_handle).expect("synced above");
         let Materials { by_key, masks, .. } = &mut scene.materials;
+        crate::raytraced_shadows::prune(masks);
         let materials: Vec<YoctiteMaterial> = by_key.values().filter_map(|slot| resolve(slot, masks, &mut ctx)).collect();
         let synced = started.elapsed().as_secs_f64();
 

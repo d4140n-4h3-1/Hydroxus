@@ -110,6 +110,9 @@ pub struct GrassMap {
 #[derive(Debug, Default)]
 struct Field {
     map: Option<GrassMap>,
+    /// How deep snow lies at each of the map's samples, in meters, if any: a clump it covers
+    /// whole is not drawn.
+    snow: Option<Vec<f32>>,
     cards: Vec<GrassCard>,
     /// Counts the maps and cards given, so the pass knows when to upload them.
     version: u64,
@@ -150,6 +153,15 @@ impl GrassField {
         }
         let mut field = self.0.borrow_mut();
         field.cards = cards;
+        field.version += 1;
+    }
+
+    /// How deep snow lies at each of the map's samples, in meters, row by row as the map's, from
+    /// now on; [`None`] for none. A clump the snow covers whole - its card's top under the
+    /// snow's - is not drawn; one it covers part of grows out of it.
+    pub fn set_snow(&self, snow: Option<Vec<f32>>) {
+        let mut field = self.0.borrow_mut();
+        field.snow = snow;
         field.version += 1;
     }
 
@@ -265,7 +277,7 @@ impl GrassPass {
             // The cards' textures may still be loading: tried again next frame.
             match cards_texture(device, queue, &field.cards, self.settings.cutoff) {
                 Some(Ok(cards)) => {
-                    gpu.group = Some(group(device, queue, gpu, map, &cards));
+                    gpu.group = Some(group(device, queue, gpu, map, field.snow.as_deref(), &cards));
                     self.uploaded = field.version;
                 }
                 Some(Err(why)) => {
@@ -590,7 +602,7 @@ fn mip_levels(pixels: &[u8], width: u32, height: u32, cutoff: f32) -> Vec<Vec<u8
 }
 
 /// The map's textures and the cards', uploaded, and the bind group over them and the uniforms.
-fn group(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &Gpu, map: &GrassMap, cards: &wgpu::Texture) -> wgpu::BindGroup {
+fn group(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &Gpu, map: &GrassMap, snow: Option<&[f32]>, cards: &wgpu::Texture) -> wgpu::BindGroup {
     let size = wgpu::Extent3d { width: map.width, height: map.depth, depth_or_array_layers: 1 };
     let texture = |label, format, data: &[u8]| {
         device.create_texture_with_data(
@@ -609,7 +621,15 @@ fn group(device: &wgpu::Device, queue: &wgpu::Queue, gpu: &Gpu, map: &GrassMap, 
             data,
         )
     };
-    let heights = texture("GrassHeights", wgpu::TextureFormat::R32Float, bytemuck::cast_slice(&map.heights));
+    // The ground's height, and the snow's depth on it.
+    let snow = snow.filter(|snow| snow.len() == map.heights.len());
+    let heights: Vec<f32> = map
+        .heights
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &h)| [h, snow.map_or(0.0, |snow| snow[i])])
+        .collect();
+    let heights = texture("GrassHeights", wgpu::TextureFormat::Rg32Float, bytemuck::cast_slice(&heights));
     let ground: Vec<u8> = map.density.iter().zip(&map.damp).flat_map(|(&d, &w)| [d, w]).collect();
     let ground = texture("GrassGround", wgpu::TextureFormat::Rg8Unorm, &ground);
     let cards_view = cards.create_view(&wgpu::TextureViewDescriptor {
