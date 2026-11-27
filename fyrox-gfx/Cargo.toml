@@ -19,11 +19,14 @@ fyrox-graphics-wgpu = { version = "2.0.0-rc.1", path = "../fyrox-graphics-wgpu",
 yoctite = { git = "https://github.com/d4140n-4h3-1/yoctite-candelite.git", branch = "main", optional = true }
 yoctite-wgpu = { git = "https://github.com/d4140n-4h3-1/yoctite-candelite.git", branch = "main", optional = true }
 candelite = { git = "https://github.com/d4140n-4h3-1/yoctite-candelite.git", branch = "main", optional = true }
-# The engine's own wgpu, to ask the card what it can do before Yoctite and Candelite start.
+# The engine's own wgpu, to ask the card what it can do before Yoctite and Candelite start, and
+# to draw the grass with.
 wgpu = { version = "30.0.0", optional = true }
+# The grass's uniforms, as bytes for the GPU.
+bytemuck = { version = "1", features = ["derive"], optional = true }
 
 [features]
-raytracing = ["dep:fyrox-graphics-wgpu", "dep:yoctite", "dep:yoctite-wgpu", "dep:candelite", "dep:wgpu", "fyrox/backend_wgpu"]
+raytracing = ["dep:fyrox-graphics-wgpu", "dep:yoctite", "dep:yoctite-wgpu", "dep:candelite", "dep:wgpu", "dep:bytemuck", "fyrox/backend_wgpu"]
 
 [dev-dependencies]
 fyrox = { version = "2.0.0-rc.1", path = "../fyrox", default-features = false, features = ["backend_wgpu"] }

@@ -46,6 +46,8 @@ pub mod antialiasing;
 pub mod area_lights;
 pub mod distance_blur;
 pub mod double_sided;
+#[cfg(feature = "raytracing")]
+pub mod grass;
 pub mod moving;
 pub mod occlusion;
 #[cfg(feature = "raytracing")]
@@ -66,6 +68,8 @@ pub use double_sided::make_double_sided;
 #[cfg(feature = "raytracing")]
 pub use area_lights::{AreaLight, AreaLights};
 pub use moving::{MovingThing, MovingThings};
+#[cfg(feature = "raytracing")]
+pub use grass::{GrassField, GrassMap, GrassSettings};
 pub use occlusion::AmbientOcclusion;
 #[cfg(feature = "raytracing")]
 pub use raytraced_shadows::RayTracedShadows;
@@ -189,6 +193,15 @@ pub struct GraphicsEffects {
     #[visit(skip)]
     #[reflect(hidden)]
     half_resolution_switch: Switch,
+    /// Grass, if wanted (see [`Self::with_grass`]), and the field it grows on, for the game.
+    #[cfg(feature = "raytracing")]
+    #[visit(skip)]
+    #[reflect(hidden)]
+    grass: Option<grass::GrassSettings>,
+    #[cfg(feature = "raytracing")]
+    #[visit(skip)]
+    #[reflect(hidden)]
+    grass_field: grass::GrassField,
     #[visit(skip)]
     #[reflect(hidden)]
     shadows_before_off: Option<[bool; 3]>,
@@ -248,6 +261,10 @@ impl Default for GraphicsEffects {
             shadows_traced: false,
             shadow_switch: ShadowSwitch::default(),
             half_resolution_switch: Switch::default(),
+            #[cfg(feature = "raytracing")]
+            grass: None,
+            #[cfg(feature = "raytracing")]
+            grass_field: grass::GrassField::default(),
             shadows_before_off: None,
             reflection_switch: Switch::default(),
             distance_blur: None,
@@ -280,6 +297,22 @@ impl GraphicsEffects {
     /// places with many, or a sun over all of it.
     pub fn half_resolution_shadows_switch(&self) -> Switch {
         self.half_resolution_switch.clone()
+    }
+
+    /// Grass over the ground round the eye, as `settings` has it (see [`grass`]): drawn into the
+    /// G-Buffer in one instanced draw, where the game's [`Self::grass_field`] says it grows. Needs
+    /// the wgpu backend.
+    #[cfg(feature = "raytracing")]
+    pub fn with_grass(mut self, settings: grass::GrassSettings) -> Self {
+        self.grass = Some(settings);
+        self
+    }
+
+    /// The field the grass grows on, for the game to give its map and the wind: shared with the
+    /// grass, so a copy taken before the effects are handed to the executor stays connected.
+    #[cfg(feature = "raytracing")]
+    pub fn grass_field(&self) -> grass::GrassField {
+        self.grass_field.clone()
     }
 
     /// The switch for reflections, if there are any (see [`Self::with_reflections`]), on until
@@ -622,6 +655,16 @@ impl Plugin for GraphicsEffects {
                 }
                 let pass = Rc::new(RefCell::new(pass));
                 graphics_context.renderer.add_render_pass(pass);
+            }
+            // The grass, after Yoctite: into the G-Buffer it has drawn the scene into.
+            #[cfg(feature = "raytracing")]
+            if let Some(settings) = self.grass {
+                if raytraced_shadows::is_supported_backend(graphics_context.renderer.graphics_server()) {
+                    let pass = grass::GrassPass::new(TypeId::of::<Self>(), settings, self.grass_field.clone());
+                    graphics_context.renderer.add_render_pass(Rc::new(RefCell::new(pass)));
+                } else {
+                    fyrox::core::log::Log::warn("Grass is off: it needs the wgpu backend.");
+                }
             }
         }
         Ok(())
