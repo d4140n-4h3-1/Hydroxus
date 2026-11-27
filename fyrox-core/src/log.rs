@@ -92,7 +92,27 @@ impl MessageKind {
             MessageKind::Error => "[ERROR]: ",
         }
     }
+
+    /// [`Self::as_str`] in bold and coloured by kind for a terminal, with ANSI escapes: the
+    /// information green, a warning yellow, an error red.
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
+    fn as_styled_str(self) -> &'static str {
+        match self {
+            MessageKind::Information => "\x1b[1;32m[INFO]:\x1b[0m ",
+            MessageKind::Warning => "\x1b[1;33m[WARNING]:\x1b[0m ",
+            MessageKind::Error => "\x1b[1;31m[ERROR]:\x1b[0m ",
+        }
+    }
 }
+
+/// Whether what is written to stdout is styled (see [`MessageKind::as_styled_str`]): only where
+/// it is a terminal - not piped into a file or another program, which would get the escapes as
+/// they are - and unless NO_COLOR is set (no-color.org). The log file never is.
+#[cfg(not(target_arch = "wasm32"))]
+static STYLED: LazyLock<bool> = LazyLock::new(|| {
+    use std::io::IsTerminal;
+    io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+});
 
 /// See module docs.
 pub struct Log {
@@ -176,6 +196,8 @@ impl Log {
                 .is_ok()
         });
 
+        #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
+        let content = msg.clone();
         msg.insert_str(0, kind.as_str());
 
         #[cfg(target_arch = "wasm32")]
@@ -186,7 +208,11 @@ impl Log {
         #[cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))]
         {
             if self.write_to_stdout {
-                let _ = io::stdout().write_all(msg.as_bytes());
+                if *STYLED {
+                    let _ = io::stdout().write_all(format!("{}{content}", kind.as_styled_str()).as_bytes());
+                } else {
+                    let _ = io::stdout().write_all(msg.as_bytes());
+                }
             }
 
             if let Some(log_file) = self.file.as_mut() {
