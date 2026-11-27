@@ -69,7 +69,7 @@ pub use double_sided::make_double_sided;
 pub use area_lights::{AreaLight, AreaLights};
 pub use moving::{MovingThing, MovingThings};
 #[cfg(feature = "raytracing")]
-pub use grass::{GrassField, GrassMap, GrassSettings};
+pub use grass::{GrassCard, GrassField, GrassMap, GrassSettings};
 pub use occlusion::AmbientOcclusion;
 #[cfg(feature = "raytracing")]
 pub use raytraced_shadows::RayTracedShadows;
