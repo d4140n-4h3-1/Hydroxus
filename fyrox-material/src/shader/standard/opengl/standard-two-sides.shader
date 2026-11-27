@@ -457,7 +457,7 @@
 
                 void main()
                 {
-                    if (texture(diffuseTexture, texCoord).a < 0.2) discard;
+                    if (texture(diffuseTexture, texCoord).a < 0.5) discard;
                 }
                 "#,
         ),
@@ -541,7 +541,7 @@
 
                 void main()
                 {
-                    if (texture(diffuseTexture, texCoord).a < 0.2) discard;
+                    if (texture(diffuseTexture, texCoord).a < 0.5) discard;
                 }
                 "#,
         ),
@@ -630,7 +630,7 @@
 
                 void main()
                 {
-                    if (texture(diffuseTexture, texCoord).a < 0.2) discard;
+                    if (texture(diffuseTexture, texCoord).a < 0.5) discard;
                     depth = length(fyrox_lightData.lightPosition - worldPosition);
                 }
                 "#,

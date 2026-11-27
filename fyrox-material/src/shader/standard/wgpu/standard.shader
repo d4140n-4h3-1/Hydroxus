@@ -458,7 +458,7 @@
             fragment_shader:
                 r#"
                 @fragment fn fs_main(@location(0) texCoord: vec2f) {
-                    if (textureSample(diffuseTexture_tex, diffuseTexture_samp, texCoord).a < 0.2) { discard; }
+                    if (textureSample(diffuseTexture_tex, diffuseTexture_samp, texCoord).a < 0.5) { discard; }
                 }
                 "#,
         ),
@@ -540,7 +540,7 @@
             fragment_shader:
                 r#"
                 @fragment fn fs_main(@location(0) texCoord: vec2f) {
-                    if (textureSample(diffuseTexture_tex, diffuseTexture_samp, texCoord).a < 0.2) { discard; }
+                    if (textureSample(diffuseTexture_tex, diffuseTexture_samp, texCoord).a < 0.5) { discard; }
                 }
                 "#,
         ),
@@ -624,7 +624,7 @@
             fragment_shader:
                 r#"
                 @fragment fn fs_main(@location(0) texCoord: vec2f, @location(1) worldPosition: vec3f) -> @location(0) f32 {
-                    if (textureSample(diffuseTexture_tex, diffuseTexture_samp, texCoord).a < 0.2) { discard; }
+                    if (textureSample(diffuseTexture_tex, diffuseTexture_samp, texCoord).a < 0.5) { discard; }
                     return length(fyrox_lightData.lightPosition - worldPosition);
                 }
                 "#,
