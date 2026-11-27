@@ -155,6 +155,9 @@ struct Slot {
     slot: u32,
     material: MaterialResource,
     shading: Shading,
+    /// The key of its diffuse texture when last looked at (0 for none): a game that swaps it -
+    /// the Wilderness's seasons, turning leaves - has Candelite's cards of it captured again.
+    diffuse: u64,
     /// How many placed surfaces are drawn with it; the slot is given back at none.
     users: u32,
 }
@@ -187,10 +190,25 @@ impl Materials {
             }),
             material: material.clone(),
             shading,
+            diffuse: diffuse_key(material),
             users: 0,
         });
         slot.users += 1;
         slot.slot
+    }
+
+    /// The slots whose material's diffuse texture has been swapped since last looked at, and
+    /// their materials' keys.
+    fn changed(&mut self) -> Vec<(u32, u64)> {
+        let mut changed = Vec::new();
+        for (&key, slot) in &mut self.by_key {
+            let diffuse = diffuse_key(&slot.material);
+            if diffuse != slot.diffuse {
+                slot.diffuse = diffuse;
+                changed.push((slot.slot, key));
+            }
+        }
+        changed
     }
 
     /// Counts `key`'s material as used once less, giving its slot back at none.
@@ -213,6 +231,15 @@ impl Materials {
     fn slots(&self) -> u32 {
         self.next
     }
+}
+
+/// The key of `material`'s diffuse texture; 0 for none, or while the material loads.
+fn diffuse_key(material: &MaterialResource) -> u64 {
+    let state = material.state();
+    state
+        .data_ref()
+        .and_then(|material| material.texture_ref("diffuseTexture")?.value.as_ref().map(|t| t.key()))
+        .unwrap_or(0)
 }
 
 /// A surface's geometry, copied out to be built on another thread.
@@ -402,6 +429,9 @@ struct Candelite {
     full_reported: bool,
     /// The cutout masks made so far, by texture: foliage is traced as a cutout.
     masks: crate::raytraced_shadows::Masks,
+    /// The meshes traced as cutouts, and their materials' keys: given new masks when their
+    /// materials' textures are swapped.
+    cutouts: FxHashMap<MeshId, u64>,
 }
 
 /// About how long lighting Candelite's cards may take on the GPU a frame, in milliseconds: its
@@ -852,6 +882,7 @@ impl SceneMeshes {
                 target: None,
                 full_reported: false,
                 masks: Default::default(),
+                cutouts: Default::default(),
             });
         }
         let Self {
@@ -1057,6 +1088,9 @@ impl SceneMeshes {
                         &indices,
                         cutout.as_ref().map(|(uvs, mask)| (uvs.as_slice(), mask.clone())),
                     );
+                    if cutout.is_some() {
+                        candelite.cutouts.insert(mesh, surface.material().key());
+                    }
                     let first = pool.mesh(mesh).map_or(0, |m| m.first_cluster);
                     let clusters: Vec<u32> = full.iter().map(|&i| first + i as u32).collect();
                     match candelite.cache.add_mesh(mesh, &Bounds::of(positions), &clusters, slot) {
@@ -1114,6 +1148,7 @@ impl SceneMeshes {
                     if let Some(candelite) = candelite.as_mut() {
                         candelite.cache.remove_mesh(built.mesh);
                         candelite.scene.remove_mesh(built.mesh);
+                        candelite.cutouts.remove(&built.mesh);
                         candelite.pending.retain(|capture| capture.mesh != built.mesh);
                     }
                 }
@@ -1129,6 +1164,31 @@ impl SceneMeshes {
                 stats.clusters,
                 stats.bytes as f64 / 1048576.0
             ));
+        }
+
+        // Materials whose textures were swapped since the last frame: their meshes' cards captured
+        // again, and the cutouts among them traced with their new masks, so the light bounced off
+        // and through them is that of what is drawn.
+        let swapped = materials.changed();
+        if let (Some(candelite), false) = (candelite.as_mut(), swapped.is_empty()) {
+            for (slot, key) in swapped {
+                candelite.pending.extend(candelite.cache.recapture(slot));
+                let meshes: Vec<MeshId> = candelite.cutouts.iter().filter(|(_, k)| **k == key).map(|(m, _)| *m).collect();
+                if meshes.is_empty() {
+                    continue;
+                }
+                let Some(material) = materials.by_key.get(&key).map(|s| s.material.clone()) else {
+                    continue;
+                };
+                if let Some(mask) = crate::raytraced_shadows::material_mask(&material, &mut candelite.masks) {
+                    for mesh in meshes {
+                        candelite.scene.set_cutout(mesh, mask.clone());
+                    }
+                }
+            }
+            // The masks of textures swapped out, which no mesh is traced with any more: a game
+            // swapping them daily would otherwise keep every one it ever made.
+            candelite.masks.retain(|_, mask| mask.as_ref().is_none_or(|mask| Arc::strong_count(mask) > 1));
         }
         changed
     }
